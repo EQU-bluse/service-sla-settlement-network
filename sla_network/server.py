@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import closing
 from datetime import UTC, datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -26,7 +27,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/health":
-            with connect(self.server.database_path) as database:
+            with closing(connect(self.server.database_path)) as database:
                 version = database.execute(
                     "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
                 ).fetchone()[0]
@@ -50,4 +51,3 @@ def serve(host: str, port: int, database_path: str) -> None:
     server = ApiServer((host, port), Handler)
     server.database_path = database_path
     server.serve_forever()
-
