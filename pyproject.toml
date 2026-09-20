@@ -1,0 +1,9 @@
+[project]
+name = "service-sla-settlement-network"
+version = "0.1.0"
+description = "Auditable backend for machine-service SLA settlement"
+requires-python = ">=3.12"
+
+[tool.ruff]
+line-length = 100
+
