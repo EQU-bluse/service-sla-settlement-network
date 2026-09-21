@@ -19,6 +19,22 @@ CREATE TABLE IF NOT EXISTS idempotency_records (
     machine_id TEXT NOT NULL,
     public_key TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS machine_capabilities (
+    machine_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    protocol TEXT NOT NULL,
+    region TEXT NOT NULL,
+    unit TEXT NOT NULL,
+    capacity INTEGER NOT NULL,
+    version INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS capability_idempotency_records (
+    key TEXT PRIMARY KEY,
+    machine_id TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    response_json TEXT NOT NULL
+);
 """
 
 

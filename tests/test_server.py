@@ -164,6 +164,251 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(list(json.loads(body)), ["id", "publicKey"])
 
 
+class CapabilityTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.machine_id = machine_id(PUBLIC_KEY_A)
+        request = Request(
+            self.url("/v1/machines"),
+            data=json.dumps({"publicKey": PUBLIC_KEY_A}).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "register-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temporary.cleanup()
+
+    def url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}{path}"
+
+    def capability_body(self, expected_version: int = 0, **overrides: object) -> bytes:
+        fields: dict[str, object] = {
+            "expectedVersion": expected_version,
+            "name": "pump-01",
+            "protocol": "mqtt",
+            "region": "cn",
+            "unit": "call",
+            "capacity": 10,
+        }
+        fields.update(overrides)
+        return json.dumps(fields).encode()
+
+    def post_capability(
+        self,
+        body: bytes,
+        machine_id: str | None = None,
+        idempotency_key: str | None = "cap-1",
+    ) -> tuple[int, bytes, str]:
+        target = machine_id if machine_id is not None else self.machine_id
+        request = Request(
+            self.url(f"/v1/machines/{target}/capabilities"), data=body, method="POST"
+        )
+        if idempotency_key is not None:
+            request.add_header("Idempotency-Key", idempotency_key)
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read(), response.headers["Content-Type"]
+        except HTTPError as error:
+            return error.code, error.read(), error.headers["Content-Type"]
+
+    def test_declare_capability_created(self) -> None:
+        status, body, content_type = self.post_capability(self.capability_body())
+        self.assertEqual(status, 201)
+        self.assertEqual(content_type, "application/json; charset=utf-8")
+        self.assertEqual(body, b'{"version":1}')
+
+    def test_declare_capability_update_increments_version(self) -> None:
+        self.assertEqual(self.post_capability(self.capability_body())[0], 201)
+        status, body, _ = self.post_capability(
+            self.capability_body(expected_version=1, capacity=20), idempotency_key="cap-2"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b'{"version":2}')
+
+    def test_first_declaration_requires_version_zero(self) -> None:
+        status, body, _ = self.post_capability(self.capability_body(expected_version=1))
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_stale_expected_version_conflicts(self) -> None:
+        self.assertEqual(self.post_capability(self.capability_body())[0], 201)
+        status, body, _ = self.post_capability(self.capability_body(), idempotency_key="cap-2")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_replay_returns_first_response_bytes(self) -> None:
+        status, body, _ = self.post_capability(self.capability_body())
+        self.assertEqual((status, body), (201, b'{"version":1}'))
+        for _ in range(2):
+            again_status, again_body, _ = self.post_capability(self.capability_body())
+            self.assertEqual((again_status, again_body), (status, body))
+        # 重放未重复写入：版本仍为 1。
+        status, body, _ = self.post_capability(
+            self.capability_body(expected_version=1), idempotency_key="cap-2"
+        )
+        self.assertEqual((status, body), (200, b'{"version":2}'))
+
+    def test_same_key_different_fields_conflicts(self) -> None:
+        self.assertEqual(self.post_capability(self.capability_body())[0], 201)
+        status, body, _ = self.post_capability(self.capability_body(capacity=99))
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_same_key_different_machine_conflicts_even_if_unregistered(self) -> None:
+        self.assertEqual(self.post_capability(self.capability_body())[0], 201)
+        status, body, _ = self.post_capability(
+            self.capability_body(), machine_id=machine_id(PUBLIC_KEY_B)
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_unregistered_machine_not_found(self) -> None:
+        status, body, _ = self.post_capability(
+            self.capability_body(), machine_id=machine_id(PUBLIC_KEY_B)
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+
+    def test_failed_request_leaves_no_idempotency_record(self) -> None:
+        other_id = machine_id(PUBLIC_KEY_B)
+        status, _, _ = self.post_capability(self.capability_body(), machine_id=other_id)
+        self.assertEqual(status, 404)
+        request = Request(
+            self.url("/v1/machines"),
+            data=json.dumps({"publicKey": PUBLIC_KEY_B}).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "register-2")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        status, body, _ = self.post_capability(self.capability_body(), machine_id=other_id)
+        self.assertEqual((status, body), (201, b'{"version":1}'))
+
+    def test_version_conflict_leaves_no_idempotency_record(self) -> None:
+        self.assertEqual(self.post_capability(self.capability_body())[0], 201)
+        status, _, _ = self.post_capability(self.capability_body(), idempotency_key="cap-2")
+        self.assertEqual(status, 409)
+        status, body, _ = self.post_capability(
+            self.capability_body(expected_version=1), idempotency_key="cap-2"
+        )
+        self.assertEqual((status, body), (200, b'{"version":2}'))
+
+    def test_replay_survives_restart(self) -> None:
+        status, body, _ = self.post_capability(self.capability_body())
+        self.assertEqual(status, 201)
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        again_status, again_body, _ = self.post_capability(self.capability_body())
+        self.assertEqual((again_status, again_body), (status, body))
+
+    def test_concurrent_distinct_keys_single_winner(self) -> None:
+        results: list[int] = []
+        lock = threading.Lock()
+
+        def declare(index: int) -> None:
+            status, _, _ = self.post_capability(
+                self.capability_body(), idempotency_key=f"cap-race-{index}"
+            )
+            with lock:
+                results.append(status)
+
+        threads = [threading.Thread(target=declare, args=(index,)) for index in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual(sorted(results), [201] + [409] * 7)
+
+    def test_invalid_idempotency_key(self) -> None:
+        for key in (None, "", "bad key", "bad_key", "x" * 65, "é"):
+            status, body, _ = self.post_capability(
+                self.capability_body(), idempotency_key=key
+            )
+            self.assertEqual(status, 400, key)
+            self.assertEqual(json.loads(body), {"error": "invalid_request"})
+
+    def test_invalid_bodies(self) -> None:
+        cases = [
+            b"",
+            b"\xff\xfe{}",
+            b"{not json",
+            b"[1,2]",
+            b"null",
+            b"{}",
+            json.dumps(
+                {
+                    "expectedVersion": 0,
+                    "name": "pump-01",
+                    "protocol": "mqtt",
+                    "region": "cn",
+                    "unit": "call",
+                }
+            ).encode(),
+            json.dumps(
+                {
+                    "expectedVersion": 0,
+                    "name": "pump-01",
+                    "protocol": "mqtt",
+                    "region": "cn",
+                    "unit": "call",
+                    "capacity": 10,
+                    "extra": 1,
+                }
+            ).encode(),
+            self.capability_body(expected_version=-1),
+            self.capability_body(expected_version=2147483647),
+            self.capability_body(expected_version=True),
+            self.capability_body(expected_version=1.0),
+            self.capability_body(expected_version="0"),
+            self.capability_body(name=""),
+            self.capability_body(name="a" * 33),
+            self.capability_body(name="Pump"),
+            self.capability_body(name="pump_01"),
+            self.capability_body(name=1),
+            self.capability_body(protocol="amqp"),
+            self.capability_body(protocol="HTTP"),
+            self.capability_body(region="us-east"),
+            self.capability_body(unit="bytes"),
+            self.capability_body(capacity=0),
+            self.capability_body(capacity=-1),
+            self.capability_body(capacity=2147483648),
+            self.capability_body(capacity=False),
+            self.capability_body(capacity="10"),
+            b'{"expectedVersion":0,"expectedVersion":0,"name":"pump-01",'
+            b'"protocol":"mqtt","region":"cn","unit":"call","capacity":10}',
+        ]
+        for body in cases:
+            status, response_body, _ = self.post_capability(body)
+            self.assertEqual(status, 400, body)
+            self.assertEqual(json.loads(response_body), {"error": "invalid_request"})
+
+    def test_machine_subpath_without_capabilities_is_404(self) -> None:
+        request = Request(
+            self.url(f"/v1/machines/{self.machine_id}"),
+            data=self.capability_body(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "cap-1")
+        with self.assertRaises(HTTPError) as captured:
+            urlopen(request, timeout=5)
+        self.assertEqual(captured.exception.code, 404)
+        self.assertEqual(json.load(captured.exception), {"error": "not_found"})
+
+
 if __name__ == "__main__":
     unittest.main()
 

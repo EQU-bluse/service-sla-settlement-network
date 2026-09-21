@@ -17,6 +17,7 @@ python3 -m sla_network --host 127.0.0.1 --port 8080 --database var/service-sla.d
 
 - `GET /health`：返回 JSON 健康状态，成功响应为 `200`。
 - `POST /v1/machines`：登记机器身份。请求须携带 `Idempotency-Key` 头（`[A-Za-z0-9-]{1,64}`），JSON 请求体仅含 `publicKey`（`[0-9a-f]{64}`）。`id` 为 `SHA-256(bytes.fromhex(publicKey))` 的小写十六进制。首次登记返回 `201`；同键同 `publicKey` 重放返回 `200`；同键异 `publicKey` 返回 `409`/`idempotency_conflict`；异键同 `id` 返回 `409`/`machine_exists`。登记与幂等记录在同一原子提交中持久化，重启后重放语义不变。
+- `POST /v1/machines/{id}/capabilities`：为已登记机器声明能力。请求须携带 `Idempotency-Key` 头（格式同上），JSON 请求体恰含 `expectedVersion`（非布尔整数 `0..2147483646`）、`name`（`[a-z0-9-]{1,32}`）、`protocol`（`http|mqtt`）、`region`（`cn|eu|us`）、`unit`（`call|byte|ms`）、`capacity`（非布尔整数 `1..2147483647`），键不得重复或缺失。首次声明仅接受 `expectedVersion: 0`，原子写入版本 `1` 并返回 `201`；更新须匹配当前版本，原子加一并返回 `200`。成功体仅 `{"version":新版本}`。判定顺序为头、体、幂等记录、机器、版本：头或体非法返回 `400`/`invalid_request`；同键异 `id` 或异字段返回 `409`/`conflict`（即使 `id` 未登记）；无幂等记录且机器不存在返回 `404`/`not_found`；版本不符返回 `409`/`conflict`。同键同请求重放（含并发与重启后）返回首次状态码与响应字节，仅写入一次；异键竞争同一机器版本仅一项成功。声明与幂等结果原子持久化，失败不留记录。
 
 ## 测试
 
