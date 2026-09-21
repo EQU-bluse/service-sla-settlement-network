@@ -35,6 +35,19 @@ CREATE TABLE IF NOT EXISTS capability_idempotency_records (
     status INTEGER NOT NULL,
     response_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS sla_templates (
+    id TEXT PRIMARY KEY,
+    machine_id TEXT NOT NULL,
+    capability_version INTEGER NOT NULL,
+    price_micros INTEGER NOT NULL,
+    max_latency_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sla_template_idempotency_records (
+    key TEXT PRIMARY KEY,
+    request_json TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    response_json TEXT NOT NULL
+);
 """
 
 

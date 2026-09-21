@@ -381,8 +381,18 @@ class CapabilityTests(unittest.TestCase):
             self.capability_body(name=1),
             self.capability_body(protocol="amqp"),
             self.capability_body(protocol="HTTP"),
+            self.capability_body(protocol=["mqtt"]),
+            self.capability_body(protocol={"value": "mqtt"}),
+            self.capability_body(protocol=1),
+            self.capability_body(protocol=None),
             self.capability_body(region="us-east"),
+            self.capability_body(region=["cn"]),
+            self.capability_body(region={"value": "cn"}),
+            self.capability_body(region=0),
             self.capability_body(unit="bytes"),
+            self.capability_body(unit=["call"]),
+            self.capability_body(unit={"value": "call"}),
+            self.capability_body(unit=True),
             self.capability_body(capacity=0),
             self.capability_body(capacity=-1),
             self.capability_body(capacity=2147483648),
@@ -407,6 +417,305 @@ class CapabilityTests(unittest.TestCase):
             urlopen(request, timeout=5)
         self.assertEqual(captured.exception.code, 404)
         self.assertEqual(json.load(captured.exception), {"error": "not_found"})
+
+
+class SlaTemplateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.machine_id = machine_id(PUBLIC_KEY_A)
+        request = Request(
+            self.url("/v1/machines"),
+            data=json.dumps({"publicKey": PUBLIC_KEY_A}).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "register-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        capability = {
+            "expectedVersion": 0,
+            "name": "pump-01",
+            "protocol": "mqtt",
+            "region": "cn",
+            "unit": "call",
+            "capacity": 10,
+        }
+        request = Request(
+            self.url(f"/v1/machines/{self.machine_id}/capabilities"),
+            data=json.dumps(capability).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "cap-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temporary.cleanup()
+
+    def url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}{path}"
+
+    def template_body(self, **overrides: object) -> bytes:
+        fields: dict[str, object] = {
+            "id": "tmpl-1",
+            "machineId": self.machine_id,
+            "capabilityVersion": 1,
+            "priceMicros": 100,
+            "maxLatencyMs": 250,
+        }
+        fields.update(overrides)
+        return json.dumps(fields).encode()
+
+    def post_template(
+        self, body: bytes, idempotency_key: str | None = "tmpl-key-1"
+    ) -> tuple[int, bytes, str]:
+        request = Request(self.url("/v1/sla-templates"), data=body, method="POST")
+        if idempotency_key is not None:
+            request.add_header("Idempotency-Key", idempotency_key)
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read(), response.headers["Content-Type"]
+        except HTTPError as error:
+            return error.code, error.read(), error.headers["Content-Type"]
+
+    def test_create_template_created(self) -> None:
+        status, body, content_type = self.post_template(self.template_body())
+        self.assertEqual(status, 201)
+        self.assertEqual(content_type, "application/json; charset=utf-8")
+        self.assertEqual(body, b'{"id":"tmpl-1"}')
+
+    def test_replay_returns_first_response(self) -> None:
+        status, body, _ = self.post_template(self.template_body())
+        self.assertEqual((status, body), (201, b'{"id":"tmpl-1"}'))
+        again_status, again_body, _ = self.post_template(self.template_body())
+        self.assertEqual((again_status, again_body), (status, body))
+
+    def test_replay_survives_restart(self) -> None:
+        status, body, _ = self.post_template(self.template_body())
+        self.assertEqual(status, 201)
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        again_status, again_body, _ = self.post_template(self.template_body())
+        self.assertEqual((again_status, again_body), (status, body))
+
+    def test_same_key_different_request_conflicts(self) -> None:
+        self.assertEqual(self.post_template(self.template_body())[0], 201)
+        status, body, _ = self.post_template(self.template_body(priceMicros=200))
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_same_key_different_request_conflicts_even_if_machine_unknown(self) -> None:
+        self.assertEqual(self.post_template(self.template_body())[0], 201)
+        status, body, _ = self.post_template(
+            self.template_body(machineId=machine_id(PUBLIC_KEY_B))
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_unregistered_machine_not_found(self) -> None:
+        status, body, _ = self.post_template(
+            self.template_body(machineId=machine_id(PUBLIC_KEY_B))
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+
+    def test_version_mismatch_conflicts(self) -> None:
+        status, body, _ = self.post_template(self.template_body(capabilityVersion=2))
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_machine_without_capability_conflicts(self) -> None:
+        request = Request(
+            self.url("/v1/machines"),
+            data=json.dumps({"publicKey": PUBLIC_KEY_B}).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "register-2")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        status, body, _ = self.post_template(
+            self.template_body(machineId=machine_id(PUBLIC_KEY_B))
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_stale_version_after_capability_update_conflicts(self) -> None:
+        capability = {
+            "expectedVersion": 1,
+            "name": "pump-01",
+            "protocol": "mqtt",
+            "region": "cn",
+            "unit": "call",
+            "capacity": 20,
+        }
+        request = Request(
+            self.url(f"/v1/machines/{self.machine_id}/capabilities"),
+            data=json.dumps(capability).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "cap-2")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+        status, body, _ = self.post_template(self.template_body())
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+        status, body, _ = self.post_template(
+            self.template_body(capabilityVersion=2), idempotency_key="tmpl-key-2"
+        )
+        self.assertEqual((status, body), (201, b'{"id":"tmpl-1"}'))
+
+    def test_duplicate_id_conflicts(self) -> None:
+        self.assertEqual(self.post_template(self.template_body())[0], 201)
+        status, body, _ = self.post_template(
+            self.template_body(priceMicros=1), idempotency_key="tmpl-key-2"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "template_exists"})
+
+    def test_failed_request_leaves_no_idempotency_record(self) -> None:
+        status, _, _ = self.post_template(
+            self.template_body(machineId=machine_id(PUBLIC_KEY_B))
+        )
+        self.assertEqual(status, 404)
+        request = Request(
+            self.url("/v1/machines"),
+            data=json.dumps({"publicKey": PUBLIC_KEY_B}).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "register-2")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        capability = {
+            "expectedVersion": 0,
+            "name": "pump-02",
+            "protocol": "http",
+            "region": "us",
+            "unit": "ms",
+            "capacity": 5,
+        }
+        request = Request(
+            self.url(f"/v1/machines/{machine_id(PUBLIC_KEY_B)}/capabilities"),
+            data=json.dumps(capability).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "cap-2")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        status, body, _ = self.post_template(
+            self.template_body(machineId=machine_id(PUBLIC_KEY_B))
+        )
+        self.assertEqual((status, body), (201, b'{"id":"tmpl-1"}'))
+
+    def test_concurrent_same_key_single_write(self) -> None:
+        results: list[tuple[int, bytes]] = []
+        lock = threading.Lock()
+
+        def create() -> None:
+            status, body, _ = self.post_template(self.template_body())
+            with lock:
+                results.append((status, body))
+
+        threads = [threading.Thread(target=create) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual(results, [(201, b'{"id":"tmpl-1"}')] * 8)
+
+    def test_concurrent_distinct_keys_same_id_single_winner(self) -> None:
+        results: list[int] = []
+        lock = threading.Lock()
+
+        def create(index: int) -> None:
+            status, _, _ = self.post_template(
+                self.template_body(), idempotency_key=f"tmpl-race-{index}"
+            )
+            with lock:
+                results.append(status)
+
+        threads = [threading.Thread(target=create, args=(index,)) for index in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual(sorted(results), [201] + [409] * 7)
+
+    def test_invalid_idempotency_key(self) -> None:
+        for key in (None, "", "bad key", "bad_key", "x" * 65, "é"):
+            status, body, _ = self.post_template(
+                self.template_body(), idempotency_key=key
+            )
+            self.assertEqual(status, 400, key)
+            self.assertEqual(json.loads(body), {"error": "invalid_request"})
+
+    def test_invalid_bodies(self) -> None:
+        cases = [
+            b"",
+            b"\xff\xfe{}",
+            b"{not json",
+            b"[1,2]",
+            b"null",
+            b"{}",
+            json.dumps(
+                {
+                    "id": "tmpl-1",
+                    "machineId": self.machine_id,
+                    "capabilityVersion": 1,
+                    "priceMicros": 100,
+                }
+            ).encode(),
+            json.dumps(
+                {
+                    "id": "tmpl-1",
+                    "machineId": self.machine_id,
+                    "capabilityVersion": 1,
+                    "priceMicros": 100,
+                    "maxLatencyMs": 250,
+                    "extra": 1,
+                }
+            ).encode(),
+            self.template_body(id=""),
+            self.template_body(id="a" * 65),
+            self.template_body(id="Tmpl"),
+            self.template_body(id="tmpl_1"),
+            self.template_body(id=1),
+            self.template_body(machineId=self.machine_id.upper()),
+            self.template_body(machineId="aa"),
+            self.template_body(machineId="gg" * 32),
+            self.template_body(machineId=123),
+            self.template_body(capabilityVersion=0),
+            self.template_body(capabilityVersion=-1),
+            self.template_body(capabilityVersion=2147483648),
+            self.template_body(capabilityVersion=True),
+            self.template_body(capabilityVersion=1.0),
+            self.template_body(capabilityVersion="1"),
+            self.template_body(priceMicros=-1),
+            self.template_body(priceMicros=2147483648),
+            self.template_body(priceMicros=False),
+            self.template_body(priceMicros="0"),
+            self.template_body(maxLatencyMs=0),
+            self.template_body(maxLatencyMs=-1),
+            self.template_body(maxLatencyMs=2147483648),
+            self.template_body(maxLatencyMs=True),
+            self.template_body(maxLatencyMs="250"),
+            b'{"id":"tmpl-1","id":"tmpl-1","machineId":"' + self.machine_id.encode()
+            + b'","capabilityVersion":1,"priceMicros":100,"maxLatencyMs":250}',
+        ]
+        for body in cases:
+            status, response_body, _ = self.post_template(body)
+            self.assertEqual(status, 400, body)
+            self.assertEqual(json.loads(response_body), {"error": "invalid_request"})
 
 
 if __name__ == "__main__":
