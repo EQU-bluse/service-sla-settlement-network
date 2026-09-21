@@ -1,14 +1,23 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 from urllib.error import HTTPError
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 from sla_network.server import ApiServer, Handler
+
+PUBLIC_KEY_A = "aa" * 32
+PUBLIC_KEY_B = "bb" * 32
+PUBLIC_KEY_C = "cc" * 32
+
+
+def machine_id(public_key: str) -> str:
+    return hashlib.sha256(bytes.fromhex(public_key)).hexdigest()
 
 
 class ServerTests(unittest.TestCase):
@@ -40,6 +49,119 @@ class ServerTests(unittest.TestCase):
             urlopen(self.url("/missing"), timeout=2)
         self.assertEqual(captured.exception.code, 404)
         self.assertEqual(json.load(captured.exception), {"error": "not_found"})
+
+    def post_machines(self, body: bytes, idempotency_key: str | None = "key-1") -> tuple[int, bytes, str]:
+        request = Request(self.url("/v1/machines"), data=body, method="POST")
+        if idempotency_key is not None:
+            request.add_header("Idempotency-Key", idempotency_key)
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read(), response.headers["Content-Type"]
+        except HTTPError as error:
+            return error.code, error.read(), error.headers["Content-Type"]
+
+    def register_body(self, public_key: str = PUBLIC_KEY_A) -> bytes:
+        return json.dumps({"publicKey": public_key}).encode("utf-8")
+
+    def test_register_machine_created(self) -> None:
+        status, body, content_type = self.post_machines(self.register_body())
+        self.assertEqual(status, 201)
+        self.assertEqual(content_type, "application/json; charset=utf-8")
+        self.assertEqual(
+            body.decode("utf-8"),
+            json.dumps(
+                {"id": machine_id(PUBLIC_KEY_A), "publicKey": PUBLIC_KEY_A},
+                separators=(",", ":"),
+            ),
+        )
+        self.assertFalse(body.endswith(b"\n"))
+
+    def test_register_machine_replay_returns_200(self) -> None:
+        self.assertEqual(self.post_machines(self.register_body())[0], 201)
+        status, body, _ = self.post_machines(self.register_body())
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            json.loads(body), {"id": machine_id(PUBLIC_KEY_A), "publicKey": PUBLIC_KEY_A}
+        )
+
+    def test_register_machine_replay_survives_restart(self) -> None:
+        self.assertEqual(self.post_machines(self.register_body())[0], 201)
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        status, body, _ = self.post_machines(self.register_body())
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            json.loads(body), {"id": machine_id(PUBLIC_KEY_A), "publicKey": PUBLIC_KEY_A}
+        )
+
+    def test_same_key_different_public_key_conflicts(self) -> None:
+        self.assertEqual(self.post_machines(self.register_body())[0], 201)
+        status, body, _ = self.post_machines(self.register_body(PUBLIC_KEY_B))
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "idempotency_conflict"})
+
+    def test_same_machine_different_key_conflicts(self) -> None:
+        self.assertEqual(self.post_machines(self.register_body())[0], 201)
+        status, body, _ = self.post_machines(self.register_body(), idempotency_key="key-2")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "machine_exists"})
+
+    def test_concurrent_identical_requests_exactly_one_created(self) -> None:
+        results: list[int] = []
+        lock = threading.Lock()
+
+        def register() -> None:
+            status, _, _ = self.post_machines(self.register_body())
+            with lock:
+                results.append(status)
+
+        threads = [threading.Thread(target=register) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual(sorted(results), [200] * 7 + [201])
+
+    def test_missing_idempotency_key(self) -> None:
+        status, body, _ = self.post_machines(self.register_body(), idempotency_key=None)
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_idempotency_key"})
+
+    def test_invalid_idempotency_key(self) -> None:
+        for key in ("", "bad key", "bad_key", "x" * 65, "é"):
+            status, body, _ = self.post_machines(self.register_body(), idempotency_key=key)
+            self.assertEqual(status, 400, key)
+            self.assertEqual(json.loads(body), {"error": "invalid_idempotency_key"})
+
+    def test_invalid_request_bodies(self) -> None:
+        cases = [
+            b"",
+            b"\xff\xfe{}",
+            b"{not json",
+            b"[1,2]",
+            b'"text"',
+            b"null",
+            b"{}",
+            json.dumps({"publicKey": PUBLIC_KEY_A, "extra": 1}).encode(),
+            json.dumps({"publicKey": PUBLIC_KEY_A.upper()}).encode(),
+            json.dumps({"publicKey": "aa"}).encode(),
+            json.dumps({"publicKey": "gg" * 32}).encode(),
+            json.dumps({"publicKey": 123}).encode(),
+            b'{"publicKey":"' + PUBLIC_KEY_A.encode() + b'","publicKey":"' + PUBLIC_KEY_B.encode() + b'"}',
+        ]
+        for body in cases:
+            status, response_body, _ = self.post_machines(body)
+            self.assertEqual(status, 400, body)
+            self.assertEqual(json.loads(response_body), {"error": "invalid_request"})
+
+    def test_success_payload_key_order(self) -> None:
+        _, body, _ = self.post_machines(self.register_body())
+        self.assertEqual(list(json.loads(body)), ["id", "publicKey"])
 
 
 if __name__ == "__main__":
