@@ -18,6 +18,7 @@ CAPABILITY_NAME_PATTERN = re.compile(r"[a-z0-9-]{1,32}")
 TEMPLATE_ID_PATTERN = re.compile(r"[a-z0-9-]{1,64}")
 SLA_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)")
 SLA_CONFIRMATIONS_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/confirmations")
+SLA_TELEMETRY_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/telemetry")
 CAPABILITY_FIELDS = {"expectedVersion", "name", "protocol", "region", "unit", "capacity"}
 SLA_TEMPLATE_FIELDS = {
     "id",
@@ -29,6 +30,7 @@ SLA_TEMPLATE_FIELDS = {
 SLA_FIELDS = {"id", "templateId", "consumerId", "start", "end"}
 CONFIRMATION_FIELDS = {"party", "actorId"}
 CONFIRMATION_PARTIES = {"producer", "consumer"}
+TELEMETRY_FIELDS = {"eventId", "timestamp", "latencyMs", "digest"}
 CAPABILITY_PROTOCOLS = {"http", "mqtt"}
 CAPABILITY_REGIONS = {"cn", "eu", "us"}
 CAPABILITY_UNITS = {"call", "byte", "ms"}
@@ -130,6 +132,10 @@ class Handler(BaseHTTPRequestHandler):
         confirmations_match = SLA_CONFIRMATIONS_PATH_PATTERN.fullmatch(self.path)
         if confirmations_match is not None:
             self._confirm_sla(confirmations_match.group(1))
+            return
+        telemetry_match = SLA_TELEMETRY_PATH_PATTERN.fullmatch(self.path)
+        if telemetry_match is not None:
+            self._submit_telemetry(telemetry_match.group(1))
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
@@ -631,6 +637,105 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 database.execute("COMMIT")
                 return HTTPStatus.OK, payload
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+
+    def _submit_telemetry(self, sla_id: str) -> None:
+        idempotency_key = self.headers.get("Idempotency-Key")
+        if idempotency_key is None or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        fields = self._read_telemetry_object()
+        if fields is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        status, payload = self._apply_telemetry(idempotency_key, sla_id, fields)
+        self._json(status, payload)
+
+    def _read_telemetry_object(self) -> dict[str, Any] | None:
+        parsed = self._read_json_object()
+        if parsed is None or set(parsed) != TELEMETRY_FIELDS:
+            return None
+        event_id = parsed["eventId"]
+        if not isinstance(event_id, str) or TEMPLATE_ID_PATTERN.fullmatch(event_id) is None:
+            return None
+        if not _bounded_int(parsed["timestamp"], 0, 2147483647999):
+            return None
+        if not _bounded_int(parsed["latencyMs"], 0, 2147483647):
+            return None
+        digest = parsed["digest"]
+        if not isinstance(digest, str) or PUBLIC_KEY_PATTERN.fullmatch(digest) is None:
+            return None
+        return parsed
+
+    def _apply_telemetry(
+        self, idempotency_key: str, sla_id: str, fields: dict[str, Any]
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                record = database.execute(
+                    "SELECT sla_id, request_json, status, response_json"
+                    " FROM sla_telemetry_idempotency_records WHERE key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    if record["sla_id"] == sla_id and record["request_json"] == request_json:
+                        return HTTPStatus(record["status"]), json.loads(record["response_json"])
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                sla = database.execute(
+                    "SELECT machine_id, start_unix, end_unix, state FROM slas WHERE id = ?",
+                    (sla_id,),
+                ).fetchone()
+                if sla is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                timestamp = fields["timestamp"]
+                if (
+                    sla["state"] != "active"
+                    or not sla["start_unix"] * 1000 <= timestamp < sla["end_unix"] * 1000
+                ):
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                expected_digest = hashlib.sha256(
+                    f"{sla_id}\n{fields['eventId']}\n{timestamp}\n"
+                    f"{fields['latencyMs']}\n{sla['machine_id']}".encode("utf-8")
+                ).hexdigest()
+                if fields["digest"] != expected_digest:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                existing = database.execute(
+                    "SELECT event_id FROM sla_telemetry_events"
+                    " WHERE sla_id = ? AND event_id = ?",
+                    (sla_id, fields["eventId"]),
+                ).fetchone()
+                if existing is not None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "event_exists"}
+                payload = {"eventId": fields["eventId"]}
+                database.execute(
+                    "INSERT INTO sla_telemetry_events"
+                    "(sla_id, event_id, timestamp_ms, latency_ms, digest)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (sla_id, fields["eventId"], timestamp, fields["latencyMs"], fields["digest"]),
+                )
+                database.execute(
+                    "INSERT INTO sla_telemetry_idempotency_records"
+                    "(key, sla_id, request_json, status, response_json)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        sla_id,
+                        request_json,
+                        int(HTTPStatus.CREATED),
+                        json.dumps(payload, separators=(",", ":")),
+                    ),
+                )
+                database.execute("COMMIT")
+                return HTTPStatus.CREATED, payload
             except BaseException:
                 database.execute("ROLLBACK")
                 raise

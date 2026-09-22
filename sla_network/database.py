@@ -79,6 +79,21 @@ CREATE TABLE IF NOT EXISTS sla_confirmation_idempotency_records (
     status INTEGER NOT NULL,
     response_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS sla_telemetry_events (
+    sla_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    timestamp_ms INTEGER NOT NULL,
+    latency_ms INTEGER NOT NULL,
+    digest TEXT NOT NULL,
+    PRIMARY KEY (sla_id, event_id)
+);
+CREATE TABLE IF NOT EXISTS sla_telemetry_idempotency_records (
+    key TEXT PRIMARY KEY,
+    sla_id TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    response_json TEXT NOT NULL
+);
 """
 
 

@@ -1454,6 +1454,369 @@ class ConfirmationTests(unittest.TestCase):
             self.assertEqual(json.loads(response_body), {"error": "invalid_request"})
 
 
+class TelemetryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.machine_id = machine_id(PUBLIC_KEY_A)
+        self.consumer_id = machine_id(PUBLIC_KEY_B)
+        for key, public_key in (("register-1", PUBLIC_KEY_A), ("register-2", PUBLIC_KEY_B)):
+            request = Request(
+                self.url("/v1/machines"),
+                data=json.dumps({"publicKey": public_key}).encode(),
+                method="POST",
+            )
+            request.add_header("Idempotency-Key", key)
+            with urlopen(request, timeout=5) as response:
+                self.assertEqual(response.status, 201)
+        request = Request(
+            self.url(f"/v1/machines/{self.machine_id}/capabilities"),
+            data=json.dumps(
+                {
+                    "expectedVersion": 0,
+                    "name": "pump-01",
+                    "protocol": "mqtt",
+                    "region": "cn",
+                    "unit": "call",
+                    "capacity": 10,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "cap-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        request = Request(
+            self.url("/v1/sla-templates"),
+            data=json.dumps(
+                {
+                    "id": "tpl-1",
+                    "machineId": self.machine_id,
+                    "capabilityVersion": 1,
+                    "priceMicros": 1000,
+                    "maxLatencyMs": 50,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "tpl-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        self.start = int(time.time()) - 10
+        self.end = int(time.time()) + 3600
+        self.create_sla("sla-1", key="sla-1", start=self.start, end=self.end)
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temporary.cleanup()
+
+    def url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}{path}"
+
+    def create_sla(
+        self,
+        sla_id: str,
+        key: str,
+        start: int | None = None,
+        end: int | None = None,
+    ) -> None:
+        current = int(time.time())
+        body = json.dumps(
+            {
+                "id": sla_id,
+                "templateId": "tpl-1",
+                "consumerId": self.consumer_id,
+                "start": current - 10 if start is None else start,
+                "end": current + 3600 if end is None else end,
+            }
+        ).encode()
+        request = Request(self.url("/v1/slas"), data=body, method="POST")
+        request.add_header("Idempotency-Key", key)
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+
+    def activate(self, sla_id: str = "sla-1") -> None:
+        for index, (party, actor) in enumerate(
+            (("producer", self.machine_id), ("consumer", self.consumer_id))
+        ):
+            request = Request(
+                self.url(f"/v1/slas/{sla_id}/confirmations"),
+                data=json.dumps({"party": party, "actorId": actor}).encode(),
+                method="POST",
+            )
+            request.add_header("Idempotency-Key", f"activate-{sla_id}-{index}")
+            with urlopen(request, timeout=5) as response:
+                self.assertEqual(response.status, 200)
+
+    def digest(self, sla_id: str, event_id: str, timestamp: int, latency_ms: int) -> str:
+        text = f"{sla_id}\n{event_id}\n{timestamp}\n{latency_ms}\n{self.machine_id}"
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def telemetry_body(
+        self,
+        sla_id: str = "sla-1",
+        event_id: str = "evt-1",
+        timestamp: int | None = None,
+        latency_ms: int = 12,
+        digest: str | None = None,
+    ) -> bytes:
+        if timestamp is None:
+            timestamp = (self.start + 1) * 1000
+        if digest is None:
+            digest = self.digest(sla_id, event_id, timestamp, latency_ms)
+        return json.dumps(
+            {
+                "eventId": event_id,
+                "timestamp": timestamp,
+                "latencyMs": latency_ms,
+                "digest": digest,
+            }
+        ).encode()
+
+    def post_telemetry(
+        self,
+        body: bytes,
+        sla_id: str = "sla-1",
+        idempotency_key: str | None = "tel-1",
+    ) -> tuple[int, bytes, str]:
+        request = Request(
+            self.url(f"/v1/slas/{sla_id}/telemetry"), data=body, method="POST"
+        )
+        if idempotency_key is not None:
+            request.add_header("Idempotency-Key", idempotency_key)
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read(), response.headers["Content-Type"]
+        except HTTPError as error:
+            return error.code, error.read(), error.headers["Content-Type"]
+
+    def restart(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def test_telemetry_created(self) -> None:
+        self.activate()
+        status, body, content_type = self.post_telemetry(self.telemetry_body())
+        self.assertEqual(status, 201)
+        self.assertEqual(content_type, "application/json; charset=utf-8")
+        self.assertEqual(body, b'{"eventId":"evt-1"}')
+        self.assertFalse(body.endswith(b"\n"))
+
+    def test_replay_returns_first_status_and_bytes(self) -> None:
+        self.activate()
+        status, body, _ = self.post_telemetry(self.telemetry_body())
+        self.assertEqual((status, body), (201, b'{"eventId":"evt-1"}'))
+        for _ in range(2):
+            again_status, again_body, _ = self.post_telemetry(self.telemetry_body())
+            self.assertEqual((again_status, again_body), (status, body))
+
+    def test_replay_survives_restart(self) -> None:
+        self.activate()
+        status, body, _ = self.post_telemetry(self.telemetry_body())
+        self.assertEqual(status, 201)
+        self.restart()
+        again_status, again_body, _ = self.post_telemetry(self.telemetry_body())
+        self.assertEqual((again_status, again_body), (status, body))
+
+    def test_same_key_different_body_conflicts(self) -> None:
+        self.activate()
+        self.assertEqual(self.post_telemetry(self.telemetry_body())[0], 201)
+        for body in (
+            self.telemetry_body(event_id="evt-2"),
+            self.telemetry_body(latency_ms=13),
+        ):
+            status, response_body, _ = self.post_telemetry(body)
+            self.assertEqual(status, 409)
+            self.assertEqual(json.loads(response_body), {"error": "conflict"})
+
+    def test_same_key_different_sla_conflicts(self) -> None:
+        self.activate()
+        self.create_sla("sla-2", key="sla-2", start=self.start, end=self.end)
+        self.activate("sla-2")
+        self.assertEqual(self.post_telemetry(self.telemetry_body())[0], 201)
+        status, body, _ = self.post_telemetry(
+            self.telemetry_body(sla_id="sla-2"), sla_id="sla-2"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_sla_not_found(self) -> None:
+        status, body, _ = self.post_telemetry(self.telemetry_body(), sla_id="missing")
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+
+    def test_pending_sla_conflicts(self) -> None:
+        status, body, _ = self.post_telemetry(self.telemetry_body())
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_out_of_window_conflicts(self) -> None:
+        self.activate()
+        for timestamp in ((self.start - 1) * 1000, self.end * 1000):
+            status, body, _ = self.post_telemetry(
+                self.telemetry_body(timestamp=timestamp),
+                idempotency_key=f"tel-ts-{timestamp}",
+            )
+            self.assertEqual(status, 409, timestamp)
+            self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_window_boundaries_accepted(self) -> None:
+        self.activate()
+        status, body, _ = self.post_telemetry(
+            self.telemetry_body(timestamp=self.start * 1000)
+        )
+        self.assertEqual((status, body), (201, b'{"eventId":"evt-1"}'))
+        status, body, _ = self.post_telemetry(
+            self.telemetry_body(event_id="evt-2", timestamp=self.end * 1000 - 1),
+            idempotency_key="tel-2",
+        )
+        self.assertEqual((status, body), (201, b'{"eventId":"evt-2"}'))
+
+    def test_wrong_digest_conflicts(self) -> None:
+        self.activate()
+        status, body, _ = self.post_telemetry(
+            self.telemetry_body(digest="0" * 64)
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_digest_uses_sla_machine_snapshot(self) -> None:
+        self.activate()
+        timestamp = (self.start + 1) * 1000
+        wrong = hashlib.sha256(
+            f"sla-1\nevt-1\n{timestamp}\n12\n{self.consumer_id}".encode()
+        ).hexdigest()
+        status, body, _ = self.post_telemetry(
+            self.telemetry_body(timestamp=timestamp, digest=wrong)
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_duplicate_event_id_different_key_is_event_exists(self) -> None:
+        self.activate()
+        self.assertEqual(self.post_telemetry(self.telemetry_body())[0], 201)
+        status, body, _ = self.post_telemetry(
+            self.telemetry_body(), idempotency_key="tel-2"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "event_exists"})
+
+    def test_same_event_id_on_other_sla_accepted(self) -> None:
+        self.activate()
+        self.create_sla("sla-2", key="sla-2", start=self.start, end=self.end)
+        self.activate("sla-2")
+        self.assertEqual(self.post_telemetry(self.telemetry_body())[0], 201)
+        status, body, _ = self.post_telemetry(
+            self.telemetry_body(sla_id="sla-2"), sla_id="sla-2", idempotency_key="tel-2"
+        )
+        self.assertEqual((status, body), (201, b'{"eventId":"evt-1"}'))
+
+    def test_failed_request_leaves_no_idempotency_record(self) -> None:
+        self.activate()
+        status, _, _ = self.post_telemetry(self.telemetry_body(digest="0" * 64))
+        self.assertEqual(status, 409)
+        status, body, _ = self.post_telemetry(self.telemetry_body())
+        self.assertEqual((status, body), (201, b'{"eventId":"evt-1"}'))
+
+    def test_concurrent_same_key_all_replay_created(self) -> None:
+        self.activate()
+        results: list[tuple[int, bytes]] = []
+        lock = threading.Lock()
+
+        def submit() -> None:
+            status, body, _ = self.post_telemetry(self.telemetry_body())
+            with lock:
+                results.append((status, body))
+
+        threads = [threading.Thread(target=submit) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual(results, [(201, b'{"eventId":"evt-1"}')] * 8)
+
+    def test_concurrent_distinct_keys_same_event_single_winner(self) -> None:
+        self.activate()
+        results: list[int] = []
+        lock = threading.Lock()
+
+        def submit(index: int) -> None:
+            status, _, _ = self.post_telemetry(
+                self.telemetry_body(), idempotency_key=f"tel-race-{index}"
+            )
+            with lock:
+                results.append(status)
+
+        threads = [threading.Thread(target=submit, args=(index,)) for index in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual(sorted(results), [201] + [409] * 7)
+
+    def test_invalid_idempotency_key(self) -> None:
+        self.activate()
+        for key in (None, "", "bad key", "bad_key", "x" * 65, "é"):
+            status, body, _ = self.post_telemetry(
+                self.telemetry_body(), idempotency_key=key
+            )
+            self.assertEqual(status, 400, key)
+            self.assertEqual(json.loads(body), {"error": "invalid_request"})
+
+    def test_invalid_bodies(self) -> None:
+        self.activate()
+        valid = json.loads(self.telemetry_body())
+        cases = [
+            b"",
+            b"\xff\xfe{}",
+            b"{not json",
+            b"[1,2]",
+            b'"text"',
+            b"null",
+            b"{}",
+            json.dumps(dict(valid, extra=1)).encode(),
+            json.dumps(
+                {key: value for key, value in valid.items() if key != "digest"}
+            ).encode(),
+            json.dumps(dict(valid, eventId="")).encode(),
+            json.dumps(dict(valid, eventId="Evt_1")).encode(),
+            json.dumps(dict(valid, eventId="x" * 65)).encode(),
+            json.dumps(dict(valid, eventId=1)).encode(),
+            json.dumps(dict(valid, timestamp=-1)).encode(),
+            json.dumps(dict(valid, timestamp=2147483648000)).encode(),
+            json.dumps(dict(valid, timestamp=True)).encode(),
+            json.dumps(dict(valid, timestamp=1.0)).encode(),
+            json.dumps(dict(valid, timestamp="0")).encode(),
+            json.dumps(dict(valid, latencyMs=-1)).encode(),
+            json.dumps(dict(valid, latencyMs=2147483648)).encode(),
+            json.dumps(dict(valid, latencyMs=False)).encode(),
+            json.dumps(dict(valid, digest="")).encode(),
+            json.dumps(dict(valid, digest="0" * 63)).encode(),
+            json.dumps(dict(valid, digest="0" * 65)).encode(),
+            json.dumps(dict(valid, digest="A" * 64)).encode(),
+            json.dumps(dict(valid, digest=123)).encode(),
+            b'{"eventId":"evt-1","eventId":"evt-2","timestamp":'
+            + str(valid["timestamp"]).encode()
+            + b',"latencyMs":12,"digest":"'
+            + valid["digest"].encode()
+            + b'"}',
+        ]
+        for body in cases:
+            status, response_body, _ = self.post_telemetry(body)
+            self.assertEqual(status, 400, body)
+            self.assertEqual(json.loads(response_body), {"error": "invalid_request"})
+
+
 if __name__ == "__main__":
     unittest.main()
 
