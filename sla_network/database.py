@@ -48,6 +48,24 @@ CREATE TABLE IF NOT EXISTS sla_template_idempotency_records (
     status INTEGER NOT NULL,
     response_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS slas (
+    id TEXT PRIMARY KEY,
+    template_id TEXT NOT NULL,
+    machine_id TEXT NOT NULL,
+    consumer_id TEXT NOT NULL,
+    capability_version INTEGER NOT NULL,
+    price_micros INTEGER NOT NULL,
+    max_latency_ms INTEGER NOT NULL,
+    start_unix INTEGER NOT NULL,
+    end_unix INTEGER NOT NULL,
+    state TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sla_idempotency_records (
+    key TEXT PRIMARY KEY,
+    request_json TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    response_json TEXT NOT NULL
+);
 """
 
 
