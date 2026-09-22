@@ -2007,6 +2007,426 @@ class TelemetryTests(unittest.TestCase):
             self.assertEqual(json.loads(response_body), {"error": "invalid_request"})
 
 
+class EvaluationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.machine_id = machine_id(PUBLIC_KEY_A)
+        self.consumer_id = machine_id(PUBLIC_KEY_B)
+        for key, public_key in (("register-1", PUBLIC_KEY_A), ("register-2", PUBLIC_KEY_B)):
+            request = Request(
+                self.url("/v1/machines"),
+                data=json.dumps({"publicKey": public_key}).encode(),
+                method="POST",
+            )
+            request.add_header("Idempotency-Key", key)
+            with urlopen(request, timeout=5) as response:
+                self.assertEqual(response.status, 201)
+        request = Request(
+            self.url(f"/v1/machines/{self.machine_id}/capabilities"),
+            data=json.dumps(
+                {
+                    "expectedVersion": 0,
+                    "name": "pump-01",
+                    "protocol": "mqtt",
+                    "region": "cn",
+                    "unit": "call",
+                    "capacity": 10,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "cap-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        request = Request(
+            self.url("/v1/sla-templates"),
+            data=json.dumps(
+                {
+                    "id": "tpl-1",
+                    "machineId": self.machine_id,
+                    "capabilityVersion": 1,
+                    "priceMicros": 1000,
+                    "maxLatencyMs": 50,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "tpl-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        current = int(time.time())
+        self.start = current - 10
+        self.end = current + 3600
+        request = Request(
+            self.url("/v1/slas"),
+            data=json.dumps(
+                {
+                    "id": "sla-1",
+                    "templateId": "tpl-1",
+                    "consumerId": self.consumer_id,
+                    "start": self.start,
+                    "end": self.end,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "sla-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temporary.cleanup()
+
+    def url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}{path}"
+
+    def activate(self) -> None:
+        for key, party, actor in (
+            ("conf-p", "producer", self.machine_id),
+            ("conf-c", "consumer", self.consumer_id),
+        ):
+            request = Request(
+                self.url("/v1/slas/sla-1/confirmations"),
+                data=json.dumps({"party": party, "actorId": actor}).encode(),
+                method="POST",
+            )
+            request.add_header("Idempotency-Key", key)
+            with urlopen(request, timeout=5) as response:
+                self.assertEqual(response.status, 200)
+
+    def digest(self, event_id: str, timestamp: int, latency_ms: int) -> str:
+        message = f"sla-1\n{event_id}\n{timestamp}\n{latency_ms}\n{self.machine_id}"
+        return hashlib.sha256(message.encode("utf-8")).hexdigest()
+
+    def add_event(self, index: int, timestamp: int, latency_ms: int) -> None:
+        event_id = f"evt-{index:03d}"
+        body = json.dumps(
+            {
+                "eventId": event_id,
+                "timestamp": timestamp,
+                "latencyMs": latency_ms,
+                "digest": self.digest(event_id, timestamp, latency_ms),
+            }
+        ).encode()
+        request = Request(self.url("/v1/slas/sla-1/telemetry"), data=body, method="POST")
+        request.add_header("Idempotency-Key", f"tel-{index}")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+
+    def evaluation_body(self, **overrides: object) -> bytes:
+        fields: dict[str, object] = {
+            "from": self.start * 1000,
+            "to": self.end * 1000,
+        }
+        fields.update(overrides)
+        return json.dumps(fields).encode()
+
+    def post_evaluation(
+        self,
+        body: bytes,
+        sla_id: str = "sla-1",
+        idempotency_key: str | None = "eval-1",
+    ) -> tuple[int, bytes, str]:
+        request = Request(
+            self.url(f"/v1/slas/{sla_id}/evaluations"), data=body, method="POST"
+        )
+        if idempotency_key is not None:
+            request.add_header("Idempotency-Key", idempotency_key)
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read(), response.headers["Content-Type"]
+        except HTTPError as error:
+            return error.code, error.read(), error.headers["Content-Type"]
+
+    def restart(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def test_empty_window_is_insufficient_with_cut_zero(self) -> None:
+        self.activate()
+        status, body, content_type = self.post_evaluation(self.evaluation_body())
+        self.assertEqual(status, 201)
+        self.assertEqual(content_type, "application/json; charset=utf-8")
+        self.assertEqual(
+            list(json.loads(body)),
+            ["from", "to", "cut", "count", "latencySum", "maxLatency", "violations", "outcome"],
+        )
+        payload = json.loads(body)
+        self.assertEqual(payload["from"], self.start * 1000)
+        self.assertEqual(payload["to"], self.end * 1000)
+        self.assertEqual(payload["cut"], 0)
+        self.assertEqual(payload["count"], 0)
+        self.assertEqual(payload["latencySum"], 0)
+        self.assertIsNone(payload["maxLatency"])
+        self.assertEqual(payload["violations"], 0)
+        self.assertEqual(payload["outcome"], "insufficient")
+        self.assertFalse(body.endswith(b"\n"))
+
+    def test_fulfilled_when_no_violations(self) -> None:
+        self.activate()
+        base = self.start * 1000
+        self.add_event(1, base + 100, 10)
+        self.add_event(2, base + 200, 50)  # 等于阈值不算违约
+        status, body, _ = self.post_evaluation(
+            self.evaluation_body(**{"from": base, "to": base + 1000})
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(
+            json.loads(body),
+            {
+                "from": base,
+                "to": base + 1000,
+                "cut": 2,
+                "count": 2,
+                "latencySum": 60,
+                "maxLatency": 50,
+                "violations": 0,
+                "outcome": "fulfilled",
+            },
+        )
+
+    def test_breached_when_any_violation(self) -> None:
+        self.activate()
+        base = self.start * 1000
+        self.add_event(1, base + 100, 10)
+        self.add_event(2, base + 200, 51)
+        status, body, _ = self.post_evaluation(
+            self.evaluation_body(**{"from": base, "to": base + 1000})
+        )
+        self.assertEqual(status, 201)
+        payload = json.loads(body)
+        self.assertEqual(payload["cut"], 2)
+        self.assertEqual(payload["count"], 2)
+        self.assertEqual(payload["latencySum"], 61)
+        self.assertEqual(payload["maxLatency"], 51)
+        self.assertEqual(payload["violations"], 1)
+        self.assertEqual(payload["outcome"], "breached")
+
+    def test_interval_is_half_open_and_filtered_by_sla(self) -> None:
+        self.activate()
+        base = self.start * 1000
+        self.add_event(1, base + 100, 10)
+        self.add_event(2, base + 200, 60)
+        # 区间 [base+100, base+200) 只含事件 1：无违约，fulfilled。
+        status, body, _ = self.post_evaluation(
+            self.evaluation_body(**{"from": base + 100, "to": base + 200}),
+            idempotency_key="eval-sub",
+        )
+        self.assertEqual(status, 201)
+        payload = json.loads(body)
+        self.assertEqual(payload["cut"], 2)
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(payload["latencySum"], 10)
+        self.assertEqual(payload["maxLatency"], 10)
+        self.assertEqual(payload["violations"], 0)
+        self.assertEqual(payload["outcome"], "fulfilled")
+
+    def test_window_boundaries_accepted(self) -> None:
+        self.activate()
+        status, body, _ = self.post_evaluation(self.evaluation_body())
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(body)["outcome"], "insufficient")
+
+    def test_pending_sla_conflicts(self) -> None:
+        status, body, _ = self.post_evaluation(self.evaluation_body())
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_interval_out_of_window_conflicts(self) -> None:
+        self.activate()
+        base = self.start * 1000
+        end = self.end * 1000
+        for overrides in (
+            {"from": base - 1, "to": end},
+            {"from": base, "to": end + 1},
+            {"from": end, "to": end + 1},
+            {"from": base - 2, "to": base - 1},
+        ):
+            status, body, _ = self.post_evaluation(
+                self.evaluation_body(**overrides),
+                idempotency_key=f"eval-range-{overrides['from']}",
+            )
+            self.assertEqual(status, 409, overrides)
+            self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_sla_not_found(self) -> None:
+        status, body, _ = self.post_evaluation(
+            self.evaluation_body(), sla_id="missing"
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+
+    def test_invalid_idempotency_key(self) -> None:
+        self.activate()
+        for key in (None, "", "bad key", "bad_key", "x" * 65, "é"):
+            status, body, _ = self.post_evaluation(
+                self.evaluation_body(), idempotency_key=key
+            )
+            self.assertEqual(status, 400, key)
+            self.assertEqual(json.loads(body), {"error": "invalid_request"})
+
+    def test_invalid_bodies(self) -> None:
+        self.activate()
+        base = self.start * 1000
+        end = self.end * 1000
+        cases = [
+            b"",
+            b"\xff\xfe{}",
+            b"{not json",
+            b"[1,2]",
+            b'"text"',
+            b"null",
+            b"{}",
+            json.dumps({"from": base}).encode(),
+            json.dumps({"to": end}).encode(),
+            json.dumps({"from": base, "to": end, "extra": 1}).encode(),
+            json.dumps({"from": True, "to": end}).encode(),
+            json.dumps({"from": False, "to": end}).encode(),
+            json.dumps({"from": base, "to": True}).encode(),
+            json.dumps({"from": 1.0, "to": end}).encode(),
+            json.dumps({"from": str(base), "to": end}).encode(),
+            json.dumps({"from": None, "to": end}).encode(),
+            json.dumps({"from": base, "to": [end]}).encode(),
+            json.dumps({"from": end, "to": end}).encode(),
+            json.dumps({"from": base + 1, "to": base}).encode(),
+            b'{"from":' + str(base).encode() + b',"from":' + str(base).encode()
+            + b',"to":' + str(end).encode() + b"}",
+        ]
+        for body in cases:
+            status, response_body, _ = self.post_evaluation(body)
+            self.assertEqual(status, 400, body)
+            self.assertEqual(json.loads(response_body), {"error": "invalid_request"})
+
+    def test_same_key_different_sla_or_body_conflicts(self) -> None:
+        self.activate()
+        base = self.start * 1000
+        status, first_body, _ = self.post_evaluation(self.evaluation_body())
+        self.assertEqual(status, 201)
+        status, body, _ = self.post_evaluation(
+            self.evaluation_body(**{"to": base + 1000})
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+        status, body, _ = self.post_evaluation(
+            self.evaluation_body(), sla_id="missing"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+        # 同键同请求仍重放首次字节。
+        status, body, _ = self.post_evaluation(self.evaluation_body())
+        self.assertEqual((status, body), (201, first_body))
+
+    def test_failed_request_leaves_no_idempotency_record(self) -> None:
+        # pending 状态失败不占键；激活后同键首次使用应成功。
+        status, _, _ = self.post_evaluation(self.evaluation_body())
+        self.assertEqual(status, 409)
+        self.activate()
+        status, body, _ = self.post_evaluation(self.evaluation_body())
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(body)["outcome"], "insufficient")
+
+    def test_replay_returns_first_status_and_bytes(self) -> None:
+        self.activate()
+        base = self.start * 1000
+        self.add_event(1, base + 100, 60)
+        status, body, _ = self.post_evaluation(
+            self.evaluation_body(**{"from": base, "to": base + 1000})
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(body)["outcome"], "breached")
+        for _ in range(2):
+            again_status, again_body, _ = self.post_evaluation(
+                self.evaluation_body(**{"from": base, "to": base + 1000})
+            )
+            self.assertEqual((again_status, again_body), (status, body))
+
+    def test_snapshot_is_immutable_against_later_telemetry(self) -> None:
+        self.activate()
+        base = self.start * 1000
+        self.add_event(1, base + 100, 10)
+        status, first_body, _ = self.post_evaluation(
+            self.evaluation_body(**{"from": base, "to": base + 1000})
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(first_body)["cut"], 1)
+        # 评估后新增遥测（含违约事件）。
+        self.add_event(2, base + 200, 99)
+        self.add_event(3, base + 300, 98)
+        # 同键重放：cut 与汇总钉在首次快照。
+        status, body, _ = self.post_evaluation(
+            self.evaluation_body(**{"from": base, "to": base + 1000})
+        )
+        self.assertEqual((status, body), (201, first_body))
+        # 重启后仍重放首次字节。
+        self.restart()
+        status, body, _ = self.post_evaluation(
+            self.evaluation_body(**{"from": base, "to": base + 1000})
+        )
+        self.assertEqual((status, body), (201, first_body))
+        # 异键的新评估取新 cut，可见全部事件。
+        status, body, _ = self.post_evaluation(
+            self.evaluation_body(**{"from": base, "to": base + 1000}),
+            idempotency_key="eval-2",
+        )
+        self.assertEqual(status, 201)
+        payload = json.loads(body)
+        self.assertEqual(payload["cut"], 3)
+        self.assertEqual(payload["count"], 3)
+        self.assertEqual(payload["outcome"], "breached")
+
+    def test_replay_survives_restart(self) -> None:
+        self.activate()
+        base = self.start * 1000
+        self.add_event(1, base + 100, 10)
+        status, body, _ = self.post_evaluation(
+            self.evaluation_body(**{"from": base, "to": base + 1000})
+        )
+        self.assertEqual(status, 201)
+        self.restart()
+        again_status, again_body, _ = self.post_evaluation(
+            self.evaluation_body(**{"from": base, "to": base + 1000})
+        )
+        self.assertEqual((again_status, again_body), (status, body))
+
+    def test_concurrent_same_key_all_replay_created(self) -> None:
+        self.activate()
+        results: list[tuple[int, bytes]] = []
+        lock = threading.Lock()
+
+        def evaluate() -> None:
+            status, body, _ = self.post_evaluation(self.evaluation_body())
+            with lock:
+                results.append((status, body))
+
+        threads = [threading.Thread(target=evaluate) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual({status for status, _ in results}, {201})
+        self.assertEqual(len({body for _, body in results}), 1)
+
+    def test_get_on_evaluations_is_404(self) -> None:
+        try:
+            urlopen(self.url("/v1/slas/sla-1/evaluations"), timeout=5)
+            self.fail("expected HTTPError")
+        except HTTPError as error:
+            self.assertEqual(error.code, 404)
+            self.assertEqual(json.load(error), {"error": "not_found"})
+
+
 if __name__ == "__main__":
     unittest.main()
 
