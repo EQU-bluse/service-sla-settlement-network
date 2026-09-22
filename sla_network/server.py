@@ -20,6 +20,7 @@ TEMPLATE_ID_PATTERN = re.compile(r"[a-z0-9-]{1,64}")
 SLA_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)")
 SLA_CONFIRMATIONS_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/confirmations")
 SLA_TELEMETRY_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/telemetry")
+SLA_EVALUATIONS_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/evaluations")
 CAPABILITY_FIELDS = {"expectedVersion", "name", "protocol", "region", "unit", "capacity"}
 SLA_TEMPLATE_FIELDS = {
     "id",
@@ -32,6 +33,7 @@ SLA_FIELDS = {"id", "templateId", "consumerId", "start", "end"}
 CONFIRMATION_FIELDS = {"party", "actorId"}
 CONFIRMATION_PARTIES = {"producer", "consumer"}
 TELEMETRY_FIELDS = {"eventId", "timestamp", "latencyMs", "digest"}
+EVALUATION_FIELDS = {"from", "to"}
 TELEMETRY_QUERY_PARAMS = {"from", "to", "limit", "cursor"}
 TELEMETRY_TIME_MAX = 2147483648000
 TELEMETRY_DEFAULT_LIMIT = 50
@@ -324,6 +326,10 @@ class Handler(BaseHTTPRequestHandler):
         telemetry_match = SLA_TELEMETRY_PATH_PATTERN.fullmatch(self.path)
         if telemetry_match is not None:
             self._post_telemetry(telemetry_match.group(1))
+            return
+        evaluations_match = SLA_EVALUATIONS_PATH_PATTERN.fullmatch(self.path)
+        if evaluations_match is not None:
+            self._evaluate_sla(evaluations_match.group(1))
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
@@ -924,6 +930,121 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 database.execute(
                     "INSERT INTO sla_telemetry_idempotency_records"
+                    "(key, sla_id, request_json, status, response_json)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        sla_id,
+                        request_json,
+                        int(HTTPStatus.CREATED),
+                        json.dumps(payload, separators=(",", ":")),
+                    ),
+                )
+                database.execute("COMMIT")
+                return HTTPStatus.CREATED, payload
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+
+    def _evaluate_sla(self, sla_id: str) -> None:
+        idempotency_key = self.headers.get("Idempotency-Key")
+        if idempotency_key is None or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        fields = self._read_evaluation_object()
+        if fields is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        status, payload = self._apply_evaluation(idempotency_key, sla_id, fields)
+        self._json(status, payload)
+
+    def _read_evaluation_object(self) -> dict[str, Any] | None:
+        parsed = self._read_json_object()
+        if parsed is None or set(parsed) != EVALUATION_FIELDS:
+            return None
+        start = parsed["from"]
+        end = parsed["to"]
+        if not isinstance(start, int) or isinstance(start, bool):
+            return None
+        if not isinstance(end, int) or isinstance(end, bool):
+            return None
+        return parsed
+
+    def _apply_evaluation(
+        self, idempotency_key: str, sla_id: str, fields: dict[str, Any]
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                record = database.execute(
+                    "SELECT sla_id, request_json, status, response_json"
+                    " FROM sla_evaluation_idempotency_records WHERE key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    if record["sla_id"] == sla_id and record["request_json"] == request_json:
+                        return HTTPStatus(record["status"]), json.loads(record["response_json"])
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                sla = database.execute(
+                    "SELECT max_latency_ms, start_unix, end_unix, state"
+                    " FROM slas WHERE id = ?",
+                    (sla_id,),
+                ).fetchone()
+                if sla is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                start = fields["from"]
+                end = fields["to"]
+                if (
+                    sla["state"] != "active"
+                    or not (sla["start_unix"] * 1000 <= start < end <= sla["end_unix"] * 1000)
+                ):
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                cut_record = database.execute(
+                    "SELECT MAX(commit_seq) AS cut FROM sla_telemetry_events"
+                ).fetchone()
+                cut = cut_record["cut"]
+                if cut is None:
+                    cut = 0
+                summary = database.execute(
+                    "SELECT COUNT(*) AS count, COALESCE(SUM(latency_ms), 0) AS latency_sum,"
+                    " MAX(latency_ms) AS max_latency,"
+                    " COALESCE(SUM(CASE WHEN latency_ms > ? THEN 1 ELSE 0 END), 0)"
+                    " AS violations"
+                    " FROM sla_telemetry_events"
+                    " WHERE sla_id = ? AND commit_seq <= ?"
+                    " AND timestamp_ms >= ? AND timestamp_ms < ?",
+                    (
+                        sla["max_latency_ms"],
+                        sla_id,
+                        cut,
+                        start,
+                        end,
+                    ),
+                ).fetchone()
+                count = summary["count"]
+                violations = summary["violations"]
+                if count == 0:
+                    outcome = "insufficient"
+                elif violations == 0:
+                    outcome = "fulfilled"
+                else:
+                    outcome = "breached"
+                payload = {
+                    "from": start,
+                    "to": end,
+                    "cut": cut,
+                    "count": count,
+                    "latencySum": summary["latency_sum"],
+                    "maxLatency": summary["max_latency"],
+                    "violations": violations,
+                    "outcome": outcome,
+                }
+                database.execute(
+                    "INSERT INTO sla_evaluation_idempotency_records"
                     "(key, sla_id, request_json, status, response_json)"
                     " VALUES (?, ?, ?, ?, ?)",
                     (

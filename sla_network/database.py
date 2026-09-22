@@ -95,6 +95,13 @@ CREATE TABLE IF NOT EXISTS sla_telemetry_idempotency_records (
     status INTEGER NOT NULL,
     response_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS sla_evaluation_idempotency_records (
+    key TEXT PRIMARY KEY,
+    sla_id TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    response_json TEXT NOT NULL
+);
 """
 
 TELEMETRY_SEQ_MARKER = "telemetry_commit_seq_renumbered"
