@@ -85,7 +85,7 @@ CREATE TABLE IF NOT EXISTS sla_telemetry_events (
     timestamp_ms INTEGER NOT NULL,
     latency_ms INTEGER NOT NULL,
     digest TEXT NOT NULL,
-    commit_seq INTEGER,
+    commit_seq INTEGER NOT NULL,
     PRIMARY KEY (sla_id, event_id)
 );
 CREATE TABLE IF NOT EXISTS sla_telemetry_idempotency_records (
@@ -97,6 +97,55 @@ CREATE TABLE IF NOT EXISTS sla_telemetry_idempotency_records (
 );
 """
 
+TELEMETRY_SEQ_MARKER = "telemetry_commit_seq_renumbered"
+TELEMETRY_SEQ_INDEX = "idx_sla_telemetry_commit_seq_unique"
+
+
+def _renumber_commit_seq(connection: sqlite3.Connection) -> None:
+    # 仅在一次性迁移（含空库首次连接）时取写锁；BEGIN IMMEDIATE 串行并发首启。
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        if (
+            connection.execute(
+                "SELECT 1 FROM schema_metadata WHERE key = ?",
+                (TELEMETRY_SEQ_MARKER,),
+            ).fetchone()
+            is not None
+        ):
+            # 其他连接已完成迁移，直接释放写锁，不再重编号。
+            connection.execute("COMMIT")
+            return
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(sla_telemetry_events)")
+        }
+        if "commit_seq" not in columns:
+            connection.execute(
+                "ALTER TABLE sla_telemetry_events ADD COLUMN commit_seq INTEGER"
+            )
+        # 单事务按全局 rowid 升序稠密重编号 1..N；事件内容与幂等记录不变。
+        rows = connection.execute(
+            "SELECT rowid AS rid FROM sla_telemetry_events ORDER BY rowid ASC"
+        ).fetchall()
+        for commit_seq, row in enumerate(rows, start=1):
+            connection.execute(
+                "UPDATE sla_telemetry_events SET commit_seq = ? WHERE rowid = ?",
+                (commit_seq, row["rid"]),
+            )
+        connection.execute(
+            "INSERT INTO schema_metadata(key, value) VALUES (?, '1')",
+            (TELEMETRY_SEQ_MARKER,),
+        )
+        # 唯一索引必须在重编号之后建立：旧库迁移前存在跨 SLA 的重复序号。
+        connection.execute(
+            f"CREATE UNIQUE INDEX IF NOT EXISTS {TELEMETRY_SEQ_INDEX}"
+            " ON sla_telemetry_events(commit_seq)"
+        )
+        connection.execute("COMMIT")
+    except BaseException:
+        connection.execute("ROLLBACK")
+        raise
+
 
 def connect(path: str) -> sqlite3.Connection:
     database = Path(path)
@@ -104,15 +153,17 @@ def connect(path: str) -> sqlite3.Connection:
     connection = sqlite3.connect(database, isolation_level=None)
     connection.row_factory = sqlite3.Row
     connection.executescript(SCHEMA)
-    columns = {
-        row["name"]
-        for row in connection.execute("PRAGMA table_info(sla_telemetry_events)")
-    }
-    if "commit_seq" not in columns:
-        connection.execute("ALTER TABLE sla_telemetry_events ADD COLUMN commit_seq INTEGER")
+    # 快速路径：一次性标记已存在则纯读，避免给普通读请求加写锁；
+    # 标记与唯一索引在同一事务写入，故标记存在即索引已就绪。
+    if (
         connection.execute(
-            "UPDATE sla_telemetry_events SET commit_seq = rowid WHERE commit_seq IS NULL"
-        )
+            "SELECT 1 FROM schema_metadata WHERE key = ?",
+            (TELEMETRY_SEQ_MARKER,),
+        ).fetchone()
+        is None
+    ):
+        _renumber_commit_seq(connection)
+    # 此处 commit_seq 必然存在：新库由 SCHEMA 建列，旧库由迁移补列。
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_sla_telemetry_commit"
         " ON sla_telemetry_events(sla_id, commit_seq, timestamp_ms, event_id)"

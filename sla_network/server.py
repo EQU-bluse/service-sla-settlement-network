@@ -192,8 +192,6 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 cut_record = database.execute(
                     "SELECT MAX(commit_seq) AS cut FROM sla_telemetry_events"
-                    " WHERE sla_id = ?",
-                    (sla_id,),
                 ).fetchone()
                 current_cut = cut_record["cut"]
                 if current_cut is None:
@@ -907,8 +905,7 @@ class Handler(BaseHTTPRequestHandler):
                     return HTTPStatus.CONFLICT, {"error": "event_exists"}
                 next_record = database.execute(
                     "SELECT COALESCE(MAX(commit_seq), 0) + 1 AS next_seq"
-                    " FROM sla_telemetry_events WHERE sla_id = ?",
-                    (sla_id,),
+                    " FROM sla_telemetry_events"
                 ).fetchone()
                 commit_seq = next_record["next_seq"]
                 payload = {"eventId": fields["eventId"]}
