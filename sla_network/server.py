@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.parse import parse_qsl, urlsplit
 
 from .database import connect
 
@@ -31,6 +32,9 @@ SLA_FIELDS = {"id", "templateId", "consumerId", "start", "end"}
 CONFIRMATION_FIELDS = {"party", "actorId"}
 CONFIRMATION_PARTIES = {"producer", "consumer"}
 TELEMETRY_FIELDS = {"eventId", "timestamp", "latencyMs", "digest"}
+TELEMETRY_QUERY_FIELDS = {"from", "to", "limit", "cursor"}
+DECIMAL_PATTERN = re.compile(r"0|[1-9][0-9]*")
+TELEMETRY_TO_MAX = 2147483648000
 CAPABILITY_PROTOCOLS = {"http", "mqtt"}
 CAPABILITY_REGIONS = {"cn", "eu", "us"}
 CAPABILITY_UNITS = {"call", "byte", "ms"}
@@ -53,6 +57,12 @@ def _bounded_int(value: Any, minimum: int, maximum: int) -> bool:
         and not isinstance(value, bool)
         and minimum <= value <= maximum
     )
+
+
+def _parse_decimal(text: str) -> int | None:
+    if DECIMAL_PATTERN.fullmatch(text) is None:
+        return None
+    return int(text)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -81,6 +91,10 @@ class Handler(BaseHTTPRequestHandler):
                     "time": datetime.now(UTC).isoformat(),
                 },
             )
+            return
+        telemetry_match = SLA_TELEMETRY_PATH_PATTERN.fullmatch(urlsplit(self.path).path)
+        if telemetry_match is not None:
+            self._get_telemetry(telemetry_match.group(1), urlsplit(self.path).query)
             return
         sla_match = SLA_PATH_PATTERN.fullmatch(self.path)
         if sla_match is not None:
@@ -114,6 +128,178 @@ class Handler(BaseHTTPRequestHandler):
                 "state": record["state"],
             },
         )
+
+    def _get_telemetry(self, sla_id: str, query: str) -> None:
+        pairs = parse_qsl(query, keep_blank_values=True)
+        keys = [key for key, _ in pairs]
+        if (
+            len(set(keys)) != len(keys)
+            or not set(keys) <= TELEMETRY_QUERY_FIELDS
+            or "from" not in keys
+            or "to" not in keys
+        ):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        params = dict(pairs)
+        from_value = _parse_decimal(params["from"])
+        to_value = _parse_decimal(params["to"])
+        if (
+            from_value is None
+            or to_value is None
+            or not 0 <= from_value < to_value <= TELEMETRY_TO_MAX
+        ):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        limit = 50
+        if "limit" in params:
+            parsed_limit = _parse_decimal(params["limit"])
+            if parsed_limit is None or not 1 <= parsed_limit <= 100:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+                return
+            limit = parsed_limit
+        cursor_cut: int | None = None
+        cursor_timestamp = 0
+        cursor_event_id = ""
+        if "cursor" in params:
+            parts = params["cursor"].split(":")
+            if len(parts) != 3:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+                return
+            parsed_cut = _parse_decimal(parts[0])
+            parsed_timestamp = _parse_decimal(parts[1])
+            if (
+                parsed_cut is None
+                or parsed_timestamp is None
+                or TEMPLATE_ID_PATTERN.fullmatch(parts[2]) is None
+            ):
+                self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+                return
+            cursor_cut = parsed_cut
+            cursor_timestamp = parsed_timestamp
+            cursor_event_id = parts[2]
+        status, payload = self._read_telemetry_page(
+            sla_id,
+            from_value,
+            to_value,
+            limit,
+            cursor_cut,
+            cursor_timestamp,
+            cursor_event_id,
+        )
+        self._json(status, payload)
+
+    def _read_telemetry_page(
+        self,
+        sla_id: str,
+        from_value: int,
+        to_value: int,
+        limit: int,
+        cursor_cut: int | None,
+        cursor_timestamp: int,
+        cursor_event_id: str,
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN")
+            try:
+                sla = database.execute(
+                    "SELECT max_latency_ms FROM slas WHERE id = ?", (sla_id,)
+                ).fetchone()
+                if sla is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                current_cut = database.execute(
+                    "SELECT COALESCE(MAX(seq), 0) AS cut FROM sla_telemetry_events"
+                ).fetchone()["cut"]
+                if cursor_cut is None:
+                    cut = current_cut
+                    page_rows = database.execute(
+                        "SELECT event_id, timestamp_ms, latency_ms, digest"
+                        " FROM sla_telemetry_events"
+                        " WHERE sla_id = ? AND seq <= ?"
+                        " AND timestamp_ms >= ? AND timestamp_ms < ?"
+                        " ORDER BY timestamp_ms, event_id LIMIT ?",
+                        (sla_id, cut, from_value, to_value, limit + 1),
+                    ).fetchall()
+                else:
+                    anchor = database.execute(
+                        "SELECT seq, timestamp_ms FROM sla_telemetry_events"
+                        " WHERE sla_id = ? AND event_id = ?",
+                        (sla_id, cursor_event_id),
+                    ).fetchone()
+                    if (
+                        anchor is None
+                        or anchor["timestamp_ms"] != cursor_timestamp
+                        or not from_value <= cursor_timestamp < to_value
+                        or anchor["seq"] > cursor_cut
+                    ):
+                        database.execute("ROLLBACK")
+                        return HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                    cut = cursor_cut
+                    page_rows = database.execute(
+                        "SELECT event_id, timestamp_ms, latency_ms, digest"
+                        " FROM sla_telemetry_events"
+                        " WHERE sla_id = ? AND seq <= ?"
+                        " AND timestamp_ms >= ? AND timestamp_ms < ?"
+                        " AND (timestamp_ms > ?"
+                        " OR (timestamp_ms = ? AND event_id > ?))"
+                        " ORDER BY timestamp_ms, event_id LIMIT ?",
+                        (
+                            sla_id,
+                            min(cut, current_cut),
+                            from_value,
+                            to_value,
+                            cursor_timestamp,
+                            cursor_timestamp,
+                            cursor_event_id,
+                            limit + 1,
+                        ),
+                    ).fetchall()
+                summary = database.execute(
+                    "SELECT COUNT(*) AS count,"
+                    " COALESCE(SUM(latency_ms), 0) AS latency_sum,"
+                    " MAX(latency_ms) AS max_latency,"
+                    " COALESCE(SUM(CASE WHEN latency_ms > ? THEN 1 ELSE 0 END), 0)"
+                    " AS violations"
+                    " FROM sla_telemetry_events"
+                    " WHERE sla_id = ? AND seq <= ?"
+                    " AND timestamp_ms >= ? AND timestamp_ms < ?",
+                    (
+                        sla["max_latency_ms"],
+                        sla_id,
+                        min(cut, current_cut),
+                        from_value,
+                        to_value,
+                    ),
+                ).fetchone()
+                database.execute("COMMIT")
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+        has_more = len(page_rows) > limit
+        page = page_rows[:limit]
+        next_cursor = None
+        if has_more:
+            last = page[-1]
+            next_cursor = f"{cut}:{last['timestamp_ms']}:{last['event_id']}"
+        events = [
+            {
+                "eventId": row["event_id"],
+                "timestamp": row["timestamp_ms"],
+                "latencyMs": row["latency_ms"],
+                "digest": row["digest"],
+            }
+            for row in page
+        ]
+        return HTTPStatus.OK, {
+            "events": events,
+            "summary": {
+                "count": summary["count"],
+                "latencySum": summary["latency_sum"],
+                "maxLatency": summary["max_latency"],
+                "violations": summary["violations"],
+            },
+            "nextCursor": next_cursor,
+        }
 
     def do_POST(self) -> None:  # noqa: N802
         if self.path == "/v1/machines":
@@ -716,16 +902,21 @@ class Handler(BaseHTTPRequestHandler):
                     database.execute("ROLLBACK")
                     return HTTPStatus.CONFLICT, {"error": "event_exists"}
                 payload = {"eventId": fields["eventId"]}
+                next_seq = database.execute(
+                    "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq"
+                    " FROM sla_telemetry_events"
+                ).fetchone()["next_seq"]
                 database.execute(
                     "INSERT INTO sla_telemetry_events"
-                    "(sla_id, event_id, timestamp_ms, latency_ms, digest)"
-                    " VALUES (?, ?, ?, ?, ?)",
+                    "(sla_id, event_id, timestamp_ms, latency_ms, digest, seq)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
                     (
                         sla_id,
                         fields["eventId"],
                         timestamp,
                         fields["latencyMs"],
                         fields["digest"],
+                        next_seq,
                     ),
                 )
                 database.execute(

@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS sla_telemetry_events (
     timestamp_ms INTEGER NOT NULL,
     latency_ms INTEGER NOT NULL,
     digest TEXT NOT NULL,
+    seq INTEGER,
     PRIMARY KEY (sla_id, event_id)
 );
 CREATE TABLE IF NOT EXISTS sla_telemetry_idempotency_records (
@@ -103,5 +104,15 @@ def connect(path: str) -> sqlite3.Connection:
     connection = sqlite3.connect(database, isolation_level=None)
     connection.row_factory = sqlite3.Row
     connection.executescript(SCHEMA)
+    columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(sla_telemetry_events)")
+    }
+    if "seq" not in columns:
+        try:
+            connection.execute("ALTER TABLE sla_telemetry_events ADD COLUMN seq INTEGER")
+            connection.execute("UPDATE sla_telemetry_events SET seq = rowid")
+        except sqlite3.OperationalError:
+            # 并发连接已应用迁移。
+            pass
     return connection
 

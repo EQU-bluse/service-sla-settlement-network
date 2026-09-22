@@ -1786,6 +1786,301 @@ class TelemetryTests(unittest.TestCase):
             self.assertEqual(json.loads(response_body), {"error": "invalid_request"})
 
 
+class TelemetryGetTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.machine_id = machine_id(PUBLIC_KEY_A)
+        self.consumer_id = machine_id(PUBLIC_KEY_B)
+        for key, public_key in (("register-1", PUBLIC_KEY_A), ("register-2", PUBLIC_KEY_B)):
+            request = Request(
+                self.url("/v1/machines"),
+                data=json.dumps({"publicKey": public_key}).encode(),
+                method="POST",
+            )
+            request.add_header("Idempotency-Key", key)
+            with urlopen(request, timeout=5) as response:
+                self.assertEqual(response.status, 201)
+        request = Request(
+            self.url(f"/v1/machines/{self.machine_id}/capabilities"),
+            data=json.dumps(
+                {
+                    "expectedVersion": 0,
+                    "name": "pump-01",
+                    "protocol": "mqtt",
+                    "region": "cn",
+                    "unit": "call",
+                    "capacity": 10,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "cap-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        request = Request(
+            self.url("/v1/sla-templates"),
+            data=json.dumps(
+                {
+                    "id": "tpl-1",
+                    "machineId": self.machine_id,
+                    "capabilityVersion": 1,
+                    "priceMicros": 1000,
+                    "maxLatencyMs": 50,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "tpl-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        current = int(time.time())
+        self.start = current - 10
+        self.end = current + 3600
+        request = Request(
+            self.url("/v1/slas"),
+            data=json.dumps(
+                {
+                    "id": "sla-1",
+                    "templateId": "tpl-1",
+                    "consumerId": self.consumer_id,
+                    "start": self.start,
+                    "end": self.end,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "sla-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        for key, party, actor in (
+            ("conf-p", "producer", self.machine_id),
+            ("conf-c", "consumer", self.consumer_id),
+        ):
+            request = Request(
+                self.url("/v1/slas/sla-1/confirmations"),
+                data=json.dumps({"party": party, "actorId": actor}).encode(),
+                method="POST",
+            )
+            request.add_header("Idempotency-Key", key)
+            with urlopen(request, timeout=5) as response:
+                self.assertEqual(response.status, 200)
+        self.base = self.start * 1000
+        for event_id, offset, latency in (
+            ("evt-a", 100, 10),
+            ("evt-b", 200, 60),
+            ("evt-c", 200, 30),
+            ("evt-d", 300, 40),
+        ):
+            self.post_event(event_id, self.base + offset, latency)
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temporary.cleanup()
+
+    def url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}{path}"
+
+    def post_event(self, event_id: str, timestamp: int, latency_ms: int) -> None:
+        message = f"sla-1\n{event_id}\n{timestamp}\n{latency_ms}\n{self.machine_id}"
+        digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
+        request = Request(
+            self.url("/v1/slas/sla-1/telemetry"),
+            data=json.dumps(
+                {
+                    "eventId": event_id,
+                    "timestamp": timestamp,
+                    "latencyMs": latency_ms,
+                    "digest": digest,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", f"get-{event_id}")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+
+    def get_telemetry(self, query: str, sla_id: str = "sla-1") -> tuple[int, bytes, str]:
+        try:
+            with urlopen(
+                self.url(f"/v1/slas/{sla_id}/telemetry?{query}"), timeout=5
+            ) as response:
+                return response.status, response.read(), response.headers["Content-Type"]
+        except HTTPError as error:
+            return error.code, error.read(), error.headers["Content-Type"]
+
+    def restart(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def query_range(self) -> str:
+        return f"from={self.base}&to={self.base + 400}"
+
+    def test_first_page_orders_and_summarizes(self) -> None:
+        status, body, content_type = self.get_telemetry(self.query_range())
+        self.assertEqual(status, 200)
+        self.assertEqual(content_type, "application/json; charset=utf-8")
+        payload = json.loads(body)
+        self.assertEqual(list(payload), ["events", "summary", "nextCursor"])
+        self.assertEqual(
+            [event["eventId"] for event in payload["events"]],
+            ["evt-a", "evt-b", "evt-c", "evt-d"],
+        )
+        for event in payload["events"]:
+            self.assertEqual(list(event), ["eventId", "timestamp", "latencyMs", "digest"])
+        first = payload["events"][0]
+        self.assertEqual(first["timestamp"], self.base + 100)
+        self.assertEqual(first["latencyMs"], 10)
+        self.assertEqual(len(first["digest"]), 64)
+        self.assertEqual(
+            list(payload["summary"]), ["count", "latencySum", "maxLatency", "violations"]
+        )
+        self.assertEqual(
+            payload["summary"],
+            {"count": 4, "latencySum": 140, "maxLatency": 60, "violations": 1},
+        )
+        self.assertIsNone(payload["nextCursor"])
+
+    def test_pagination_follows_cursor(self) -> None:
+        status, body, _ = self.get_telemetry(self.query_range() + "&limit=2")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual([e["eventId"] for e in payload["events"]], ["evt-a", "evt-b"])
+        cursor = payload["nextCursor"]
+        self.assertEqual(cursor, f"4:{self.base + 200}:evt-b")
+        status, body, _ = self.get_telemetry(
+            self.query_range() + f"&limit=2&cursor={cursor}"
+        )
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual([e["eventId"] for e in payload["events"]], ["evt-c", "evt-d"])
+        self.assertIsNone(payload["nextCursor"])
+        self.assertEqual(
+            payload["summary"],
+            {"count": 4, "latencySum": 140, "maxLatency": 60, "violations": 1},
+        )
+
+    def test_new_events_after_cut_do_not_affect_continuation(self) -> None:
+        _, body, _ = self.get_telemetry(self.query_range() + "&limit=2")
+        cursor = json.loads(body)["nextCursor"]
+        self.post_event("evt-e", self.base + 350, 20)
+        status, body, _ = self.get_telemetry(
+            self.query_range() + f"&limit=2&cursor={cursor}"
+        )
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual([e["eventId"] for e in payload["events"]], ["evt-c", "evt-d"])
+        self.assertEqual(payload["summary"]["count"], 4)
+        _, body, _ = self.get_telemetry(self.query_range())
+        payload = json.loads(body)
+        self.assertEqual(payload["summary"]["count"], 5)
+        self.assertEqual(payload["summary"]["latencySum"], 160)
+
+    def test_cursor_survives_restart(self) -> None:
+        _, body, _ = self.get_telemetry(self.query_range() + "&limit=2")
+        cursor = json.loads(body)["nextCursor"]
+        self.restart()
+        status, body, _ = self.get_telemetry(
+            self.query_range() + f"&limit=2&cursor={cursor}"
+        )
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual([e["eventId"] for e in payload["events"]], ["evt-c", "evt-d"])
+        self.assertEqual(payload["summary"]["count"], 4)
+
+    def test_empty_range_returns_null_max(self) -> None:
+        status, body, _ = self.get_telemetry(
+            f"from={self.base + 400}&to={self.base + 500}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            json.loads(body),
+            {
+                "events": [],
+                "summary": {"count": 0, "latencySum": 0, "maxLatency": None, "violations": 0},
+                "nextCursor": None,
+            },
+        )
+
+    def test_partial_range_filters_events(self) -> None:
+        status, body, _ = self.get_telemetry(
+            f"from={self.base + 150}&to={self.base + 250}"
+        )
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual([e["eventId"] for e in payload["events"]], ["evt-b", "evt-c"])
+        self.assertEqual(
+            payload["summary"],
+            {"count": 2, "latencySum": 90, "maxLatency": 60, "violations": 1},
+        )
+
+    def test_boundary_to_accepted(self) -> None:
+        status, _, _ = self.get_telemetry("from=0&to=2147483648000")
+        self.assertEqual(status, 200)
+
+    def test_sla_not_found(self) -> None:
+        status, body, _ = self.get_telemetry(self.query_range(), sla_id="missing")
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+
+    def test_invalid_queries(self) -> None:
+        cases = [
+            "",
+            f"from={self.base}",
+            f"to={self.base + 400}",
+            self.query_range() + "&extra=1",
+            f"from={self.base}&from={self.base}&to={self.base + 400}",
+            self.query_range() + "&limit=1&limit=2",
+            f"from=0{self.base}&to={self.base + 400}",
+            f"from={self.base + 400}&to={self.base + 400}",
+            f"from={self.base + 500}&to={self.base + 400}",
+            "from=-1&to=2",
+            "from=1.0&to=2",
+            "from=abc&to=2",
+            "from=&to=2",
+            "from=0&to=2147483648001",
+            self.query_range() + "&limit=0",
+            self.query_range() + "&limit=101",
+            self.query_range() + "&limit=01",
+            self.query_range() + "&limit=abc",
+            self.query_range() + "&limit=",
+            self.query_range() + "&cursor=abc",
+            self.query_range() + "&cursor=1:2",
+            self.query_range() + "&cursor=1:2:3:4",
+            self.query_range() + "&cursor=01:2:evt-a",
+            self.query_range() + "&cursor=1:02:evt-a",
+            self.query_range() + "&cursor=1:2:Evt_A",
+            self.query_range() + "&cursor=1:2:",
+            self.query_range() + f"&cursor=4:{self.base + 100}:evt-zzz",
+            self.query_range() + f"&cursor=4:{self.base + 101}:evt-a",
+            self.query_range() + f"&cursor=0:{self.base + 100}:evt-a",
+            self.query_range() + f"&cursor=4:{self.base + 500}:evt-a",
+        ]
+        for query in cases:
+            status, body, _ = self.get_telemetry(query)
+            self.assertEqual(status, 400, query)
+            self.assertEqual(json.loads(body), {"error": "invalid_request"})
+
+    def test_cursor_anchor_outside_requested_range(self) -> None:
+        _, body, _ = self.get_telemetry(self.query_range() + "&limit=1")
+        cursor = json.loads(body)["nextCursor"]
+        status, body, _ = self.get_telemetry(
+            f"from={self.base + 200}&to={self.base + 400}&cursor={cursor}"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+
+
 if __name__ == "__main__":
     unittest.main()
 
