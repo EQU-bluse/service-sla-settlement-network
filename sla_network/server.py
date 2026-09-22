@@ -190,10 +190,9 @@ class Handler(BaseHTTPRequestHandler):
                     database.execute("ROLLBACK")
                     self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
                     return
+                # 读事务起点取全库最大提交序号作为首页 cut（空库为 0）。
                 cut_record = database.execute(
                     "SELECT MAX(commit_seq) AS cut FROM sla_telemetry_events"
-                    " WHERE sla_id = ?",
-                    (sla_id,),
                 ).fetchone()
                 current_cut = cut_record["cut"]
                 if current_cut is None:
@@ -905,10 +904,10 @@ class Handler(BaseHTTPRequestHandler):
                 if existing is not None:
                     database.execute("ROLLBACK")
                     return HTTPStatus.CONFLICT, {"error": "event_exists"}
+                # 全库共享持久化序列：提交序号为提交前全库最大值加一，跨 SLA 唯一。
                 next_record = database.execute(
                     "SELECT COALESCE(MAX(commit_seq), 0) + 1 AS next_seq"
-                    " FROM sla_telemetry_events WHERE sla_id = ?",
-                    (sla_id,),
+                    " FROM sla_telemetry_events"
                 ).fetchone()
                 commit_seq = next_record["next_seq"]
                 payload = {"eventId": fields["eventId"]}
