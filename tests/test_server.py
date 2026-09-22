@@ -1590,6 +1590,227 @@ class TelemetryTests(unittest.TestCase):
         except HTTPError as error:
             return error.code, error.read(), error.headers["Content-Type"]
 
+    def add_event(self, index: int, timestamp: int, latency_ms: int) -> None:
+        event_id = f"evt-{index:03d}"
+        status, body, _ = self.post_telemetry(
+            self.telemetry_body(
+                event_id=event_id, timestamp=timestamp, latency_ms=latency_ms
+            ),
+            idempotency_key=f"tel-{index}",
+        )
+        self.assertEqual(
+            (status, body),
+            (201, json.dumps({"eventId": event_id}, separators=(",", ":")).encode()),
+        )
+
+    def get_telemetry(
+        self, query: str = "", sla_id: str = "sla-1"
+    ) -> tuple[int, object, str]:
+        suffix = f"?{query}" if query else ""
+        try:
+            with urlopen(
+                self.url(f"/v1/slas/{sla_id}/telemetry{suffix}"), timeout=5
+            ) as response:
+                return (
+                    response.status,
+                    json.loads(response.read()),
+                    response.headers["Content-Type"],
+                )
+        except HTTPError as error:
+            return error.code, json.loads(error.read()), error.headers["Content-Type"]
+
+    def test_get_telemetry_empty_sla(self) -> None:
+        self.activate()
+        status, body, content_type = self.get_telemetry("from=0&to=2147483648000")
+        self.assertEqual(status, 200)
+        self.assertEqual(content_type, "application/json; charset=utf-8")
+        self.assertEqual(list(body), ["events", "summary", "nextCursor"])
+        self.assertEqual(body["events"], [])
+        self.assertEqual(list(body["summary"]), ["count", "latencySum", "maxLatency", "violations"])
+        self.assertEqual(
+            body["summary"],
+            {"count": 0, "latencySum": 0, "maxLatency": None, "violations": 0},
+        )
+        self.assertIsNone(body["nextCursor"])
+
+    def test_get_telemetry_order_window_and_summary(self) -> None:
+        self.activate()
+        base = self.start * 1000
+        self.add_event(1, base + 100, 10)
+        self.add_event(2, base + 100, 5)  # 同 timestamp 按 eventId 升序
+        self.add_event(3, base + 200, 60)  # 违约（> 50）
+        self.add_event(4, base + 300, 51)  # 违约
+        status, body, _ = self.get_telemetry(f"from={base}&to={base + 400}")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [event["eventId"] for event in body["events"]],
+            ["evt-001", "evt-002", "evt-003", "evt-004"],
+        )
+        self.assertEqual(
+            list(body["events"][0]), ["eventId", "timestamp", "latencyMs", "digest"]
+        )
+        self.assertEqual(
+            body["summary"],
+            {"count": 4, "latencySum": 126, "maxLatency": 60, "violations": 2},
+        )
+        self.assertIsNone(body["nextCursor"])
+
+    def test_get_telemetry_interval_is_half_open(self) -> None:
+        self.activate()
+        base = self.start * 1000
+        self.add_event(1, base + 100, 10)
+        self.add_event(2, base + 200, 10)
+        status, body, _ = self.get_telemetry(f"from={base + 100}&to={base + 200}")
+        self.assertEqual(status, 200)
+        self.assertEqual([event["eventId"] for event in body["events"]], ["evt-001"])
+        self.assertEqual(body["summary"]["count"], 1)
+
+    def test_get_telemetry_boundary_from_to_accepted(self) -> None:
+        self.activate()
+        status, _, _ = self.get_telemetry("from=0&to=2147483648000")
+        self.assertEqual(status, 200)
+
+    def test_get_telemetry_pagination(self) -> None:
+        self.activate()
+        base = self.start * 1000
+        for index in range(1, 6):
+            self.add_event(index, base + index * 10, index)
+        status, page1, _ = self.get_telemetry(f"from={base}&to={base + 1000}&limit=2")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [event["eventId"] for event in page1["events"]], ["evt-001", "evt-002"]
+        )
+        self.assertEqual(page1["nextCursor"], f"5:{base + 20}:evt-002")
+        self.assertEqual(page1["summary"]["count"], 5)
+        status, page2, _ = self.get_telemetry(
+            f"from={base}&to={base + 1000}&limit=2&cursor={page1['nextCursor']}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [event["eventId"] for event in page2["events"]], ["evt-003", "evt-004"]
+        )
+        self.assertEqual(page2["nextCursor"], f"5:{base + 40}:evt-004")
+        status, page3, _ = self.get_telemetry(
+            f"from={base}&to={base + 1000}&limit=2&cursor={page2['nextCursor']}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual([event["eventId"] for event in page3["events"]], ["evt-005"])
+        self.assertIsNone(page3["nextCursor"])
+
+    def test_get_telemetry_default_limit_is_50(self) -> None:
+        self.activate()
+        base = self.start * 1000
+        for index in range(1, 52):
+            self.add_event(index, base + index, index)
+        status, page1, _ = self.get_telemetry(f"from={base}&to={base + 1000}")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(page1["events"]), 50)
+        self.assertEqual(page1["summary"]["count"], 51)
+        self.assertIsNotNone(page1["nextCursor"])
+        status, page2, _ = self.get_telemetry(
+            f"from={base}&to={base + 1000}&cursor={page1['nextCursor']}"
+        )
+        self.assertEqual(
+            [event["eventId"] for event in page2["events"]], ["evt-051"]
+        )
+        self.assertIsNone(page2["nextCursor"])
+
+    def test_get_telemetry_cursor_pins_cut_against_new_events(self) -> None:
+        self.activate()
+        base = self.start * 1000
+        for index in range(1, 4):
+            self.add_event(index, base + index * 10, index)
+        status, page1, _ = self.get_telemetry(f"from={base}&to={base + 1000}&limit=2")
+        self.assertEqual(status, 200)
+        cursor = page1["nextCursor"]
+        # 新事件按序会插入到已返回事件之间与之后。
+        self.add_event(4, base + 15, 4)
+        self.add_event(5, base + 25, 99)
+        status, page2, _ = self.get_telemetry(
+            f"from={base}&to={base + 1000}&limit=2&cursor={cursor}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual([event["eventId"] for event in page2["events"]], ["evt-003"])
+        self.assertIsNone(page2["nextCursor"])
+        # 汇总同样钉在游标携带的 cut 上，不含新事件。
+        self.assertEqual(
+            page2["summary"],
+            {"count": 3, "latencySum": 6, "maxLatency": 3, "violations": 0},
+        )
+        # 全新首页使用新 cut，可见全部 5 条。
+        status, fresh, _ = self.get_telemetry(f"from={base}&to={base + 1000}")
+        self.assertEqual(
+            [event["eventId"] for event in fresh["events"]],
+            ["evt-001", "evt-004", "evt-002", "evt-005", "evt-003"],
+        )
+        self.assertEqual(fresh["summary"]["count"], 5)
+        self.assertEqual(fresh["summary"]["violations"], 1)
+
+    def test_get_telemetry_cursor_survives_restart(self) -> None:
+        self.activate()
+        base = self.start * 1000
+        for index in range(1, 4):
+            self.add_event(index, base + index * 10, index)
+        status, page1, _ = self.get_telemetry(f"from={base}&to={base + 1000}&limit=2")
+        self.assertEqual(status, 200)
+        cursor = page1["nextCursor"]
+        self.restart()
+        status, page2, _ = self.get_telemetry(
+            f"from={base}&to={base + 1000}&limit=2&cursor={cursor}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual([event["eventId"] for event in page2["events"]], ["evt-003"])
+        self.assertIsNone(page2["nextCursor"])
+        self.assertEqual(page2["summary"]["count"], 3)
+
+    def test_get_telemetry_sla_not_found(self) -> None:
+        status, body, _ = self.get_telemetry("from=0&to=1", sla_id="missing")
+        self.assertEqual(status, 404)
+        self.assertEqual(body, {"error": "not_found"})
+
+    def test_get_telemetry_invalid_query(self) -> None:
+        self.activate()
+        cases = [
+            "",
+            "to=1",
+            "from=0",
+            "from=-1&to=1",
+            "from=01&to=1",
+            "from=1&to=1",
+            "from=2&to=1",
+            "from=0&to=2147483648001",
+            "from=x&to=1",
+            "from=1.0&to=2",
+            "from=0&to=1&limit=0",
+            "from=0&to=1&limit=101",
+            "from=0&to=1&limit=01",
+            "from=0&to=1&limit=x",
+            "from=0&to=1&unknown=2",
+            "from=0&to=1&from=0",
+            "from=0&to=1&cursor=1%3A5%3Aevt-1",  # SLA 无事件，锚点不存在
+            "from=0&to=1&cursor=bad",
+            "from=0&to=1&cursor=0:0:evt-1",
+            "from=0&to=1&cursor=999999:0:evt-1",
+        ]
+        for query in cases:
+            status, body, _ = self.get_telemetry(query)
+            self.assertEqual(status, 400, query)
+            self.assertEqual(body, {"error": "invalid_request"})
+
+    def test_get_telemetry_cursor_must_match_range_and_event(self) -> None:
+        self.activate()
+        base = self.start * 1000
+        self.add_event(1, base + 100, 10)
+        cursor = f"1:{base + 100}:evt-001"
+        for query in (
+            f"from={base + 200}&to={base + 300}&cursor={cursor}",
+            f"from={base}&to={base + 100}&cursor={cursor}",
+            f"from={base}&to={base + 400}&cursor=1:{base + 100}:evt-009",
+        ):
+            status, body, _ = self.get_telemetry(query)
+            self.assertEqual(status, 400, query)
+            self.assertEqual(body, {"error": "invalid_request"})
+
     def restart(self) -> None:
         self.server.shutdown()
         self.server.server_close()

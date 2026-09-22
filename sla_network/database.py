@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS sla_telemetry_events (
     timestamp_ms INTEGER NOT NULL,
     latency_ms INTEGER NOT NULL,
     digest TEXT NOT NULL,
+    commit_seq INTEGER,
     PRIMARY KEY (sla_id, event_id)
 );
 CREATE TABLE IF NOT EXISTS sla_telemetry_idempotency_records (
@@ -103,5 +104,18 @@ def connect(path: str) -> sqlite3.Connection:
     connection = sqlite3.connect(database, isolation_level=None)
     connection.row_factory = sqlite3.Row
     connection.executescript(SCHEMA)
+    columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(sla_telemetry_events)")
+    }
+    if "commit_seq" not in columns:
+        connection.execute("ALTER TABLE sla_telemetry_events ADD COLUMN commit_seq INTEGER")
+        connection.execute(
+            "UPDATE sla_telemetry_events SET commit_seq = rowid WHERE commit_seq IS NULL"
+        )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sla_telemetry_commit"
+        " ON sla_telemetry_events(sla_id, commit_seq, timestamp_ms, event_id)"
+    )
     return connection
 
