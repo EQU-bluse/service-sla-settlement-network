@@ -66,6 +66,19 @@ CREATE TABLE IF NOT EXISTS sla_idempotency_records (
     status INTEGER NOT NULL,
     response_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS sla_confirmations (
+    sla_id TEXT NOT NULL,
+    party TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    PRIMARY KEY (sla_id, party)
+);
+CREATE TABLE IF NOT EXISTS sla_confirmation_idempotency_records (
+    key TEXT PRIMARY KEY,
+    sla_id TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    response_json TEXT NOT NULL
+);
 """
 
 

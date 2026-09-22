@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from contextlib import closing
 from datetime import UTC, datetime
 from http import HTTPStatus
@@ -17,6 +18,7 @@ CAPABILITIES_PATH_PATTERN = re.compile(r"/v1/machines/([^/]+)/capabilities")
 CAPABILITY_NAME_PATTERN = re.compile(r"[a-z0-9-]{1,32}")
 TEMPLATE_ID_PATTERN = re.compile(r"[a-z0-9-]{1,64}")
 SLA_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)")
+SLA_CONFIRMATIONS_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/confirmations")
 CAPABILITY_FIELDS = {"expectedVersion", "name", "protocol", "region", "unit", "capacity"}
 SLA_TEMPLATE_FIELDS = {
     "id",
@@ -26,6 +28,8 @@ SLA_TEMPLATE_FIELDS = {
     "maxLatencyMs",
 }
 SLA_FIELDS = {"id", "templateId", "consumerId", "start", "end"}
+SLA_CONFIRMATION_FIELDS = {"party", "actorId"}
+SLA_PARTIES = {"producer", "consumer"}
 CAPABILITY_PROTOCOLS = {"http", "mqtt"}
 CAPABILITY_REGIONS = {"cn", "eu", "us"}
 CAPABILITY_UNITS = {"call", "byte", "ms"}
@@ -123,6 +127,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/v1/slas":
             self._create_sla()
+            return
+        confirmations_match = SLA_CONFIRMATIONS_PATH_PATTERN.fullmatch(self.path)
+        if confirmations_match is not None:
+            self._confirm_sla(confirmations_match.group(1))
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
@@ -516,6 +524,111 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 database.execute("COMMIT")
                 return HTTPStatus.CREATED, payload
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+
+    def _confirm_sla(self, sla_id: str) -> None:
+        idempotency_key = self.headers.get("Idempotency-Key")
+        if idempotency_key is None or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        fields = self._read_confirmation_object()
+        if fields is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        status, payload = self._apply_confirmation(idempotency_key, sla_id, fields)
+        self._json(status, payload)
+
+    def _read_confirmation_object(self) -> dict[str, Any] | None:
+        parsed = self._read_json_object()
+        if parsed is None or set(parsed) != SLA_CONFIRMATION_FIELDS:
+            return None
+        party = parsed["party"]
+        if not isinstance(party, str) or party not in SLA_PARTIES:
+            return None
+        actor_id = parsed["actorId"]
+        if not isinstance(actor_id, str) or PUBLIC_KEY_PATTERN.fullmatch(actor_id) is None:
+            return None
+        return parsed
+
+    def _apply_confirmation(
+        self, idempotency_key: str, sla_id: str, fields: dict[str, Any]
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                record = database.execute(
+                    "SELECT sla_id, request_json, status, response_json"
+                    " FROM sla_confirmation_idempotency_records WHERE key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    if record["sla_id"] == sla_id and record["request_json"] == request_json:
+                        return HTTPStatus(record["status"]), json.loads(record["response_json"])
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                sla = database.execute(
+                    "SELECT machine_id, consumer_id, capability_version,"
+                    " start_unix, end_unix FROM slas WHERE id = ?",
+                    (sla_id,),
+                ).fetchone()
+                if sla is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                party = fields["party"]
+                expected_actor = sla["machine_id"] if party == "producer" else sla["consumer_id"]
+                if fields["actorId"] != expected_actor:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
+                confirmation = database.execute(
+                    "SELECT party FROM sla_confirmations WHERE sla_id = ? AND party = ?",
+                    (sla_id, party),
+                ).fetchone()
+                if confirmation is not None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "already_confirmed"}
+                now = int(time.time())
+                capability = database.execute(
+                    "SELECT version FROM machine_capabilities WHERE machine_id = ?",
+                    (sla["machine_id"],),
+                ).fetchone()
+                if (
+                    not sla["start_unix"] <= now < sla["end_unix"]
+                    or capability is None
+                    or capability["version"] != sla["capability_version"]
+                ):
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                database.execute(
+                    "INSERT INTO sla_confirmations(sla_id, party, actor_id) VALUES (?, ?, ?)",
+                    (sla_id, party, fields["actorId"]),
+                )
+                confirmed = database.execute(
+                    "SELECT COUNT(*) AS count FROM sla_confirmations WHERE sla_id = ?",
+                    (sla_id,),
+                ).fetchone()["count"]
+                state = "active" if confirmed == 2 else "pending"
+                if state == "active":
+                    database.execute(
+                        "UPDATE slas SET state = 'active' WHERE id = ?", (sla_id,)
+                    )
+                payload = {"state": state}
+                database.execute(
+                    "INSERT INTO sla_confirmation_idempotency_records"
+                    "(key, sla_id, request_json, status, response_json)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        sla_id,
+                        request_json,
+                        int(HTTPStatus.OK),
+                        json.dumps(payload, separators=(",", ":")),
+                    ),
+                )
+                database.execute("COMMIT")
+                return HTTPStatus.OK, payload
             except BaseException:
                 database.execute("ROLLBACK")
                 raise
