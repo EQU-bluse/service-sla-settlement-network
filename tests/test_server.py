@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import tempfile
 import threading
 import time
@@ -2164,6 +2165,29 @@ class EvaluationTests(unittest.TestCase):
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
 
+    def evaluate(self, index: int, sla_id: str = "sla-1") -> bytes:
+        status, body, _ = self.post_evaluation(
+            sla_id=sla_id, idempotency_key=f"eval-{sla_id}-{index}"
+        )
+        self.assertEqual(status, 201)
+        return body
+
+    def get_evaluations(
+        self, query: str = "", sla_id: str = "sla-1"
+    ) -> tuple[int, object, str]:
+        suffix = f"?{query}" if query else ""
+        try:
+            with urlopen(
+                self.url(f"/v1/slas/{sla_id}/evaluations{suffix}"), timeout=5
+            ) as response:
+                return (
+                    response.status,
+                    json.loads(response.read()),
+                    response.headers["Content-Type"],
+                )
+        except HTTPError as error:
+            return error.code, json.loads(error.read()), error.headers["Content-Type"]
+
     def test_empty_window_is_insufficient_with_null_max_latency(self) -> None:
         self.activate()
         status, body, content_type = self.post_evaluation()
@@ -2400,14 +2424,336 @@ class EvaluationTests(unittest.TestCase):
             self.assertEqual(status, 400, body)
             self.assertEqual(json.loads(response_body), {"error": "invalid_request"})
 
-    def test_get_on_evaluations_path_is_404(self) -> None:
-        try:
-            urlopen(self.url("/v1/slas/sla-1/evaluations"), timeout=5)
-        except HTTPError as error:
-            self.assertEqual(error.code, 404)
-            self.assertEqual(json.load(error), {"error": "not_found"})
-        else:
-            self.fail("expected HTTPError")
+    def test_get_evaluations_empty(self) -> None:
+        self.activate()
+        status, body, content_type = self.get_evaluations()
+        self.assertEqual(status, 200)
+        self.assertEqual(content_type, "application/json; charset=utf-8")
+        self.assertEqual(list(body), ["evaluations", "nextCursor"])
+        self.assertEqual(body, {"evaluations": [], "nextCursor": None})
+
+    def test_post_allocates_global_seq_and_created_at(self) -> None:
+        self.activate()
+        self.create_sla("sla-2", "sla-create-2")
+        self.activate("sla-2")
+        before = int(time.time() * 1000)
+        first = json.loads(self.evaluate(1))
+        self.evaluate(1, sla_id="sla-2")
+        second = json.loads(self.evaluate(2))
+        after = int(time.time() * 1000)
+        # POST 响应保持原有八键，不含序号与时间戳。
+        expected_keys = [
+            "from",
+            "to",
+            "cut",
+            "count",
+            "latencySum",
+            "maxLatency",
+            "violations",
+            "outcome",
+        ]
+        self.assertEqual(list(first), expected_keys)
+        self.assertEqual(list(second), expected_keys)
+        # 序号全库共享：sla-1 得 1 与 3，sla-2 得 2。
+        status, page1, _ = self.get_evaluations()
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["evaluationSeq"] for item in page1["evaluations"]], [1, 3]
+        )
+        for item in page1["evaluations"]:
+            self.assertEqual(
+                list(item),
+                [
+                    "evaluationSeq",
+                    "from",
+                    "to",
+                    "cut",
+                    "count",
+                    "latencySum",
+                    "maxLatency",
+                    "violations",
+                    "outcome",
+                    "createdAt",
+                ],
+            )
+            self.assertIsInstance(item["createdAt"], int)
+            self.assertGreaterEqual(item["createdAt"], before)
+            self.assertLessEqual(item["createdAt"], after)
+        status, page2, _ = self.get_evaluations(sla_id="sla-2")
+        self.assertEqual(
+            [item["evaluationSeq"] for item in page2["evaluations"]], [2]
+        )
+
+    def test_replay_and_failure_do_not_allocate_seq(self) -> None:
+        self.activate()
+        status, body, _ = self.post_evaluation()
+        self.assertEqual(status, 201)
+        # 同键重放不分配序号，响应字节不变。
+        again_status, again_body, _ = self.post_evaluation()
+        self.assertEqual((again_status, again_body), (status, body))
+        # 失败请求不分配序号：区间越界与未激活 SLA。
+        status, _, _ = self.post_evaluation(
+            self.evaluation_body(self.start * 1000 - 1, self.end * 1000),
+            idempotency_key="eval-bad-range",
+        )
+        self.assertEqual(status, 409)
+        self.create_sla("sla-2", "sla-create-2")
+        status, _, _ = self.post_evaluation(sla_id="sla-2", idempotency_key="eval-pending")
+        self.assertEqual(status, 409)
+        # 下一个成功评估取序号 2，无空洞。
+        self.evaluate(1)
+        status, page, _ = self.get_evaluations()
+        self.assertEqual(
+            [item["evaluationSeq"] for item in page["evaluations"]], [1, 2]
+        )
+
+    def test_get_evaluations_item_matches_post_payload(self) -> None:
+        self.activate()
+        base = self.start * 1000
+        self.add_event(1, base + 100, 10)
+        self.add_event(2, base + 200, 60)
+        status, body, _ = self.post_evaluation(self.evaluation_body(base, base + 400))
+        self.assertEqual(status, 201)
+        payload = json.loads(body)
+        status, page, _ = self.get_evaluations()
+        self.assertEqual(status, 200)
+        (item,) = page["evaluations"]
+        self.assertEqual(item["evaluationSeq"], 1)
+        for key, value in payload.items():
+            self.assertEqual(item[key], value)
+        self.assertEqual(item["outcome"], "breached")
+        self.assertEqual(item["maxLatency"], 60)
+
+    def test_get_evaluations_pagination(self) -> None:
+        self.activate()
+        for index in range(1, 4):
+            self.evaluate(index)
+        status, page1, _ = self.get_evaluations("limit=2")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["evaluationSeq"] for item in page1["evaluations"]], [1, 2]
+        )
+        self.assertEqual(page1["nextCursor"], "3:2")
+        status, page2, _ = self.get_evaluations(f"limit=2&cursor={page1['nextCursor']}")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["evaluationSeq"] for item in page2["evaluations"]], [3]
+        )
+        self.assertIsNone(page2["nextCursor"])
+
+    def test_get_evaluations_default_limit_is_50(self) -> None:
+        self.activate()
+        for index in range(1, 52):
+            self.evaluate(index)
+        status, page1, _ = self.get_evaluations()
+        self.assertEqual(status, 200)
+        self.assertEqual(len(page1["evaluations"]), 50)
+        self.assertEqual(page1["nextCursor"], "51:50")
+        status, page2, _ = self.get_evaluations(f"cursor={page1['nextCursor']}")
+        self.assertEqual(
+            [item["evaluationSeq"] for item in page2["evaluations"]], [51]
+        )
+        self.assertIsNone(page2["nextCursor"])
+
+    def test_get_evaluations_cursor_pins_cut(self) -> None:
+        self.activate()
+        self.evaluate(1)
+        self.evaluate(2)
+        status, page1, _ = self.get_evaluations("limit=1")
+        self.assertEqual(page1["nextCursor"], "2:1")
+        # 新评估只推进全新首页的 cut，不影响游标续页。
+        self.evaluate(3)
+        status, page2, _ = self.get_evaluations(f"limit=1&cursor={page1['nextCursor']}")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["evaluationSeq"] for item in page2["evaluations"]], [2]
+        )
+        self.assertIsNone(page2["nextCursor"])
+        status, fresh, _ = self.get_evaluations()
+        self.assertEqual(
+            [item["evaluationSeq"] for item in fresh["evaluations"]], [1, 2, 3]
+        )
+
+    def test_get_evaluations_cursor_survives_restart(self) -> None:
+        self.activate()
+        self.evaluate(1)
+        self.evaluate(2)
+        status, page1, _ = self.get_evaluations("limit=1")
+        self.restart()
+        status, page2, _ = self.get_evaluations(f"limit=1&cursor={page1['nextCursor']}")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["evaluationSeq"] for item in page2["evaluations"]], [2]
+        )
+        self.assertIsNone(page2["nextCursor"])
+
+    def test_get_evaluations_anchor_must_belong_to_sla(self) -> None:
+        self.activate()
+        self.create_sla("sla-2", "sla-create-2")
+        self.activate("sla-2")
+        self.evaluate(1)
+        self.evaluate(1, sla_id="sla-2")
+        # 序号 2 属于 sla-2，对 sla-1 不是有效锚点。
+        status, body, _ = self.get_evaluations("cursor=2:2")
+        self.assertEqual(status, 400)
+        self.assertEqual(body, {"error": "invalid_request"})
+        # cut 为全库最大序号，但条目只含本 SLA。
+        status, page, _ = self.get_evaluations("cursor=2:1")
+        self.assertEqual(status, 200)
+        self.assertEqual(page["evaluations"], [])
+        self.assertIsNone(page["nextCursor"])
+
+    def test_get_evaluations_sla_not_found(self) -> None:
+        status, body, _ = self.get_evaluations(sla_id="missing")
+        self.assertEqual(status, 404)
+        self.assertEqual(body, {"error": "not_found"})
+
+    def test_get_evaluations_params_validated_before_sla_lookup(self) -> None:
+        status, body, _ = self.get_evaluations("limit=0", sla_id="missing")
+        self.assertEqual(status, 400)
+        self.assertEqual(body, {"error": "invalid_request"})
+
+    def test_get_evaluations_invalid_query(self) -> None:
+        self.activate()
+        self.evaluate(1)
+        cases = [
+            "limit=0",
+            "limit=101",
+            "limit=01",
+            "limit=x",
+            "limit=1.0",
+            "limit=-1",
+            "limit=",
+            "unknown=1",
+            "limit=1&limit=2",
+            "cursor=1&cursor=2",
+            "cursor=1",
+            "cursor=1:2:3",
+            "cursor=a:1",
+            "cursor=1:b",
+            "cursor=01:1",
+            "cursor=1:01",
+            "cursor=1:-1",
+            "cursor=999:1",  # cut 超过当前全库最大序号
+            "cursor=1:9",  # 锚点在该 SLA 内不存在
+            "cursor=1:0",  # 序号从 1 开始，锚点不存在
+        ]
+        for query in cases:
+            status, body, _ = self.get_evaluations(query)
+            self.assertEqual(status, 400, query)
+            self.assertEqual(body, {"error": "invalid_request"})
+
+    def test_concurrent_evaluations_get_unique_dense_seqs(self) -> None:
+        self.activate()
+        results: list[int] = []
+        lock = threading.Lock()
+
+        def evaluate(index: int) -> None:
+            status, _, _ = self.post_evaluation(idempotency_key=f"eval-race-{index}")
+            with lock:
+                results.append(status)
+
+        threads = [threading.Thread(target=evaluate, args=(index,)) for index in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual(results, [201] * 8)
+        status, page, _ = self.get_evaluations()
+        self.assertEqual(
+            [item["evaluationSeq"] for item in page["evaluations"]],
+            list(range(1, 9)),
+        )
+
+
+class EvaluationMigrationTests(unittest.TestCase):
+    def test_old_database_numbered_by_rowid_with_zero_created_at(self) -> None:
+        from sla_network.database import connect
+
+        payload = json.dumps(
+            {
+                "from": 0,
+                "to": 1,
+                "cut": 0,
+                "count": 0,
+                "latencySum": 0,
+                "maxLatency": None,
+                "violations": 0,
+                "outcome": "insufficient",
+            },
+            separators=(",", ":"),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = str(Path(temporary) / "old.db")
+            connection = sqlite3.connect(path)
+            connection.executescript(
+                """
+                CREATE TABLE schema_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                INSERT INTO schema_metadata(key, value) VALUES ('schema_version', '1');
+                INSERT INTO schema_metadata(key, value)
+                    VALUES ('telemetry_commit_seq_renumbered', '1');
+                CREATE TABLE sla_telemetry_events (
+                    sla_id TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    timestamp_ms INTEGER NOT NULL,
+                    latency_ms INTEGER NOT NULL,
+                    digest TEXT NOT NULL,
+                    commit_seq INTEGER NOT NULL,
+                    PRIMARY KEY (sla_id, event_id)
+                );
+                CREATE TABLE sla_evaluation_idempotency_records (
+                    key TEXT PRIMARY KEY,
+                    sla_id TEXT NOT NULL,
+                    request_json TEXT NOT NULL,
+                    status INTEGER NOT NULL,
+                    response_json TEXT NOT NULL
+                );
+                """
+            )
+            for index in range(3):
+                connection.execute(
+                    "INSERT INTO sla_evaluation_idempotency_records"
+                    "(key, sla_id, request_json, status, response_json)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (f"key-{index}", "sla-1", "{}", 201, payload),
+                )
+            connection.commit()
+            connection.close()
+
+            database = connect(path)
+            rows = database.execute(
+                "SELECT key, evaluation_seq, created_at, response_json"
+                " FROM sla_evaluation_idempotency_records ORDER BY evaluation_seq"
+            ).fetchall()
+            # 单事务按 rowid 升序稠密赋 1..N，created_at 置 0，重放字节不变。
+            self.assertEqual([row["key"] for row in rows], ["key-0", "key-1", "key-2"])
+            self.assertEqual([row["evaluation_seq"] for row in rows], [1, 2, 3])
+            self.assertEqual([row["created_at"] for row in rows], [0, 0, 0])
+            for row in rows:
+                self.assertEqual(row["response_json"], payload)
+            marker = database.execute(
+                "SELECT 1 FROM schema_metadata WHERE key = 'evaluation_seq_assigned'"
+            ).fetchone()
+            self.assertIsNotNone(marker)
+            database.close()
+
+            # 一次性标记生效：重连（重启）不再重编号。
+            database = connect(path)
+            database.execute(
+                "UPDATE sla_evaluation_idempotency_records SET evaluation_seq = 30"
+                " WHERE key = 'key-2'"
+            )
+            database.close()
+            database = connect(path)
+            seqs = database.execute(
+                "SELECT evaluation_seq FROM sla_evaluation_idempotency_records"
+                " ORDER BY rowid"
+            ).fetchall()
+            self.assertEqual([row["evaluation_seq"] for row in seqs], [1, 2, 30])
+            database.close()
 
 
 if __name__ == "__main__":

@@ -38,6 +38,9 @@ TELEMETRY_QUERY_PARAMS = {"from", "to", "limit", "cursor"}
 TELEMETRY_TIME_MAX = 2147483648000
 TELEMETRY_DEFAULT_LIMIT = 50
 TELEMETRY_MAX_LIMIT = 100
+EVALUATIONS_QUERY_PARAMS = {"limit", "cursor"}
+EVALUATIONS_DEFAULT_LIMIT = 50
+EVALUATIONS_MAX_LIMIT = 100
 DECIMAL_PATTERN = re.compile(r"0|[1-9][0-9]*")
 CAPABILITY_PROTOCOLS = {"http", "mqtt"}
 CAPABILITY_REGIONS = {"cn", "eu", "us"}
@@ -94,6 +97,10 @@ class Handler(BaseHTTPRequestHandler):
         telemetry_match = SLA_TELEMETRY_PATH_PATTERN.fullmatch(target.path)
         if telemetry_match is not None:
             self._get_telemetry(telemetry_match.group(1), target.query)
+            return
+        evaluations_match = SLA_EVALUATIONS_PATH_PATTERN.fullmatch(target.path)
+        if evaluations_match is not None:
+            self._get_evaluations(evaluations_match.group(1), target.query)
             return
         sla_match = SLA_PATH_PATTERN.fullmatch(target.path)
         if sla_match is not None:
@@ -303,6 +310,112 @@ class Handler(BaseHTTPRequestHandler):
                 },
                 "nextCursor": next_cursor,
             },
+        )
+
+    def _parse_evaluations_query(
+        self, query: str
+    ) -> tuple[int, tuple[int, int] | None] | None:
+        parameters: dict[str, list[str]] = {}
+        for key, value in parse_qsl(query, keep_blank_values=True):
+            parameters.setdefault(key, []).append(value)
+        if not set(parameters) <= EVALUATIONS_QUERY_PARAMS:
+            return None
+        if any(len(values) != 1 for values in parameters.values()):
+            return None
+        if "limit" in parameters:
+            limit_text = parameters["limit"][0]
+            if DECIMAL_PATTERN.fullmatch(limit_text) is None:
+                return None
+            limit = int(limit_text)
+            if not 1 <= limit <= EVALUATIONS_MAX_LIMIT:
+                return None
+        else:
+            limit = EVALUATIONS_DEFAULT_LIMIT
+        cursor: tuple[int, int] | None = None
+        if "cursor" in parameters:
+            parts = parameters["cursor"][0].split(":")
+            if len(parts) != 2:
+                return None
+            cut_text, last_seq_text = parts
+            if (
+                DECIMAL_PATTERN.fullmatch(cut_text) is None
+                or DECIMAL_PATTERN.fullmatch(last_seq_text) is None
+            ):
+                return None
+            cursor = (int(cut_text), int(last_seq_text))
+        return limit, cursor
+
+    def _get_evaluations(self, sla_id: str, query: str) -> None:
+        parsed = self._parse_evaluations_query(query)
+        if parsed is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        limit, cursor = parsed
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN")
+            try:
+                # 参数先验：cut/锚点校验均在 SLA 存在性检查之前。
+                max_record = database.execute(
+                    "SELECT MAX(evaluation_seq) AS max_seq"
+                    " FROM sla_evaluation_idempotency_records"
+                ).fetchone()
+                current_max = max_record["max_seq"]
+                if current_max is None:
+                    current_max = 0
+                if cursor is None:
+                    cut = current_max
+                    last_seq = 0
+                else:
+                    cut, last_seq = cursor
+                    if cut > current_max:
+                        database.execute("ROLLBACK")
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+                        return
+                    anchor = database.execute(
+                        "SELECT 1 FROM sla_evaluation_idempotency_records"
+                        " WHERE sla_id = ? AND evaluation_seq = ? AND evaluation_seq <= ?",
+                        (sla_id, last_seq, cut),
+                    ).fetchone()
+                    if anchor is None:
+                        database.execute("ROLLBACK")
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+                        return
+                sla = database.execute(
+                    "SELECT id FROM slas WHERE id = ?", (sla_id,)
+                ).fetchone()
+                if sla is None:
+                    database.execute("ROLLBACK")
+                    self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                    return
+                rows = database.execute(
+                    "SELECT evaluation_seq, response_json, created_at"
+                    " FROM sla_evaluation_idempotency_records"
+                    " WHERE sla_id = ? AND evaluation_seq > ? AND evaluation_seq <= ?"
+                    " ORDER BY evaluation_seq ASC"
+                    " LIMIT ?",
+                    (sla_id, last_seq, cut, limit + 1),
+                ).fetchall()
+                database.execute("ROLLBACK")
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+        has_next = len(rows) > limit
+        page = rows[:limit]
+        evaluations = [
+            {
+                "evaluationSeq": row["evaluation_seq"],
+                **json.loads(row["response_json"]),
+                "createdAt": row["created_at"],
+            }
+            for row in page
+        ]
+        if has_next:
+            next_cursor = f"{cut}:{page[-1]['evaluation_seq']}"
+        else:
+            next_cursor = None
+        self._json(
+            HTTPStatus.OK,
+            {"evaluations": evaluations, "nextCursor": next_cursor},
         )
 
     def do_POST(self) -> None:  # noqa: N802
@@ -1043,16 +1156,27 @@ class Handler(BaseHTTPRequestHandler):
                     "violations": violations,
                     "outcome": outcome,
                 }
+                # 首次成功在同一事务内分配全库唯一序号与事务 UTC 毫秒时间戳；
+                # 失败与重放不进入此分支，均不分配。
+                next_record = database.execute(
+                    "SELECT COALESCE(MAX(evaluation_seq), 0) + 1 AS next_seq"
+                    " FROM sla_evaluation_idempotency_records"
+                ).fetchone()
+                evaluation_seq = next_record["next_seq"]
+                created_at = int(datetime.now(UTC).timestamp() * 1000)
                 database.execute(
                     "INSERT INTO sla_evaluation_idempotency_records"
-                    "(key, sla_id, request_json, status, response_json)"
-                    " VALUES (?, ?, ?, ?, ?)",
+                    "(key, sla_id, request_json, status, response_json,"
+                    " evaluation_seq, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
                         idempotency_key,
                         sla_id,
                         request_json,
                         int(HTTPStatus.CREATED),
                         json.dumps(payload, separators=(",", ":")),
+                        evaluation_seq,
+                        created_at,
                     ),
                 )
                 database.execute("COMMIT")

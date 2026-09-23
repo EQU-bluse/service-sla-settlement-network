@@ -100,12 +100,16 @@ CREATE TABLE IF NOT EXISTS sla_evaluation_idempotency_records (
     sla_id TEXT NOT NULL,
     request_json TEXT NOT NULL,
     status INTEGER NOT NULL,
-    response_json TEXT NOT NULL
+    response_json TEXT NOT NULL,
+    evaluation_seq INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
 );
 """
 
 TELEMETRY_SEQ_MARKER = "telemetry_commit_seq_renumbered"
 TELEMETRY_SEQ_INDEX = "idx_sla_telemetry_commit_seq_unique"
+EVALUATION_SEQ_MARKER = "evaluation_seq_assigned"
+EVALUATION_SEQ_INDEX = "idx_sla_evaluation_seq_unique"
 
 
 def _renumber_commit_seq(connection: sqlite3.Connection) -> None:
@@ -154,6 +158,63 @@ def _renumber_commit_seq(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _assign_evaluation_seq(connection: sqlite3.Connection) -> None:
+    # 仅在一次性迁移（含空库首次连接）时取写锁；BEGIN IMMEDIATE 串行并发首启。
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        if (
+            connection.execute(
+                "SELECT 1 FROM schema_metadata WHERE key = ?",
+                (EVALUATION_SEQ_MARKER,),
+            ).fetchone()
+            is not None
+        ):
+            # 其他连接已完成迁移，直接释放写锁，不再重编号。
+            connection.execute("COMMIT")
+            return
+        columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(sla_evaluation_idempotency_records)"
+            )
+        }
+        if "evaluation_seq" not in columns:
+            connection.execute(
+                "ALTER TABLE sla_evaluation_idempotency_records"
+                " ADD COLUMN evaluation_seq INTEGER"
+            )
+        if "created_at" not in columns:
+            connection.execute(
+                "ALTER TABLE sla_evaluation_idempotency_records"
+                " ADD COLUMN created_at INTEGER"
+            )
+        # 单事务按评估幂等表 rowid 升序稠密赋号 1..N，既有记录 created_at 置 0；
+        # 请求快照、幂等数据与重放字节保持不变。
+        rows = connection.execute(
+            "SELECT rowid AS rid FROM sla_evaluation_idempotency_records"
+            " ORDER BY rowid ASC"
+        ).fetchall()
+        for evaluation_seq, row in enumerate(rows, start=1):
+            connection.execute(
+                "UPDATE sla_evaluation_idempotency_records"
+                " SET evaluation_seq = ?, created_at = 0 WHERE rowid = ?",
+                (evaluation_seq, row["rid"]),
+            )
+        connection.execute(
+            "INSERT INTO schema_metadata(key, value) VALUES (?, '1')",
+            (EVALUATION_SEQ_MARKER,),
+        )
+        # 唯一索引必须在赋号之后建立：旧库迁移前列值全部为空。
+        connection.execute(
+            f"CREATE UNIQUE INDEX IF NOT EXISTS {EVALUATION_SEQ_INDEX}"
+            " ON sla_evaluation_idempotency_records(evaluation_seq)"
+        )
+        connection.execute("COMMIT")
+    except BaseException:
+        connection.execute("ROLLBACK")
+        raise
+
+
 def connect(path: str) -> sqlite3.Connection:
     database = Path(path)
     database.parent.mkdir(parents=True, exist_ok=True)
@@ -174,6 +235,19 @@ def connect(path: str) -> sqlite3.Connection:
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_sla_telemetry_commit"
         " ON sla_telemetry_events(sla_id, commit_seq, timestamp_ms, event_id)"
+    )
+    # 评估序号迁移同理：标记存在即列与唯一索引已就绪。
+    if (
+        connection.execute(
+            "SELECT 1 FROM schema_metadata WHERE key = ?",
+            (EVALUATION_SEQ_MARKER,),
+        ).fetchone()
+        is None
+    ):
+        _assign_evaluation_seq(connection)
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sla_evaluation_seq"
+        " ON sla_evaluation_idempotency_records(sla_id, evaluation_seq)"
     )
     return connection
 
