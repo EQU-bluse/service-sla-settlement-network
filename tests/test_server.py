@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import tempfile
 import threading
 import time
@@ -2155,6 +2156,22 @@ class EvaluationTests(unittest.TestCase):
         except HTTPError as error:
             return error.code, error.read(), error.headers["Content-Type"]
 
+    def get_evaluations(
+        self, query: str = "", sla_id: str = "sla-1"
+    ) -> tuple[int, object, str]:
+        suffix = f"?{query}" if query else ""
+        try:
+            with urlopen(
+                self.url(f"/v1/slas/{sla_id}/evaluations{suffix}"), timeout=5
+            ) as response:
+                return (
+                    response.status,
+                    json.loads(response.read()),
+                    response.headers["Content-Type"],
+                )
+        except HTTPError as error:
+            return error.code, json.loads(error.read()), error.headers["Content-Type"]
+
     def restart(self) -> None:
         self.server.shutdown()
         self.server.server_close()
@@ -2166,10 +2183,13 @@ class EvaluationTests(unittest.TestCase):
 
     def test_empty_window_is_insufficient_with_null_max_latency(self) -> None:
         self.activate()
+        before = int(time.time() * 1000)
         status, body, content_type = self.post_evaluation()
+        after = int(time.time() * 1000)
         self.assertEqual(status, 201)
         self.assertEqual(content_type, "application/json; charset=utf-8")
         self.assertEqual(list(json.loads(body)), [
+            "evaluationSeq",
             "from",
             "to",
             "cut",
@@ -2178,23 +2198,22 @@ class EvaluationTests(unittest.TestCase):
             "maxLatency",
             "violations",
             "outcome",
+            "createdAt",
         ])
-        self.assertEqual(
-            body,
-            json.dumps(
-                {
-                    "from": self.start * 1000,
-                    "to": self.end * 1000,
-                    "cut": 0,
-                    "count": 0,
-                    "latencySum": 0,
-                    "maxLatency": None,
-                    "violations": 0,
-                    "outcome": "insufficient",
-                },
-                separators=(",", ":"),
-            ).encode(),
-        )
+        payload = json.loads(body)
+        self.assertEqual(payload["evaluationSeq"], 1)
+        self.assertEqual(payload["from"], self.start * 1000)
+        self.assertEqual(payload["to"], self.end * 1000)
+        self.assertEqual(payload["cut"], 0)
+        self.assertEqual(payload["count"], 0)
+        self.assertEqual(payload["latencySum"], 0)
+        self.assertIsNone(payload["maxLatency"])
+        self.assertEqual(payload["violations"], 0)
+        self.assertEqual(payload["outcome"], "insufficient")
+        self.assertIsInstance(payload["createdAt"], int)
+        self.assertNotIsInstance(payload["createdAt"], bool)
+        self.assertGreaterEqual(payload["createdAt"], 0)
+        self.assertTrue(before <= payload["createdAt"] <= after)
         self.assertFalse(body.endswith(b"\n"))
 
     def test_fulfilled_evaluation_aggregates_window(self) -> None:
@@ -2207,8 +2226,12 @@ class EvaluationTests(unittest.TestCase):
             self.evaluation_body(base, base + 400)
         )
         self.assertEqual(status, 201)
+        payload = json.loads(body)
+        self.assertEqual(payload["evaluationSeq"], 1)
+        self.assertGreaterEqual(payload["createdAt"], 0)
         self.assertEqual(
-            json.loads(body),
+            {key: value for key, value in payload.items()
+             if key not in ("evaluationSeq", "createdAt")},
             {
                 "from": base,
                 "to": base + 400,
@@ -2400,14 +2423,358 @@ class EvaluationTests(unittest.TestCase):
             self.assertEqual(status, 400, body)
             self.assertEqual(json.loads(response_body), {"error": "invalid_request"})
 
-    def test_get_on_evaluations_path_is_404(self) -> None:
+    def test_seq_is_global_monotonic_across_slas(self) -> None:
+        self.activate()
+        self.create_sla("sla-2", "sla-create-2")
+        self.activate("sla-2")
+        _, body2, _ = self.post_evaluation(sla_id="sla-2", idempotency_key="eval-s2")
+        _, body1, _ = self.post_evaluation()
+        self.assertEqual(json.loads(body2)["evaluationSeq"], 1)
+        self.assertEqual(json.loads(body1)["evaluationSeq"], 2)
+
+    def test_failed_request_does_not_allocate_seq(self) -> None:
+        # SLA 尚为 pending，评估失败不占序号。
+        status, _, _ = self.post_evaluation()
+        self.assertEqual(status, 409)
+        self.activate()
+        _, body, _ = self.post_evaluation()
+        self.assertEqual(json.loads(body)["evaluationSeq"], 1)
+
+    def test_replay_keeps_first_seq_and_created_at_bytes(self) -> None:
+        self.activate()
+        status, body, _ = self.post_evaluation()
+        self.assertEqual(status, 201)
+        for _ in range(2):
+            again_status, again_body, _ = self.post_evaluation()
+            self.assertEqual((again_status, again_body), (status, body))
+
+    def test_concurrent_distinct_keys_get_unique_global_seqs(self) -> None:
+        self.activate()
+        results: list[int] = []
+        lock = threading.Lock()
+
+        def evaluate(index: int) -> None:
+            status, body, _ = self.post_evaluation(idempotency_key=f"eval-race-{index}")
+            with lock:
+                self.assertEqual(status, 201)
+                results.append(json.loads(body)["evaluationSeq"])
+
+        threads = [threading.Thread(target=evaluate, args=(i,)) for i in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual(sorted(results), list(range(1, 9)))
+
+    def test_get_evaluations_empty_sla(self) -> None:
+        self.activate()
+        status, body, content_type = self.get_evaluations()
+        self.assertEqual(status, 200)
+        self.assertEqual(content_type, "application/json; charset=utf-8")
+        self.assertEqual(list(body), ["evaluations", "nextCursor"])
+        self.assertEqual(body["evaluations"], [])
+        self.assertIsNone(body["nextCursor"])
+
+    def test_get_evaluations_order_scope_and_item_shape(self) -> None:
+        self.activate()
+        self.create_sla("sla-2", "sla-create-2")
+        self.activate("sla-2")
+        base = self.start * 1000
+        self.add_event(1, base + 100, 99, sla_id="sla-2")
+        _, s2_body, _ = self.post_evaluation(
+            self.evaluation_body(base, base + 400), sla_id="sla-2",
+            idempotency_key="eval-s2",
+        )
+        _, e1_body, _ = self.post_evaluation(self.evaluation_body(base, base + 400))
+        _, e2_body, _ = self.post_evaluation(
+            self.evaluation_body(base, base + 500), idempotency_key="eval-x"
+        )
+        status, body, _ = self.get_evaluations()
+        self.assertEqual(status, 200)
+        seqs = [item["evaluationSeq"] for item in body["evaluations"]]
+        self.assertEqual(seqs, [2, 3])  # 序号 1 属于 sla-2，不在本 SLA
+        self.assertIsNone(body["nextCursor"])
+        item = body["evaluations"][0]
+        self.assertEqual(
+            list(item),
+            [
+                "evaluationSeq",
+                "from",
+                "to",
+                "cut",
+                "count",
+                "latencySum",
+                "maxLatency",
+                "violations",
+                "outcome",
+                "createdAt",
+            ],
+        )
+        self.assertEqual(item["evaluationSeq"], json.loads(e1_body)["evaluationSeq"])
+        self.assertEqual(item["createdAt"], json.loads(e1_body)["createdAt"])
+        self.assertEqual(item["outcome"], "insufficient")
+        status, body, _ = self.get_evaluations(sla_id="sla-2")
+        self.assertEqual(
+            [item["evaluationSeq"] for item in body["evaluations"]], [1]
+        )
+        self.assertEqual(body["evaluations"][0]["outcome"], "breached")
+        self.assertEqual(json.loads(s2_body)["evaluationSeq"], 1)
+
+    def test_get_evaluations_pagination(self) -> None:
+        self.activate()
+        for index in range(1, 4):
+            status, _, _ = self.post_evaluation(idempotency_key=f"eval-page-{index}")
+            self.assertEqual(status, 201)
+        status, page1, _ = self.get_evaluations("limit=1")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["evaluationSeq"] for item in page1["evaluations"]], [1]
+        )
+        self.assertEqual(page1["nextCursor"], "3:1")
+        status, page2, _ = self.get_evaluations(
+            f"limit=1&cursor={page1['nextCursor']}"
+        )
+        self.assertEqual(
+            [item["evaluationSeq"] for item in page2["evaluations"]], [2]
+        )
+        self.assertEqual(page2["nextCursor"], "3:2")
+        status, page3, _ = self.get_evaluations(
+            f"limit=1&cursor={page2['nextCursor']}"
+        )
+        self.assertEqual(
+            [item["evaluationSeq"] for item in page3["evaluations"]], [3]
+        )
+        self.assertIsNone(page3["nextCursor"])
+
+    def test_get_evaluations_default_limit_is_50(self) -> None:
+        self.activate()
+        for index in range(1, 52):
+            self.post_evaluation(idempotency_key=f"eval-page-{index}")
+        status, page1, _ = self.get_evaluations()
+        self.assertEqual(status, 200)
+        self.assertEqual(len(page1["evaluations"]), 50)
+        self.assertEqual(page1["nextCursor"], "51:50")
+        status, page2, _ = self.get_evaluations(f"cursor={page1['nextCursor']}")
+        self.assertEqual(
+            [item["evaluationSeq"] for item in page2["evaluations"]], [51]
+        )
+        self.assertIsNone(page2["nextCursor"])
+
+    def test_get_evaluations_cursor_pins_cut_against_new_writes(self) -> None:
+        self.activate()
+        for index in range(1, 3):
+            self.post_evaluation(idempotency_key=f"eval-pin-{index}")
+        status, page1, _ = self.get_evaluations("limit=1")
+        self.assertEqual(status, 200)
+        cursor = page1["nextCursor"]
+        self.assertEqual(cursor, "2:1")
+        self.post_evaluation(idempotency_key="eval-pin-3")
+        status, page2, _ = self.get_evaluations(f"limit=1&cursor={cursor}")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["evaluationSeq"] for item in page2["evaluations"]], [2]
+        )
+        self.assertIsNone(page2["nextCursor"])
+        status, fresh, _ = self.get_evaluations()
+        self.assertEqual(
+            [item["evaluationSeq"] for item in fresh["evaluations"]], [1, 2, 3]
+        )
+
+    def test_get_evaluations_cursor_survives_restart(self) -> None:
+        self.activate()
+        for index in range(1, 4):
+            self.post_evaluation(idempotency_key=f"eval-restart-{index}")
+        status, page1, _ = self.get_evaluations("limit=2")
+        self.assertEqual(status, 200)
+        cursor = page1["nextCursor"]
+        self.restart()
+        status, page2, _ = self.get_evaluations(f"limit=2&cursor={cursor}")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["evaluationSeq"] for item in page2["evaluations"]], [3]
+        )
+        self.assertIsNone(page2["nextCursor"])
+
+    def test_get_evaluations_sla_not_found(self) -> None:
+        status, body, _ = self.get_evaluations(sla_id="missing")
+        self.assertEqual(status, 404)
+        self.assertEqual(body, {"error": "not_found"})
+
+    def test_get_evaluations_invalid_query_is_prior_to_sla_lookup(self) -> None:
+        # 纯语法/格式非法在 SLA 查询之前即 400（SLA 缺失也不改成 404）。
+        for query in (
+            "limit=0",
+            "limit=101",
+            "limit=01",
+            "limit=x",
+            "limit=",
+            "limit=1&limit=2",
+            "cursor=bad",
+            "cursor=1",
+            "cursor=1:2:3",
+            "cursor=01:1",
+            "cursor=1:02",
+            "unknown=1",
+        ):
+            status, body, _ = self.get_evaluations(query, sla_id="missing")
+            self.assertEqual(status, 400, query)
+            self.assertEqual(body, {"error": "invalid_request"})
+
+    def test_get_evaluations_bad_cut_or_anchor(self) -> None:
+        self.activate()
+        self.create_sla("sla-2", "sla-create-2")
+        self.activate("sla-2")
+        self.post_evaluation(sla_id="sla-2", idempotency_key="eval-s2-1")  # 全库 seq 1
+        self.post_evaluation(idempotency_key="eval-s1-1")  # 全库 seq 2
+        for query in (
+            "cursor=999:2",  # cut 超过当前全库最大值
+            "cursor=2:1",  # 序号 1 属于 sla-2，在 sla-1 内锚点不存在
+            "cursor=2:5",  # 序号在全库都不存在
+        ):
+            status, body, _ = self.get_evaluations(query)
+            self.assertEqual(status, 400, query)
+            self.assertEqual(body, {"error": "invalid_request"})
+        # cut>max 是状态校验，在 SLA 查询之后：SLA 缺失仍为 404。
+        status, _, _ = self.get_evaluations("cursor=999:1", sla_id="missing")
+        self.assertEqual(status, 404)
+        # sla-2 用自己的锚点则合法。
+        status, page, _ = self.get_evaluations("cursor=2:1", sla_id="sla-2")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["evaluationSeq"] for item in page["evaluations"]], []
+        )
+        self.assertIsNone(page["nextCursor"])
+
+
+class EvaluationMigrationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.database_path = str(Path(self.temporary.name) / "service.db")
+        self._build_old_database()
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = self.database_path
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def _build_old_database(self) -> None:
+        old_snapshot = (
+            '{"from":1,"to":2,"cut":0,"count":0,"latencySum":0,'
+            '"maxLatency":null,"violations":0,"outcome":"insufficient"}'
+        )
+        connection = sqlite3.connect(self.database_path)
         try:
-            urlopen(self.url("/v1/slas/sla-1/evaluations"), timeout=5)
+            connection.execute("CREATE TABLE slas (id TEXT PRIMARY KEY)")
+            connection.execute("INSERT INTO slas(id) VALUES ('sla-1')")
+            connection.execute(
+                "CREATE TABLE sla_evaluation_idempotency_records ("
+                "key TEXT PRIMARY KEY, sla_id TEXT NOT NULL, request_json TEXT NOT NULL,"
+                " status INTEGER NOT NULL, response_json TEXT NOT NULL)"
+            )
+            for key in ("eval-a", "eval-b", "eval-c"):
+                connection.execute(
+                    "INSERT INTO sla_evaluation_idempotency_records"
+                    "(key, sla_id, request_json, status, response_json)"
+                    " VALUES (?, 'sla-1', '{\"from\":1,\"to\":2}', 201, ?)",
+                    (key, old_snapshot),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temporary.cleanup()
+
+    def url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}{path}"
+
+    def restart(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = self.database_path
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def get_evaluations(self, query: str = "") -> tuple[int, object]:
+        suffix = f"?{query}" if query else ""
+        try:
+            with urlopen(
+                self.url(f"/v1/slas/sla-1/evaluations{suffix}"), timeout=5
+            ) as response:
+                return response.status, json.loads(response.read())
         except HTTPError as error:
-            self.assertEqual(error.code, 404)
-            self.assertEqual(json.load(error), {"error": "not_found"})
-        else:
-            self.fail("expected HTTPError")
+            return error.code, json.loads(error.read())
+
+    def test_old_database_renumbered_once_by_rowid(self) -> None:
+        status, body = self.get_evaluations()
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [(item["evaluationSeq"], item["createdAt"]) for item in body["evaluations"]],
+            [(1, 0), (2, 0), (3, 0)],
+        )
+        self.assertEqual(body["evaluations"][0]["outcome"], "insufficient")
+        self.assertEqual(body["evaluations"][0]["from"], 1)
+        self.assertIsNone(body["nextCursor"])
+
+        connection = sqlite3.connect(self.database_path)
+        connection.row_factory = sqlite3.Row
+        try:
+            rows = connection.execute(
+                "SELECT key, evaluation_seq, created_at_ms, response_json"
+                " FROM sla_evaluation_idempotency_records ORDER BY rowid ASC"
+            ).fetchall()
+            self.assertEqual(
+                [(row["key"], row["evaluation_seq"], row["created_at_ms"]) for row in rows],
+                [("eval-a", 1, 0), ("eval-b", 2, 0), ("eval-c", 3, 0)],
+            )
+            # 旧快照字节未被改写：response_json 不含新增字段。
+            self.assertNotIn("evaluationSeq", rows[0]["response_json"])
+            marker = connection.execute(
+                "SELECT 1 FROM schema_metadata WHERE key = 'evaluation_seq_renumbered'"
+            ).fetchone()
+            self.assertIsNotNone(marker)
+            index = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index'"
+                " AND name='idx_sla_evaluation_seq_unique'"
+            ).fetchone()
+            self.assertIsNotNone(index)
+        finally:
+            connection.close()
+
+        # 重启不重排。
+        self.restart()
+        connection = sqlite3.connect(self.database_path)
+        connection.row_factory = sqlite3.Row
+        try:
+            rows = connection.execute(
+                "SELECT key, evaluation_seq FROM sla_evaluation_idempotency_records"
+                " ORDER BY rowid ASC"
+            ).fetchall()
+            self.assertEqual(
+                [(row["key"], row["evaluation_seq"]) for row in rows],
+                [("eval-a", 1), ("eval-b", 2), ("eval-c", 3)],
+            )
+        finally:
+            connection.close()
+
+    def test_old_snapshot_replays_original_bytes(self) -> None:
+        old_snapshot = (
+            b'{"from":1,"to":2,"cut":0,"count":0,"latencySum":0,'
+            b'"maxLatency":null,"violations":0,"outcome":"insufficient"}'
+        )
+        request = Request(
+            self.url("/v1/slas/sla-1/evaluations"),
+            data=json.dumps({"from": 1, "to": 2}).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "eval-a")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+            self.assertEqual(response.read(), old_snapshot)
 
 
 if __name__ == "__main__":
