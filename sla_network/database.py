@@ -175,6 +175,25 @@ CREATE TABLE IF NOT EXISTS dispute_events (
     type TEXT NOT NULL,
     created_at_ms INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS dispute_evidences (
+    evidence_seq INTEGER PRIMARY KEY,
+    dispute_id TEXT NOT NULL,
+    evidence_id TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    observed_at_ms INTEGER NOT NULL,
+    digest TEXT NOT NULL,
+    UNIQUE (dispute_id, evidence_id),
+    UNIQUE (dispute_id, digest)
+);
+CREATE TABLE IF NOT EXISTS dispute_evidence_idempotency_records (
+    key TEXT PRIMARY KEY,
+    dispute_id TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    response_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dispute_evidences_dispute_seq
+ON dispute_evidences(dispute_id, evidence_seq);
 """
 
 TELEMETRY_SEQ_MARKER = "telemetry_commit_seq_renumbered"
