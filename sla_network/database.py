@@ -19,6 +19,30 @@ CREATE TABLE IF NOT EXISTS idempotency_records (
     machine_id TEXT NOT NULL,
     public_key TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS machine_keys (
+    machine_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    public_key TEXT NOT NULL,
+    activated_at_ms INTEGER NOT NULL,
+    revoked INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (machine_id, version),
+    UNIQUE (machine_id, public_key)
+);
+CREATE TABLE IF NOT EXISTS machine_key_idempotency_records (
+    key TEXT PRIMARY KEY,
+    machine_id TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    response_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS machine_key_revocation_idempotency_records (
+    key TEXT PRIMARY KEY,
+    machine_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    request_json TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    response_json TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS machine_capabilities (
     machine_id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -221,6 +245,7 @@ EVALUATION_SEQ_MARKER = "evaluation_seq_renumbered"
 EVALUATION_SEQ_INDEX = "idx_sla_evaluation_seq_unique"
 DISPUTE_EVENT_MARKER = "dispute_events_backfilled"
 DISPUTE_EVENT_INDEX = "idx_dispute_events_dispute_seq"
+MACHINE_KEYS_MARKER = "machine_keys_seeded"
 
 
 def _renumber_commit_seq(connection: sqlite3.Connection) -> None:
@@ -409,6 +434,42 @@ def _backfill_dispute_events(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _seed_machine_keys(connection: sqlite3.Connection) -> None:
+    # 仅在一次性迁移（含空库首次连接）时取写锁；BEGIN IMMEDIATE 串行并发首启。
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        if (
+            connection.execute(
+                "SELECT 1 FROM schema_metadata WHERE key = ?",
+                (MACHINE_KEYS_MARKER,),
+            ).fetchone()
+            is not None
+        ):
+            # 其他连接已完成迁移，直接释放写锁，不再补版本。
+            connection.execute("COMMIT")
+            return
+        # 旧库的每台既有机器补一条版本一：零时激活、未吊销；公钥取登记公钥。
+        # 升级前事件照常查询、评估与结算，不补造其他历史。
+        rows = connection.execute(
+            "SELECT id, public_key FROM machines ORDER BY rowid ASC"
+        ).fetchall()
+        for row in rows:
+            connection.execute(
+                "INSERT INTO machine_keys"
+                "(machine_id, version, public_key, activated_at_ms, revoked)"
+                " VALUES (?, 1, ?, 0, 0)",
+                (row["id"], row["public_key"]),
+            )
+        connection.execute(
+            "INSERT INTO schema_metadata(key, value) VALUES (?, '1')",
+            (MACHINE_KEYS_MARKER,),
+        )
+        connection.execute("COMMIT")
+    except BaseException:
+        connection.execute("ROLLBACK")
+        raise
+
+
 def connect(path: str) -> sqlite3.Connection:
     database = Path(path)
     database.parent.mkdir(parents=True, exist_ok=True)
@@ -459,6 +520,18 @@ def connect(path: str) -> sqlite3.Connection:
         is None
     ):
         _backfill_dispute_events(connection)
+    if (
+        connection.execute(
+            "SELECT 1 FROM schema_metadata WHERE key = ?",
+            (MACHINE_KEYS_MARKER,),
+        ).fetchone()
+        is None
+    ):
+        _seed_machine_keys(connection)
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_machine_keys_machine_version"
+        " ON machine_keys(machine_id, version)"
+    )
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_settlements_sla_seq"
         " ON settlements(sla_id, settlement_seq)"

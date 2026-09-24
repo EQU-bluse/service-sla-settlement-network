@@ -71,10 +71,11 @@ def telemetry_signature(
     latency_ms: int,
     digest: str,
     machine: str,
+    key_version: int = 1,
 ) -> str:
     message = (
-        f"telemetry-v1\n{sla_id}\n{event_id}\n{timestamp}\n"
-        f"{latency_ms}\n{digest}\n{machine}"
+        f"telemetry-v2\n{sla_id}\n{event_id}\n{timestamp}\n"
+        f"{latency_ms}\n{digest}\n{key_version}\n{machine}"
     )
     return _ed25519_sign(seed, message.encode("utf-8")).hex()
 
@@ -1618,6 +1619,7 @@ class TelemetryTests(unittest.TestCase):
         latency_ms: int = 12,
         digest: str | None = None,
         signature: str | None = None,
+        key_version: int = 1,
     ) -> bytes:
         if timestamp is None:
             timestamp = self.start * 1000 + 500
@@ -1626,7 +1628,7 @@ class TelemetryTests(unittest.TestCase):
         if signature is None:
             signature = telemetry_signature(
                 PRODUCER_SEED, sla_id, event_id, timestamp, latency_ms, digest,
-                self.machine_id,
+                self.machine_id, key_version,
             )
         return json.dumps(
             {
@@ -1634,6 +1636,7 @@ class TelemetryTests(unittest.TestCase):
                 "timestamp": timestamp,
                 "latencyMs": latency_ms,
                 "digest": digest,
+                "keyVersion": key_version,
                 "signature": signature,
             }
         ).encode()
@@ -2172,6 +2175,7 @@ class TelemetryTests(unittest.TestCase):
             "timestamp": timestamp,
             "latencyMs": 12,
             "digest": digest,
+            "keyVersion": 1,
             "signature": telemetry_signature(
                 PRODUCER_SEED, "sla-1", "evt-1", timestamp, 12, digest, self.machine_id
             ),
@@ -2223,6 +2227,7 @@ class TelemetryTests(unittest.TestCase):
             "timestamp": timestamp,
             "latencyMs": 12,
             "digest": digest,
+            "keyVersion": 1,
             "signature": telemetry_signature(
                 PRODUCER_SEED, "sla-ghost", "evt-1", timestamp, 12, digest, ghost
             ),
@@ -2524,6 +2529,7 @@ class EvaluationTests(unittest.TestCase):
                 "timestamp": timestamp,
                 "latencyMs": latency_ms,
                 "digest": digest,
+                "keyVersion": 1,
                 "signature": telemetry_signature(
                     PRODUCER_SEED, sla_id, event_id, timestamp, latency_ms, digest,
                     self.machine_id,
@@ -3369,6 +3375,7 @@ class TelemetrySignatureMigrationTests(unittest.TestCase):
                 "timestamp": 1600,
                 "latencyMs": 20,
                 "digest": digest,
+                "keyVersion": 1,
                 "signature": signature,
             },
             "tel-2",
@@ -3703,6 +3710,7 @@ class SettlementTests(unittest.TestCase):
                 "timestamp": timestamp,
                 "latencyMs": latency_ms,
                 "digest": digest,
+                "keyVersion": 1,
                 "signature": telemetry_signature(
                     PRODUCER_SEED, "sla-1", event_id, timestamp, latency_ms, digest,
                     self.machine_id,
@@ -4118,6 +4126,7 @@ class DisputeTests(unittest.TestCase):
                 "timestamp": timestamp,
                 "latencyMs": latency_ms,
                 "digest": digest,
+                "keyVersion": 1,
                 "signature": telemetry_signature(
                     PRODUCER_SEED, sla_id, event_id, timestamp, latency_ms, digest,
                     self.machine_id,
@@ -5124,6 +5133,7 @@ class DisputeEventMigrationTests(unittest.TestCase):
                 "timestamp": timestamp,
                 "latencyMs": 10,
                 "digest": digest,
+                "keyVersion": 1,
                 "signature": telemetry_signature(
                     PRODUCER_SEED, "sla-new", "evt-1", timestamp, 10, digest, machine,
                 ),
@@ -5292,6 +5302,7 @@ class DisputeCollectionTests(unittest.TestCase):
                 "timestamp": timestamp,
                 "latencyMs": 10,
                 "digest": digest,
+                "keyVersion": 1,
                 "signature": telemetry_signature(
                     PRODUCER_SEED, sla_id, event_id, timestamp, 10, digest,
                     self.machine_id,
@@ -5678,6 +5689,7 @@ class DisputeEvidenceTests(unittest.TestCase):
                 "timestamp": timestamp,
                 "latencyMs": 10,
                 "digest": digest,
+                "keyVersion": 1,
                 "signature": telemetry_signature(
                     PRODUCER_SEED, "sla-1", event_id, timestamp, 10, digest,
                     self.machine_id,
@@ -5926,6 +5938,7 @@ class DisputeEvidenceTests(unittest.TestCase):
                 "timestamp": timestamp,
                 "latencyMs": 100,
                 "digest": digest,
+                "keyVersion": 1,
                 "signature": telemetry_signature(
                     PRODUCER_SEED, "sla-2", event_id, timestamp, 100, digest,
                     self.machine_id,
@@ -6291,6 +6304,7 @@ class EvidenceProofTests(unittest.TestCase):
                 "timestamp": timestamp,
                 "latencyMs": 10,
                 "digest": digest,
+                "keyVersion": 1,
                 "signature": telemetry_signature(
                     self.PRODUCER_SEED, "sla-1", "evt-1", timestamp, 10, digest,
                     self.producer_id,
