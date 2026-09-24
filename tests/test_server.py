@@ -3364,6 +3364,473 @@ class SettlementTests(unittest.TestCase):
         self.assertEqual(status, 201)
         self.assertEqual(replay, first)
 
+    def restart(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def settle(self, sla_id: str, evaluation_seq: int, key: str) -> dict:
+        status, body, _ = self.post_settlement(
+            json.dumps({"slaId": sla_id, "evaluationSeq": evaluation_seq}).encode(),
+            idempotency_key=key,
+        )
+        self.assertEqual(status, 201)
+        return json.loads(body)
+
+    def get_settlements(
+        self, query: str = "", sla_id: str = "sla-1"
+    ) -> tuple[int, object, str]:
+        suffix = f"?{query}" if query else ""
+        try:
+            with urlopen(
+                self.url(f"/v1/slas/{sla_id}/settlements{suffix}"), timeout=5
+            ) as response:
+                return (
+                    response.status,
+                    json.loads(response.read()),
+                    response.headers["Content-Type"],
+                )
+        except HTTPError as error:
+            return error.code, json.loads(error.read()), error.headers["Content-Type"]
+
+    def get_ledger(
+        self, account_id: str, query: str = ""
+    ) -> tuple[int, object, str]:
+        suffix = f"?{query}" if query else ""
+        try:
+            with urlopen(
+                self.url(f"/v1/accounts/{account_id}/ledger{suffix}"), timeout=5
+            ) as response:
+                return (
+                    response.status,
+                    json.loads(response.read()),
+                    response.headers["Content-Type"],
+                )
+        except HTTPError as error:
+            return error.code, json.loads(error.read()), error.headers["Content-Type"]
+
+    def test_get_settlements_empty_sla(self) -> None:
+        self.activate()
+        status, body, content_type = self.get_settlements()
+        self.assertEqual(status, 200)
+        self.assertEqual(content_type, "application/json; charset=utf-8")
+        self.assertEqual(list(body), ["settlements", "nextCursor"])
+        self.assertEqual(body["settlements"], [])
+        self.assertIsNone(body["nextCursor"])
+
+    def test_get_settlements_order_scope_and_item_shape(self) -> None:
+        self.activate()
+        self.add_event(1, self.start * 1000 + 1, 10)
+        evaluation_seq = self.evaluate()
+        self.deposit(self.consumer_id, 5000, "fund-1")
+        first = self.settle("sla-1", evaluation_seq, "settle-1")
+        # sla-2 的结算穿插在全局序号中间，验证分页只看目标 SLA。
+        self.create_sla("sla-2", "sla-create-2")
+        self.activate("sla-2")
+        body = json.dumps({"from": self.start * 1000, "to": self.end * 1000}).encode()
+        request = Request(self.url("/v1/slas/sla-2/evaluations"), data=body, method="POST")
+        request.add_header("Idempotency-Key", "eval-2")
+        with urlopen(request, timeout=5) as response:
+            other_eval_seq = json.loads(response.read())["evaluationSeq"]
+        second = self.settle("sla-2", other_eval_seq, "settle-2")
+        empty_body = json.dumps(
+            {"from": self.start * 1000 + 5000, "to": self.end * 1000}
+        ).encode()
+        request = Request(
+            self.url("/v1/slas/sla-1/evaluations"), data=empty_body, method="POST"
+        )
+        request.add_header("Idempotency-Key", "eval-3")
+        with urlopen(request, timeout=5) as response:
+            pending_eval_seq = json.loads(response.read())["evaluationSeq"]
+        third = self.settle("sla-1", pending_eval_seq, "settle-3")
+        status, payload, _ = self.get_settlements()
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["settlementSeq"] for item in payload["settlements"]],
+            [first["settlementSeq"], third["settlementSeq"]],
+        )
+        self.assertIsNone(payload["nextCursor"])
+        charged = payload["settlements"][0]
+        self.assertEqual(
+            list(charged),
+            [
+                "settlementSeq",
+                "evaluationSeq",
+                "result",
+                "amount",
+                "payerId",
+                "payeeId",
+                "createdAt",
+            ],
+        )
+        self.assertEqual(charged["evaluationSeq"], evaluation_seq)
+        self.assertEqual(charged["result"], "charged")
+        self.assertEqual(charged["amount"], 1000)
+        self.assertEqual(charged["payerId"], self.consumer_id)
+        self.assertEqual(charged["payeeId"], self.machine_id)
+        self.assertEqual(charged["createdAt"], first["createdAt"])
+        pending = payload["settlements"][1]
+        self.assertEqual(pending["result"], "pending")
+        self.assertEqual(pending["amount"], 0)
+        self.assertIsNone(pending["payerId"])
+        self.assertIsNone(pending["payeeId"])
+        status, other, _ = self.get_settlements(sla_id="sla-2")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["settlementSeq"] for item in other["settlements"]],
+            [second["settlementSeq"]],
+        )
+        self.assertIsNone(other["settlements"][0]["payerId"])
+        self.assertIsNone(other["settlements"][0]["payeeId"])
+
+    def test_get_settlements_compact_json_without_trailing_newline(self) -> None:
+        self.activate()
+        self.add_event(1, self.start * 1000 + 1, 10)
+        evaluation_seq = self.evaluate()
+        self.deposit(self.consumer_id, 5000, "fund-1")
+        self.settle("sla-1", evaluation_seq, "settle-1")
+        with urlopen(self.url("/v1/slas/sla-1/settlements"), timeout=5) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.headers["Content-Type"], "application/json; charset=utf-8")
+            raw = response.read()
+        self.assertFalse(raw.endswith(b"\n"))
+        decoded = json.loads(raw)
+        self.assertEqual(
+            raw.decode("utf-8"),
+            json.dumps(decoded, separators=(",", ":")),
+        )
+
+    def test_get_settlements_pagination(self) -> None:
+        self.activate()
+        for index in range(1, 4):
+            body = json.dumps(
+                {"from": self.start * 1000 + 5000 + index, "to": self.end * 1000}
+            ).encode()
+            request = Request(
+                self.url("/v1/slas/sla-1/evaluations"), data=body, method="POST"
+            )
+            request.add_header("Idempotency-Key", f"eval-page-{index}")
+            with urlopen(request, timeout=5) as response:
+                evaluation_seq = json.loads(response.read())["evaluationSeq"]
+            self.settle("sla-1", evaluation_seq, f"settle-page-{index}")
+        status, page1, _ = self.get_settlements("limit=1")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["settlementSeq"] for item in page1["settlements"]], [1]
+        )
+        self.assertEqual(page1["nextCursor"], "3:1")
+        status, page2, _ = self.get_settlements(f"limit=1&cursor={page1['nextCursor']}")
+        self.assertEqual(
+            [item["settlementSeq"] for item in page2["settlements"]], [2]
+        )
+        self.assertEqual(page2["nextCursor"], "3:2")
+        status, page3, _ = self.get_settlements(f"limit=1&cursor={page2['nextCursor']}")
+        self.assertEqual(
+            [item["settlementSeq"] for item in page3["settlements"]], [3]
+        )
+        self.assertIsNone(page3["nextCursor"])
+
+    def test_get_settlements_cursor_pins_cut_against_new_writes(self) -> None:
+        self.activate()
+        for index in range(1, 3):
+            body = json.dumps(
+                {"from": self.start * 1000 + 5000 + index, "to": self.end * 1000}
+            ).encode()
+            request = Request(
+                self.url("/v1/slas/sla-1/evaluations"), data=body, method="POST"
+            )
+            request.add_header("Idempotency-Key", f"eval-pin-{index}")
+            with urlopen(request, timeout=5) as response:
+                evaluation_seq = json.loads(response.read())["evaluationSeq"]
+            self.settle("sla-1", evaluation_seq, f"settle-pin-{index}")
+        status, page1, _ = self.get_settlements("limit=1")
+        self.assertEqual(status, 200)
+        cursor = page1["nextCursor"]
+        self.assertEqual(cursor, "2:1")
+        body = json.dumps(
+            {"from": self.start * 1000 + 9000, "to": self.end * 1000}
+        ).encode()
+        request = Request(
+            self.url("/v1/slas/sla-1/evaluations"), data=body, method="POST"
+        )
+        request.add_header("Idempotency-Key", "eval-pin-3")
+        with urlopen(request, timeout=5) as response:
+            evaluation_seq = json.loads(response.read())["evaluationSeq"]
+        self.settle("sla-1", evaluation_seq, "settle-pin-3")
+        status, page2, _ = self.get_settlements(f"limit=1&cursor={cursor}")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["settlementSeq"] for item in page2["settlements"]], [2]
+        )
+        self.assertIsNone(page2["nextCursor"])
+        status, fresh, _ = self.get_settlements()
+        self.assertEqual(
+            [item["settlementSeq"] for item in fresh["settlements"]], [1, 2, 3]
+        )
+
+    def test_get_settlements_cursor_survives_restart(self) -> None:
+        self.activate()
+        for index in range(1, 4):
+            body = json.dumps(
+                {"from": self.start * 1000 + 5000 + index, "to": self.end * 1000}
+            ).encode()
+            request = Request(
+                self.url("/v1/slas/sla-1/evaluations"), data=body, method="POST"
+            )
+            request.add_header("Idempotency-Key", f"eval-restart-{index}")
+            with urlopen(request, timeout=5) as response:
+                evaluation_seq = json.loads(response.read())["evaluationSeq"]
+            self.settle("sla-1", evaluation_seq, f"settle-restart-{index}")
+        status, page1, _ = self.get_settlements("limit=2")
+        self.assertEqual(status, 200)
+        cursor = page1["nextCursor"]
+        self.restart()
+        status, page2, _ = self.get_settlements(f"limit=2&cursor={cursor}")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["settlementSeq"] for item in page2["settlements"]], [3]
+        )
+        self.assertIsNone(page2["nextCursor"])
+
+    def test_get_settlements_sla_not_found(self) -> None:
+        for sla_id in ("missing", "BAD!"):
+            status, body, _ = self.get_settlements(sla_id=sla_id)
+            self.assertEqual(status, 404, sla_id)
+            self.assertEqual(body, {"error": "not_found"})
+
+    def test_get_settlements_invalid_query_is_prior_to_sla_lookup(self) -> None:
+        for query in (
+            "limit=0",
+            "limit=101",
+            "limit=01",
+            "limit=x",
+            "limit=",
+            "limit=1&limit=2",
+            "cursor=bad",
+            "cursor=1",
+            "cursor=1:2:3",
+            "cursor=01:1",
+            "cursor=1:02",
+            "unknown=1",
+        ):
+            status, body, _ = self.get_settlements(query, sla_id="missing")
+            self.assertEqual(status, 400, query)
+            self.assertEqual(body, {"error": "invalid_request"})
+
+    def test_get_settlements_bad_cut_or_anchor(self) -> None:
+        self.activate()
+        self.create_sla("sla-2", "sla-create-2")
+        self.activate("sla-2")
+        body = json.dumps({"from": self.start * 1000, "to": self.end * 1000}).encode()
+        request = Request(self.url("/v1/slas/sla-2/evaluations"), data=body, method="POST")
+        request.add_header("Idempotency-Key", "eval-s2")
+        with urlopen(request, timeout=5) as response:
+            other_eval_seq = json.loads(response.read())["evaluationSeq"]
+        self.settle("sla-2", other_eval_seq, "settle-s2")  # 全库 seq 1
+        evaluation_seq = self.evaluate()  # sla-1 不足额，无需入金
+        self.settle("sla-1", evaluation_seq, "settle-s1")  # 全库 seq 2
+        for query in (
+            "cursor=999:2",  # cut 超过当前全库最大结算序号
+            "cursor=2:1",  # 序号 1 属于 sla-2，在 sla-1 内锚点不存在
+            "cursor=2:5",  # 序号全库不存在
+        ):
+            status, body, _ = self.get_settlements(query)
+            self.assertEqual(status, 400, query)
+            self.assertEqual(body, {"error": "invalid_request"})
+        # cut>max 在 SLA 查询之后校验：SLA 缺失仍为 404。
+        status, _, _ = self.get_settlements("cursor=999:1", sla_id="missing")
+        self.assertEqual(status, 404)
+        # sla-2 用自己的锚点则合法。
+        status, page, _ = self.get_settlements("cursor=2:1", sla_id="sla-2")
+        self.assertEqual(status, 200)
+        self.assertEqual(page["settlements"], [])
+        self.assertIsNone(page["nextCursor"])
+
+    def test_get_ledger_empty_pages_for_valid_accounts(self) -> None:
+        status, body, content_type = self.get_ledger(self.machine_id)
+        self.assertEqual(status, 200)
+        self.assertEqual(content_type, "application/json; charset=utf-8")
+        self.assertEqual(list(body), ["entries", "nextCursor"])
+        self.assertEqual(body["entries"], [])
+        self.assertIsNone(body["nextCursor"])
+        status, body, _ = self.get_ledger("external:clearing")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["entries"], [])
+        self.assertIsNone(body["nextCursor"])
+
+    def test_get_ledger_unknown_account_is_404(self) -> None:
+        for account_id in ("00" * 32, "external:other", "bad!"):
+            status, body, _ = self.get_ledger(account_id)
+            self.assertEqual(status, 404, account_id)
+            self.assertEqual(body, {"error": "not_found"})
+
+    def test_get_ledger_entries_shape_and_relations(self) -> None:
+        self.activate()
+        self.add_event(1, self.start * 1000 + 1, 10)
+        evaluation_seq = self.evaluate()
+        self.deposit(self.consumer_id, 5000, "fund-1")
+        settlement = self.settle("sla-1", evaluation_seq, "settle-1")
+        status, payload, _ = self.get_ledger(self.consumer_id)
+        self.assertEqual(status, 200)
+        entries = payload["entries"]
+        self.assertEqual(len(entries), 2)
+        self.assertIsNone(payload["nextCursor"])
+        deposit_entry, settlement_entry = entries
+        self.assertEqual(
+            list(deposit_entry),
+            [
+                "entrySeq",
+                "kind",
+                "referenceSeq",
+                "reference",
+                "slaId",
+                "evaluationSeq",
+                "delta",
+                "balanceAfter",
+                "createdAt",
+            ],
+        )
+        self.assertEqual(deposit_entry["kind"], "deposit")
+        self.assertEqual(deposit_entry["referenceSeq"], 1)
+        self.assertEqual(deposit_entry["reference"], "ref-1")
+        self.assertIsNone(deposit_entry["slaId"])
+        self.assertIsNone(deposit_entry["evaluationSeq"])
+        self.assertEqual(deposit_entry["delta"], 5000)
+        self.assertEqual(deposit_entry["balanceAfter"], 5000)
+        self.assertIsInstance(deposit_entry["createdAt"], int)
+        self.assertEqual(settlement_entry["kind"], "settlement")
+        self.assertEqual(
+            settlement_entry["referenceSeq"], settlement["settlementSeq"]
+        )
+        self.assertIsNone(settlement_entry["reference"])
+        self.assertEqual(settlement_entry["slaId"], "sla-1")
+        self.assertEqual(settlement_entry["evaluationSeq"], evaluation_seq)
+        self.assertEqual(settlement_entry["delta"], -1000)
+        self.assertEqual(settlement_entry["balanceAfter"], 4000)
+        # 生产方账户只有正向结算分录。
+        status, producer, _ = self.get_ledger(self.machine_id)
+        self.assertEqual(status, 200)
+        self.assertEqual(len(producer["entries"]), 1)
+        producer_entry = producer["entries"][0]
+        self.assertEqual(producer_entry["kind"], "settlement")
+        self.assertEqual(producer_entry["delta"], 1000)
+        self.assertEqual(producer_entry["balanceAfter"], 1000)
+        self.assertEqual(producer_entry["slaId"], "sla-1")
+        # 清算账户只有入金的反向分录。
+        status, clearing, _ = self.get_ledger("external:clearing")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(clearing["entries"]), 1)
+        clearing_entry = clearing["entries"][0]
+        self.assertEqual(clearing_entry["kind"], "deposit")
+        self.assertEqual(clearing_entry["reference"], "ref-1")
+        self.assertEqual(clearing_entry["delta"], -5000)
+        self.assertEqual(clearing_entry["balanceAfter"], -5000)
+        self.assertIsNone(clearing_entry["slaId"])
+        self.assertLess(clearing_entry["entrySeq"], producer_entry["entrySeq"])
+
+    def test_get_ledger_compact_json_without_trailing_newline(self) -> None:
+        self.deposit(self.machine_id, 1000, "fund-1")
+        with urlopen(
+            self.url(f"/v1/accounts/{self.machine_id}/ledger"), timeout=5
+        ) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.headers["Content-Type"], "application/json; charset=utf-8")
+            raw = response.read()
+        self.assertFalse(raw.endswith(b"\n"))
+        decoded = json.loads(raw)
+        self.assertEqual(raw.decode("utf-8"), json.dumps(decoded, separators=(",", ":")))
+
+    def test_get_ledger_pagination(self) -> None:
+        for index in range(1, 4):
+            self.deposit(self.machine_id, 1000, f"fund-{index}")
+        # 每次入金成对写分录，全库 entrySeq 到 6；机器账户持奇数序号 1/3/5。
+        status, page1, _ = self.get_ledger(self.machine_id, "limit=2")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["entrySeq"] for item in page1["entries"]], [1, 3]
+        )
+        self.assertEqual(page1["nextCursor"], "6:3")
+        status, page2, _ = self.get_ledger(
+            self.machine_id, f"limit=2&cursor={page1['nextCursor']}"
+        )
+        self.assertEqual([item["entrySeq"] for item in page2["entries"]], [5])
+        self.assertIsNone(page2["nextCursor"])
+
+    def test_get_ledger_cursor_pins_cut_against_new_writes(self) -> None:
+        self.deposit(self.machine_id, 1000, "fund-1")
+        self.deposit(self.machine_id, 1000, "fund-2")
+        status, page1, _ = self.get_ledger(self.machine_id, "limit=1")
+        self.assertEqual(status, 200)
+        cursor = page1["nextCursor"]
+        self.assertEqual(cursor, "4:1")
+        self.deposit(self.machine_id, 1000, "fund-3")
+        status, page2, _ = self.get_ledger(
+            self.machine_id, f"limit=1&cursor={cursor}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual([item["entrySeq"] for item in page2["entries"]], [3])
+        self.assertIsNone(page2["nextCursor"])
+        status, fresh, _ = self.get_ledger(self.machine_id)
+        self.assertEqual(
+            [item["entrySeq"] for item in fresh["entries"]], [1, 3, 5]
+        )
+
+    def test_get_ledger_cursor_survives_restart(self) -> None:
+        self.deposit(self.machine_id, 1000, "fund-1")
+        self.deposit(self.machine_id, 1000, "fund-2")
+        status, page1, _ = self.get_ledger(self.machine_id, "limit=1")
+        self.assertEqual(status, 200)
+        cursor = page1["nextCursor"]
+        self.restart()
+        status, page2, _ = self.get_ledger(
+            self.machine_id, f"limit=1&cursor={cursor}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual([item["entrySeq"] for item in page2["entries"]], [3])
+        self.assertIsNone(page2["nextCursor"])
+
+    def test_get_ledger_invalid_query_is_prior_to_account_lookup(self) -> None:
+        for query in (
+            "limit=0",
+            "limit=101",
+            "limit=01",
+            "limit=x",
+            "limit=",
+            "limit=1&limit=2",
+            "cursor=bad",
+            "cursor=1",
+            "cursor=1:2:3",
+            "cursor=01:1",
+            "cursor=1:02",
+            "unknown=1",
+        ):
+            status, body, _ = self.get_ledger("00" * 32, query)
+            self.assertEqual(status, 400, query)
+            self.assertEqual(body, {"error": "invalid_request"})
+
+    def test_get_ledger_bad_cut_or_anchor(self) -> None:
+        self.deposit(self.machine_id, 1000, "fund-1")  # 机器 entry 1，清算 entry 2
+        for query in (
+            "cursor=999:1",  # cut 超过当前全库最大分录序号
+            "cursor=2:2",  # 序号 2 属于清算账户，在机器账户内锚点不存在
+            "cursor=2:5",  # 序号全库不存在
+        ):
+            status, body, _ = self.get_ledger(self.machine_id, query)
+            self.assertEqual(status, 400, query)
+            self.assertEqual(body, {"error": "invalid_request"})
+        # cut>max 在账户查询之后校验：未知账户仍为 404。
+        status, _, _ = self.get_ledger("00" * 32, "cursor=999:1")
+        self.assertEqual(status, 404)
+        # 清算账户用自己的锚点则合法。
+        status, page, _ = self.get_ledger("external:clearing", "cursor=2:2")
+        self.assertEqual(status, 200)
+        self.assertEqual(page["entries"], [])
+        self.assertIsNone(page["nextCursor"])
+
 
 if __name__ == "__main__":
     unittest.main()
