@@ -169,12 +169,20 @@ CREATE TABLE IF NOT EXISTS dispute_resolution_idempotency_records (
     status INTEGER NOT NULL,
     response_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS dispute_events (
+    event_seq INTEGER PRIMARY KEY,
+    dispute_id TEXT NOT NULL,
+    type TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL
+);
 """
 
 TELEMETRY_SEQ_MARKER = "telemetry_commit_seq_renumbered"
 TELEMETRY_SEQ_INDEX = "idx_sla_telemetry_commit_seq_unique"
 EVALUATION_SEQ_MARKER = "evaluation_seq_renumbered"
 EVALUATION_SEQ_INDEX = "idx_sla_evaluation_seq_unique"
+DISPUTE_EVENT_MARKER = "dispute_events_backfilled"
+DISPUTE_EVENT_INDEX = "idx_dispute_events_dispute_seq"
 
 
 def _renumber_commit_seq(connection: sqlite3.Connection) -> None:
@@ -280,6 +288,56 @@ def _renumber_evaluation_seq(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _backfill_dispute_events(connection: sqlite3.Connection) -> None:
+    # 仅在一次性迁移（含空库首次连接）时取写锁；BEGIN IMMEDIATE 串行并发首启。
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        if (
+            connection.execute(
+                "SELECT 1 FROM schema_metadata WHERE key = ?",
+                (DISPUTE_EVENT_MARKER,),
+            ).fetchone()
+            is not None
+        ):
+            # 其他连接已完成迁移，直接释放写锁，不再补事件。
+            connection.execute("COMMIT")
+            return
+        # 旧库没有 dispute_events 表（新库由 SCHEMA 创建），单事务内补齐：
+        # 按争议 rowid 升序每个争议补 opened；已裁决项紧随补结果。时间记零，
+        # 不虚构旧失败，不改争议与幂等等既有数据。
+        rows = connection.execute(
+            "SELECT rowid AS rid, id, state FROM disputes ORDER BY rowid ASC"
+        ).fetchall()
+        event_seq = 0
+        for row in rows:
+            event_seq += 1
+            connection.execute(
+                "INSERT INTO dispute_events(event_seq, dispute_id, type, created_at_ms)"
+                " VALUES (?, ?, 'opened', 0)",
+                (event_seq, row["id"]),
+            )
+            if row["state"] in ("released", "refunded"):
+                event_seq += 1
+                connection.execute(
+                    "INSERT INTO dispute_events"
+                    "(event_seq, dispute_id, type, created_at_ms)"
+                    " VALUES (?, ?, ?, 0)",
+                    (event_seq, row["id"], row["state"]),
+                )
+        connection.execute(
+            "INSERT INTO schema_metadata(key, value) VALUES (?, '1')",
+            (DISPUTE_EVENT_MARKER,),
+        )
+        connection.execute(
+            f"CREATE INDEX IF NOT EXISTS {DISPUTE_EVENT_INDEX}"
+            " ON dispute_events(dispute_id, event_seq)"
+        )
+        connection.execute("COMMIT")
+    except BaseException:
+        connection.execute("ROLLBACK")
+        raise
+
+
 def connect(path: str) -> sqlite3.Connection:
     database = Path(path)
     database.parent.mkdir(parents=True, exist_ok=True)
@@ -314,6 +372,14 @@ def connect(path: str) -> sqlite3.Connection:
         "CREATE INDEX IF NOT EXISTS idx_sla_evaluation_seq"
         " ON sla_evaluation_idempotency_records(sla_id, evaluation_seq)"
     )
+    if (
+        connection.execute(
+            "SELECT 1 FROM schema_metadata WHERE key = ?",
+            (DISPUTE_EVENT_MARKER,),
+        ).fetchone()
+        is None
+    ):
+        _backfill_dispute_events(connection)
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_settlements_sla_seq"
         " ON settlements(sla_id, settlement_seq)"

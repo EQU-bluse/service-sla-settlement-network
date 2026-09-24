@@ -9,6 +9,7 @@ import time
 import unittest
 from pathlib import Path
 from urllib.error import HTTPError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from sla_network.server import ApiServer, Handler
@@ -3809,6 +3810,731 @@ class DisputeTests(unittest.TestCase):
         )
         settlement = self.settle("sla-2", evaluation_seq, "settle-3")
         self.assertEqual(settlement["result"], "compensated")
+
+    def create_open_dispute(self) -> int:
+        settlement_seq = self.create_charged_settlement()
+        self.assertEqual(
+            self.post_dispute(self.dispute_body(settlement_seq))[0], 201
+        )
+        return settlement_seq
+
+    def test_get_dispute_open(self) -> None:
+        settlement_seq = self.create_open_dispute()
+        status, payload = self.get_json("/v1/disputes/dispute-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            list(payload),
+            [
+                "id",
+                "state",
+                "amount",
+                "claimantId",
+                "payerId",
+                "payeeId",
+                "settlementSeq",
+                "slaId",
+                "evaluationSeq",
+                "result",
+            ],
+        )
+        self.assertEqual(payload["id"], "dispute-1")
+        self.assertEqual(payload["state"], "open")
+        self.assertEqual(payload["amount"], 1000)
+        self.assertEqual(payload["claimantId"], self.consumer_id)
+        self.assertEqual(payload["payerId"], self.consumer_id)
+        self.assertEqual(payload["payeeId"], self.machine_id)
+        self.assertEqual(payload["settlementSeq"], settlement_seq)
+        self.assertEqual(payload["slaId"], "sla-1")
+        self.assertEqual(payload["evaluationSeq"], 1)
+        self.assertEqual(payload["result"], "charged")
+
+    def test_get_dispute_states_after_resolution(self) -> None:
+        self.create_open_dispute()
+        self.assertEqual(
+            self.post_resolution("dispute-1", {"decision": "release"})[0], 200
+        )
+        status, payload = self.get_json("/v1/disputes/dispute-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["state"], "released")
+
+        # 第二笔 charged 结算由另一 SLA 产生，退款后状态为 refunded。
+        self.create_sla("sla-2", "sla-create-2")
+        self.activate("sla-2")
+        self.add_event("sla-2", 1, 10)
+        settlement = self.settle(
+            "sla-2", self.evaluate("sla-2", "eval-2"), "settle-2"
+        )
+        self.assertEqual(settlement["result"], "charged")
+        self.assertEqual(
+            self.post_dispute(
+                self.dispute_body(settlement["settlementSeq"], id="dispute-3"),
+                key="dispute-3",
+            )[0],
+            201,
+        )
+        self.assertEqual(
+            self.post_resolution("dispute-3", {"decision": "refund"}, key="r-3")[0],
+            200,
+        )
+        status, payload = self.get_json("/v1/disputes/dispute-3")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["state"], "refunded")
+        self.assertEqual(payload["slaId"], "sla-2")
+
+    def test_get_dispute_invalid_or_missing_is_not_found(self) -> None:
+        for dispute_id in ("missing", quote("BAD ID"), "x%2Fy"):
+            status, payload = self.get_json(f"/v1/disputes/{dispute_id}")
+            self.assertEqual(status, 404, dispute_id)
+            self.assertEqual(payload, {"error": "not_found"})
+
+    def test_get_dispute_rejects_query_params(self) -> None:
+        self.create_open_dispute()
+        for suffix in ("?limit=1", "?foo=bar"):
+            status, payload = self.get_json(f"/v1/disputes/dispute-1{suffix}")
+            self.assertEqual(status, 400, suffix)
+            self.assertEqual(payload, {"error": "invalid_request"})
+        # 参数校验先于争议查询：不存在的争议同样返回 400。
+        status, payload = self.get_json("/v1/disputes/missing?limit=1")
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "invalid_request"})
+
+    def test_dispute_events_records_opened_and_released(self) -> None:
+        self.create_open_dispute()
+        status, payload = self.get_json("/v1/disputes/dispute-1/events")
+        self.assertEqual(status, 200)
+        self.assertEqual(list(payload), ["events", "nextCursor"])
+        self.assertIsNone(payload["nextCursor"])
+        events = payload["events"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(list(events[0]), ["eventSeq", "type", "createdAt"])
+        self.assertEqual(events[0]["eventSeq"], 1)
+        self.assertEqual(events[0]["type"], "opened")
+        self.assertIsInstance(events[0]["createdAt"], int)
+        self.assertGreaterEqual(events[0]["createdAt"], 0)
+
+        self.assertEqual(
+            self.post_resolution("dispute-1", {"decision": "release"})[0], 200
+        )
+        status, payload = self.get_json("/v1/disputes/dispute-1/events")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [(event["type"]) for event in payload["events"]],
+            ["opened", "released"],
+        )
+        seqs = [event["eventSeq"] for event in payload["events"]]
+        self.assertEqual(seqs, sorted(seqs))
+        self.assertEqual(len(set(seqs)), len(seqs))
+        self.assertIsNone(payload["nextCursor"])
+
+    def test_refund_event_records_refunded_type(self) -> None:
+        self.create_open_dispute()
+        self.assertEqual(
+            self.post_resolution("dispute-1", {"decision": "refund"})[0], 200
+        )
+        status, payload = self.get_json("/v1/disputes/dispute-1/events")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [(event["eventSeq"], event["type"]) for event in payload["events"]],
+            [(1, "opened"), (2, "refunded")],
+        )
+        self.assertGreater(payload["events"][1]["createdAt"], 0)
+
+    def test_event_seq_is_global_across_disputes(self) -> None:
+        # 第二笔 compensated 结算（机器为付款方）须在 dispute-1 冻结前过账。
+        self.add_event("sla-1", 1, 10)
+        evaluation_seq = self.evaluate("sla-1", "eval-1")
+        self.deposit(self.consumer_id, 100000, "fund-1")
+        first = self.settle("sla-1", evaluation_seq, "settle-1")
+        self.create_sla("sla-2", "sla-create-2")
+        self.activate("sla-2")
+        self.add_event("sla-2", 1, 100)
+        second = self.settle(
+            "sla-2", self.evaluate("sla-2", "eval-2"), "settle-2"
+        )
+        self.assertEqual(second["result"], "compensated")
+        self.assertEqual(
+            self.post_dispute(self.dispute_body(first["settlementSeq"]))[0], 201
+        )
+        self.assertEqual(
+            self.post_dispute(
+                self.dispute_body(
+                    second["settlementSeq"],
+                    id="dispute-2",
+                    claimantId=self.machine_id,
+                ),
+                key="dispute-2",
+            )[0],
+            201,
+        )
+        _, first_events = self.get_json("/v1/disputes/dispute-1/events")
+        _, second_events = self.get_json("/v1/disputes/dispute-2/events")
+        self.assertEqual(
+            [event["eventSeq"] for event in first_events["events"]], [1]
+        )
+        self.assertEqual(
+            [event["eventSeq"] for event in second_events["events"]], [2]
+        )
+
+    def test_replay_writes_no_duplicate_events(self) -> None:
+        settlement_seq = self.create_charged_settlement()
+        first_status, first = self.post_dispute(self.dispute_body(settlement_seq))
+        self.assertEqual(first_status, 201)
+        for _ in range(3):
+            status, replay = self.post_dispute(self.dispute_body(settlement_seq))
+            self.assertEqual(status, 201)
+            self.assertEqual(replay, first)
+        _, payload = self.get_json("/v1/disputes/dispute-1/events")
+        self.assertEqual(len(payload["events"]), 1)
+        self.assertEqual(
+            self.post_resolution("dispute-1", {"decision": "release"})[0], 200
+        )
+        for _ in range(3):
+            self.assertEqual(
+                self.post_resolution("dispute-1", {"decision": "release"})[0], 200
+            )
+        _, payload = self.get_json("/v1/disputes/dispute-1/events")
+        self.assertEqual(
+            [event["type"] for event in payload["events"]],
+            ["opened", "released"],
+        )
+
+    def test_failed_requests_write_no_events(self) -> None:
+        settlement_seq = self.create_charged_settlement()
+        # 创建失败：非法请求、异请求冲突、重复争议均不得写事件。
+        self.assertEqual(
+            self.post_dispute(b"{}", key="bad-1")[0], 400
+        )
+        self.assertEqual(
+            self.post_dispute(self.dispute_body(settlement_seq))[0], 201
+        )
+        self.assertEqual(
+            self.post_dispute(
+                self.dispute_body(settlement_seq, id="dispute-2")
+            )[0],
+            409,
+        )
+        self.assertEqual(
+            self.post_dispute(
+                self.dispute_body(settlement_seq), key="dispute-2"
+            )[0],
+            409,
+        )
+        # 裁决失败：非法请求与异键重复裁决不写事件。
+        self.assertEqual(
+            self.post_resolution("dispute-1", b"{}", key="bad-2")[0], 400
+        )
+        self.assertEqual(
+            self.post_resolution("dispute-1", {"decision": "release"})[0], 200
+        )
+        self.assertEqual(
+            self.post_resolution(
+                "dispute-1", {"decision": "release"}, key="resolve-2"
+            )[0],
+            409,
+        )
+        _, payload = self.get_json("/v1/disputes/dispute-1/events")
+        self.assertEqual(
+            [event["type"] for event in payload["events"]],
+            ["opened", "released"],
+        )
+
+    def test_insufficient_refund_writes_no_event_then_succeeds_once(self) -> None:
+        settlement_seq = self.create_charged_settlement()
+        self.create_sla("sla-2", "sla-create-2")
+        self.activate("sla-2")
+        self.add_event("sla-2", 1, 100)
+        self.settle("sla-2", self.evaluate("sla-2", "eval-2"), "settle-2")
+        # 机器总余额已为 0，争议冻结 1000；退款失败不留事件。
+        self.assertEqual(
+            self.post_dispute(self.dispute_body(settlement_seq))[0], 201
+        )
+        status, body = self.post_resolution("dispute-1", {"decision": "refund"})
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "insufficient_funds"})
+        _, dispute = self.get_json("/v1/disputes/dispute-1")
+        self.assertEqual(dispute["state"], "open")
+        _, payload = self.get_json("/v1/disputes/dispute-1/events")
+        self.assertEqual(
+            [event["type"] for event in payload["events"]], ["opened"]
+        )
+        # 失败也不保存幂等结果：补足后新键成功，仅一条 refunded。
+        self.deposit(self.machine_id, 5000, "fund-2")
+        self.assertEqual(
+            self.post_resolution(
+                "dispute-1", {"decision": "refund"}, key="resolve-2"
+            )[0],
+            200,
+        )
+        _, payload = self.get_json("/v1/disputes/dispute-1/events")
+        self.assertEqual(
+            [event["type"] for event in payload["events"]],
+            ["opened", "refunded"],
+        )
+        status, ledger = self.get_json(f"/v1/accounts/{self.machine_id}/ledger")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            len(
+                [
+                    entry
+                    for entry in ledger["entries"]
+                    if entry["kind"] == "dispute_refund"
+                ]
+            ),
+            1,
+        )
+
+    def test_events_pagination_limit_and_cursor(self) -> None:
+        self.create_open_dispute()
+        self.assertEqual(
+            self.post_resolution("dispute-1", {"decision": "release"})[0], 200
+        )
+        status, first_page = self.get_json(
+            "/v1/disputes/dispute-1/events?limit=1"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [event["eventSeq"] for event in first_page["events"]], [1]
+        )
+        self.assertEqual(first_page["nextCursor"], "2:1")
+        status, second_page = self.get_json(
+            f"/v1/disputes/dispute-1/events?limit=1&cursor={first_page['nextCursor']}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [event["eventSeq"] for event in second_page["events"]], [2]
+        )
+        self.assertIsNone(second_page["nextCursor"])
+
+    def test_events_cursor_cut_isolates_later_appends(self) -> None:
+        self.create_open_dispute()
+        _, first_page = self.get_json("/v1/disputes/dispute-1/events")
+        self.assertEqual(first_page["nextCursor"], None)
+        # 裁决推进全库最大序号；旧 cut=1 的续页不得看到新事件。
+        self.assertEqual(
+            self.post_resolution("dispute-1", {"decision": "release"})[0], 200
+        )
+        status, continuation = self.get_json(
+            "/v1/disputes/dispute-1/events?cursor=1:1"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(continuation["events"], [])
+        self.assertIsNone(continuation["nextCursor"])
+        # 全新首页取新 cut，可见两条。
+        _, fresh = self.get_json("/v1/disputes/dispute-1/events")
+        self.assertEqual(len(fresh["events"]), 2)
+
+    def test_events_invalid_query_params(self) -> None:
+        self.create_open_dispute()
+        for query in (
+            "limit=0",
+            "limit=101",
+            "limit=01",
+            "limit=1&limit=2",
+            "unknown=1",
+            "cursor=1",
+            "cursor=x:1",
+            "cursor=1:y",
+            "cursor=01:1",
+        ):
+            status, payload = self.get_json(
+                f"/v1/disputes/dispute-1/events?{query}"
+            )
+            self.assertEqual(status, 400, query)
+            self.assertEqual(payload, {"error": "invalid_request"})
+        # 参数错误先于争议查询。
+        status, payload = self.get_json("/v1/disputes/missing/events?limit=0")
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "invalid_request"})
+
+    def test_events_cut_ahead_or_missing_anchor(self) -> None:
+        self.create_open_dispute()
+        self.assertEqual(
+            self.post_resolution("dispute-1", {"decision": "release"})[0], 200
+        )
+        # cut 超过当前全库最大序号。
+        status, payload = self.get_json(
+            "/v1/disputes/dispute-1/events?cursor=999:1"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "invalid_request"})
+        # 锚点不大于 cut 却不存在。
+        status, payload = self.get_json(
+            "/v1/disputes/dispute-1/events?cursor=2:5"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "invalid_request"})
+
+    def test_events_cross_dispute_anchor_is_invalid(self) -> None:
+        settlement_seq = self.create_charged_settlement()
+        self.create_sla("sla-2", "sla-create-2")
+        self.activate("sla-2")
+        self.add_event("sla-2", 1, 100)
+        second = self.settle(
+            "sla-2", self.evaluate("sla-2", "eval-2"), "settle-2"
+        )
+        self.assertEqual(
+            self.post_dispute(self.dispute_body(settlement_seq))[0], 201
+        )
+        self.assertEqual(
+            self.post_dispute(
+                self.dispute_body(
+                    second["settlementSeq"],
+                    id="dispute-2",
+                    claimantId=self.machine_id,
+                ),
+                key="dispute-2",
+            )[0],
+            201,
+        )
+        # 序号 2 属于 dispute-2，作为 dispute-1 的锚点无效。
+        status, payload = self.get_json(
+            "/v1/disputes/dispute-1/events?cursor=2:2"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "invalid_request"})
+
+    def test_events_unknown_or_invalid_dispute_is_not_found(self) -> None:
+        for dispute_id in ("missing", quote("BAD ID")):
+            status, payload = self.get_json(f"/v1/disputes/{dispute_id}/events")
+            self.assertEqual(status, 404, dispute_id)
+            self.assertEqual(payload, {"error": "not_found"})
+
+    def test_concurrent_resolution_records_single_event(self) -> None:
+        self.create_open_dispute()
+        results: list[int] = []
+        lock = threading.Lock()
+
+        def resolve() -> None:
+            status, _ = self.post_resolution("dispute-1", {"decision": "release"})
+            with lock:
+                results.append(status)
+
+        threads = [threading.Thread(target=resolve) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual(results, [200] * 8)
+        _, payload = self.get_json("/v1/disputes/dispute-1/events")
+        self.assertEqual(
+            [event["type"] for event in payload["events"]],
+            ["opened", "released"],
+        )
+
+
+class DisputeEventMigrationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.database_path = str(Path(self.temporary.name) / "service.db")
+        self._build_old_database()
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = self.database_path
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def _build_old_database(self) -> None:
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute(
+                "CREATE TABLE disputes ("
+                "id TEXT PRIMARY KEY, settlement_seq INTEGER NOT NULL UNIQUE,"
+                " claimant_id TEXT NOT NULL, payer_id TEXT NOT NULL,"
+                " payee_id TEXT NOT NULL, amount_micros INTEGER NOT NULL,"
+                " state TEXT NOT NULL)"
+            )
+            connection.execute(
+                "CREATE TABLE settlements ("
+                "settlement_seq INTEGER PRIMARY KEY, sla_id TEXT NOT NULL,"
+                " evaluation_seq INTEGER NOT NULL UNIQUE, result TEXT NOT NULL,"
+                " amount_micros INTEGER NOT NULL, payer_id TEXT,"
+                " payee_id TEXT, created_at_ms INTEGER NOT NULL)"
+            )
+            rows = (
+                ("d-open", 11, "open"),
+                ("d-ref", 12, "refunded"),
+                ("d-rel", 13, "released"),
+            )
+            for index, (dispute_id, settlement_seq, state) in enumerate(rows):
+                connection.execute(
+                    "INSERT INTO settlements"
+                    "(settlement_seq, sla_id, evaluation_seq, result,"
+                    " amount_micros, payer_id, payee_id, created_at_ms)"
+                    " VALUES (?, 'sla-old', ?, 'charged', 1000, 'p', 'm', 0)",
+                    (settlement_seq, 100 + index + 1),
+                )
+                connection.execute(
+                    "INSERT INTO disputes"
+                    "(id, settlement_seq, claimant_id, payer_id, payee_id,"
+                    " amount_micros, state)"
+                    " VALUES (?, ?, 'p', 'p', 'm', 1000, ?)",
+                    (dispute_id, settlement_seq, state),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temporary.cleanup()
+
+    def url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}{path}"
+
+    def get_json(self, path: str) -> tuple[int, object]:
+        try:
+            with urlopen(self.url(path), timeout=5) as response:
+                return response.status, json.loads(response.read())
+        except HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    def restart(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = self.database_path
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def test_old_disputes_backfilled_once_by_rowid(self) -> None:
+        expected = {
+            "d-open": [(1, "opened")],
+            "d-ref": [(2, "opened"), (3, "refunded")],
+            "d-rel": [(4, "opened"), (5, "released")],
+        }
+        for dispute_id, events in expected.items():
+            status, payload = self.get_json(f"/v1/disputes/{dispute_id}/events")
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                [
+                    (event["eventSeq"], event["type"])
+                    for event in payload["events"]
+                ],
+                events,
+            )
+            self.assertTrue(
+                all(event["createdAt"] == 0 for event in payload["events"])
+            )
+            self.assertIsNone(payload["nextCursor"])
+
+        status, payload = self.get_json("/v1/disputes/d-ref")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["state"], "refunded")
+        self.assertEqual(payload["amount"], 1000)
+        self.assertEqual(payload["settlementSeq"], 12)
+        self.assertEqual(payload["slaId"], "sla-old")
+        self.assertEqual(payload["result"], "charged")
+
+        status, page = self.get_json("/v1/disputes/d-rel/events?limit=1")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [event["eventSeq"] for event in page["events"]], [4]
+        )
+        self.assertEqual(page["nextCursor"], "5:4")
+        status, page = self.get_json(
+            f"/v1/disputes/d-rel/events?limit=1&cursor={page['nextCursor']}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [event["eventSeq"] for event in page["events"]], [5]
+        )
+        self.assertIsNone(page["nextCursor"])
+
+        connection = sqlite3.connect(self.database_path)
+        connection.row_factory = sqlite3.Row
+        try:
+            rows = connection.execute(
+                "SELECT event_seq, dispute_id, type, created_at_ms"
+                " FROM dispute_events ORDER BY event_seq ASC"
+            ).fetchall()
+            self.assertEqual(
+                [
+                    (
+                        row["event_seq"],
+                        row["dispute_id"],
+                        row["type"],
+                        row["created_at_ms"],
+                    )
+                    for row in rows
+                ],
+                [
+                    (1, "d-open", "opened", 0),
+                    (2, "d-ref", "opened", 0),
+                    (3, "d-ref", "refunded", 0),
+                    (4, "d-rel", "opened", 0),
+                    (5, "d-rel", "released", 0),
+                ],
+            )
+            # 不虚构旧失败：只有 opened/released/refunded 三类。
+            self.assertEqual(
+                {row["type"] for row in rows},
+                {"opened", "released", "refunded"},
+            )
+            marker = connection.execute(
+                "SELECT 1 FROM schema_metadata WHERE key = 'dispute_events_backfilled'"
+            ).fetchone()
+            self.assertIsNotNone(marker)
+            index = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index'"
+                " AND name='idx_dispute_events_dispute_seq'"
+            ).fetchone()
+            self.assertIsNotNone(index)
+            # 既有争议数据未被改动。
+            states = {
+                row["id"]: row["state"]
+                for row in connection.execute("SELECT id, state FROM disputes")
+            }
+            self.assertEqual(
+                states,
+                {"d-open": "open", "d-ref": "refunded", "d-rel": "released"},
+            )
+        finally:
+            connection.close()
+
+        # 重启不重复补写、不重排。
+        self.restart()
+        connection = sqlite3.connect(self.database_path)
+        try:
+            count = connection.execute("SELECT COUNT(*) FROM dispute_events").fetchone()[0]
+            self.assertEqual(count, 5)
+        finally:
+            connection.close()
+
+    def test_new_dispute_continues_migrated_sequence(self) -> None:
+        request = Request(
+            self.url("/v1/machines"),
+            data=json.dumps({"publicKey": PUBLIC_KEY_A}).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "register-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        machine = machine_id(PUBLIC_KEY_A)
+        request = Request(
+            self.url("/v1/machines"),
+            data=json.dumps({"publicKey": PUBLIC_KEY_B}).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "register-2")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        consumer = machine_id(PUBLIC_KEY_B)
+
+        def post(path: str, body: dict, key: str) -> tuple[int, bytes]:
+            request = Request(
+                self.url(path),
+                data=json.dumps(body).encode(),
+                method="POST",
+            )
+            request.add_header("Idempotency-Key", key)
+            try:
+                with urlopen(request, timeout=5) as response:
+                    return response.status, response.read()
+            except HTTPError as error:
+                return error.code, error.read()
+
+        status, _ = post(
+            f"/v1/machines/{machine}/capabilities",
+            {
+                "expectedVersion": 0,
+                "name": "pump-01",
+                "protocol": "mqtt",
+                "region": "cn",
+                "unit": "call",
+                "capacity": 10,
+            },
+            "cap-1",
+        )
+        self.assertEqual(status, 201)
+        status, _ = post(
+            "/v1/sla-templates",
+            {
+                "id": "tpl-1",
+                "machineId": machine,
+                "capabilityVersion": 1,
+                "priceMicros": 1000,
+                "maxLatencyMs": 50,
+            },
+            "tpl-1",
+        )
+        self.assertEqual(status, 201)
+        current = int(time.time())
+        status, _ = post(
+            "/v1/slas",
+            {
+                "id": "sla-new",
+                "templateId": "tpl-1",
+                "consumerId": consumer,
+                "start": current - 10,
+                "end": current + 3600,
+            },
+            "sla-new",
+        )
+        self.assertEqual(status, 201)
+        for index, (party, actor) in enumerate(
+            (("producer", machine), ("consumer", consumer))
+        ):
+            status, _ = post(
+                "/v1/slas/sla-new/confirmations",
+                {"party": party, "actorId": actor},
+                f"conf-{index}",
+            )
+            self.assertEqual(status, 200)
+        timestamp = (current - 10) * 1000
+        message = f"sla-new\nevt-1\n{timestamp}\n10\n{machine}"
+        status, _ = post(
+            "/v1/slas/sla-new/telemetry",
+            {
+                "eventId": "evt-1",
+                "timestamp": timestamp,
+                "latencyMs": 10,
+                "digest": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+            },
+            "tel-1",
+        )
+        self.assertEqual(status, 201)
+        status, body = post(
+            "/v1/slas/sla-new/evaluations",
+            {"from": (current - 10) * 1000, "to": (current + 3600) * 1000},
+            "eval-new",
+        )
+        self.assertEqual(status, 201)
+        evaluation_seq = json.loads(body)["evaluationSeq"]
+        status, _ = post(
+            f"/v1/funds/{consumer}",
+            {"amountMicros": 100000, "reference": "ref-1"},
+            "fund-1",
+        )
+        self.assertEqual(status, 201)
+        status, body = post(
+            "/v1/settlements",
+            {"slaId": "sla-new", "evaluationSeq": evaluation_seq},
+            "settle-new",
+        )
+        self.assertEqual(status, 201)
+        settlement_seq = json.loads(body)["settlementSeq"]
+        status, _ = post(
+            "/v1/disputes",
+            {
+                "id": "d-new",
+                "settlementSeq": settlement_seq,
+                "claimantId": consumer,
+            },
+            "dispute-new",
+        )
+        self.assertEqual(status, 201)
+        # 迁移稠密占用 1..5，新争议 opened 事件序号接续为 6。
+        status, payload = self.get_json("/v1/disputes/d-new/events")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [
+                (event["eventSeq"], event["type"])
+                for event in payload["events"]
+            ],
+            [(6, "opened")],
+        )
 
 
 if __name__ == "__main__":
