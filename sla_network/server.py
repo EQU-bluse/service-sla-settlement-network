@@ -24,6 +24,7 @@ SLA_EVALUATIONS_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/evaluations")
 SLA_SETTLEMENTS_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/settlements")
 ACCOUNT_LEDGER_PATH_PATTERN = re.compile(r"/v1/accounts/([^/]+)/ledger")
 FUNDS_PATH_PATTERN = re.compile(r"/v1/funds/([^/]+)")
+DISPUTE_RESOLUTION_PATH_PATTERN = re.compile(r"/v1/disputes/([^/]+)/resolution")
 CAPABILITY_FIELDS = {"expectedVersion", "name", "protocol", "region", "unit", "capacity"}
 SLA_TEMPLATE_FIELDS = {
     "id",
@@ -39,6 +40,10 @@ TELEMETRY_FIELDS = {"eventId", "timestamp", "latencyMs", "digest"}
 EVALUATION_FIELDS = {"from", "to"}
 FUND_FIELDS = {"amountMicros", "reference"}
 SETTLEMENT_FIELDS = {"slaId", "evaluationSeq"}
+DISPUTE_FIELDS = {"id", "settlementSeq", "claimantId"}
+RESOLUTION_FIELDS = {"decision"}
+DISPUTE_DECISIONS = {"release", "refund"}
+DISPUTABLE_RESULTS = {"charged", "compensated"}
 AMOUNT_CAP_MICROS = 9_000_000_000_000_000
 INT64_MAX = 9_223_372_036_854_775_807
 CLEARING_ACCOUNT_ID = "external:clearing"
@@ -589,7 +594,8 @@ class Handler(BaseHTTPRequestHandler):
                     " LEFT JOIN fund_deposits AS d"
                     " ON e.kind = 'deposit' AND e.reference_seq = d.deposit_seq"
                     " LEFT JOIN settlements AS s"
-                    " ON e.kind = 'settlement' AND e.reference_seq = s.settlement_seq"
+                    " ON e.kind IN ('settlement', 'dispute_refund')"
+                    " AND e.reference_seq = s.settlement_seq"
                     " WHERE e.account_id = ? AND e.entry_seq <= ? AND e.entry_seq > ?"
                     " ORDER BY e.entry_seq ASC"
                     " LIMIT ?",
@@ -618,7 +624,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 entry = {
                     "entrySeq": row["entry_seq"],
-                    "kind": "settlement",
+                    "kind": row["kind"],
                     "referenceSeq": row["reference_seq"],
                     "reference": None,
                     "slaId": row["sla_id"],
@@ -669,6 +675,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/v1/settlements":
             self._create_settlement()
+            return
+        if self.path == "/v1/disputes":
+            self._create_dispute()
+            return
+        resolution_match = DISPUTE_RESOLUTION_PATH_PATTERN.fullmatch(self.path)
+        if resolution_match is not None:
+            self._resolve_dispute(resolution_match.group(1))
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
@@ -1657,7 +1670,14 @@ class Handler(BaseHTTPRequestHandler):
                     if payee_balance + amount > AMOUNT_CAP_MICROS:
                         database.execute("ROLLBACK")
                         return HTTPStatus.CONFLICT, {"error": "amount_overflow"}
-                    if payer_balance < amount:
+                    # 可用余额为总余额扣除全部 open 争议冻结后的非负值。
+                    frozen_record = database.execute(
+                        "SELECT COALESCE(SUM(amount_micros), 0) AS frozen"
+                        " FROM disputes WHERE payee_id = ? AND state = 'open'",
+                        (payer_id,),
+                    ).fetchone()
+                    payer_available = payer_balance - frozen_record["frozen"]
+                    if payer_available < amount:
                         database.execute("ROLLBACK")
                         return HTTPStatus.CONFLICT, {"error": "insufficient_funds"}
                 # 全库共享一条持久化结算序号：取写锁后取全库最大序号 + 1（空表 1）。
@@ -1714,6 +1734,218 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 database.execute("COMMIT")
                 return HTTPStatus.CREATED, payload
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+
+    def _create_dispute(self) -> None:
+        idempotency_key = self.headers.get("Idempotency-Key")
+        if idempotency_key is None or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        fields = self._read_dispute_object()
+        if fields is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        status, payload = self._apply_dispute(idempotency_key, fields)
+        self._json(status, payload)
+
+    def _read_dispute_object(self) -> dict[str, Any] | None:
+        parsed = self._read_json_object()
+        if parsed is None or set(parsed) != DISPUTE_FIELDS:
+            return None
+        dispute_id = parsed["id"]
+        if not isinstance(dispute_id, str) or TEMPLATE_ID_PATTERN.fullmatch(dispute_id) is None:
+            return None
+        settlement_seq = parsed["settlementSeq"]
+        if not isinstance(settlement_seq, int) or isinstance(settlement_seq, bool):
+            return None
+        if settlement_seq < 1:
+            return None
+        claimant_id = parsed["claimantId"]
+        if not isinstance(claimant_id, str) or PUBLIC_KEY_PATTERN.fullmatch(claimant_id) is None:
+            return None
+        return parsed
+
+    def _apply_dispute(
+        self, idempotency_key: str, fields: dict[str, Any]
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                record = database.execute(
+                    "SELECT request_json, status, response_json"
+                    " FROM dispute_idempotency_records WHERE key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    if record["request_json"] == request_json:
+                        return HTTPStatus(record["status"]), json.loads(record["response_json"])
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                settlement_seq = fields["settlementSeq"]
+                settlement = None
+                if settlement_seq <= INT64_MAX:
+                    settlement = database.execute(
+                        "SELECT result, amount_micros, payer_id, payee_id"
+                        " FROM settlements WHERE settlement_seq = ?",
+                        (settlement_seq,),
+                    ).fetchone()
+                if settlement is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                payer_id = settlement["payer_id"]
+                if payer_id is not None and fields["claimantId"] != payer_id:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
+                amount = settlement["amount_micros"]
+                if settlement["result"] not in DISPUTABLE_RESULTS or amount <= 0:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                existing = database.execute(
+                    "SELECT 1 FROM disputes WHERE id = ? OR settlement_seq = ?",
+                    (fields["id"], settlement_seq),
+                ).fetchone()
+                if existing is not None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "dispute_exists"}
+                # 冻结仅登记 open 争议：可用余额按总余额扣除 open 冻结派生，不写账本。
+                database.execute(
+                    "INSERT INTO disputes"
+                    "(id, settlement_seq, claimant_id, payer_id, payee_id,"
+                    " amount_micros, state)"
+                    " VALUES (?, ?, ?, ?, ?, ?, 'open')",
+                    (
+                        fields["id"],
+                        settlement_seq,
+                        fields["claimantId"],
+                        settlement["payer_id"],
+                        settlement["payee_id"],
+                        amount,
+                    ),
+                )
+                payload = {"id": fields["id"], "open": True, "amount": amount}
+                database.execute(
+                    "INSERT INTO dispute_idempotency_records"
+                    "(key, request_json, status, response_json)"
+                    " VALUES (?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        request_json,
+                        int(HTTPStatus.CREATED),
+                        json.dumps(payload, separators=(",", ":")),
+                    ),
+                )
+                database.execute("COMMIT")
+                return HTTPStatus.CREATED, payload
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+
+    def _resolve_dispute(self, dispute_id: str) -> None:
+        idempotency_key = self.headers.get("Idempotency-Key")
+        if idempotency_key is None or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        fields = self._read_resolution_object()
+        if fields is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        status, payload = self._apply_resolution(idempotency_key, dispute_id, fields)
+        self._json(status, payload)
+
+    def _read_resolution_object(self) -> dict[str, Any] | None:
+        parsed = self._read_json_object()
+        if parsed is None or set(parsed) != RESOLUTION_FIELDS:
+            return None
+        decision = parsed["decision"]
+        if not isinstance(decision, str) or decision not in DISPUTE_DECISIONS:
+            return None
+        return parsed
+
+    def _apply_resolution(
+        self, idempotency_key: str, dispute_id: str, fields: dict[str, Any]
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                record = database.execute(
+                    "SELECT dispute_id, request_json, status, response_json"
+                    " FROM dispute_resolution_idempotency_records WHERE key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    if record["dispute_id"] == dispute_id and record["request_json"] == request_json:
+                        return HTTPStatus(record["status"]), json.loads(record["response_json"])
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                dispute = database.execute(
+                    "SELECT settlement_seq, payer_id, payee_id, amount_micros, state"
+                    " FROM disputes WHERE id = ?",
+                    (dispute_id,),
+                ).fetchone()
+                if dispute is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                if dispute["state"] != "open":
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "already_resolved"}
+                decision = fields["decision"]
+                amount = dispute["amount_micros"]
+                created_at_ms = int(datetime.now(UTC).timestamp() * 1000)
+                if decision == "refund":
+                    balance_record = database.execute(
+                        "SELECT balance_micros FROM ledger_accounts WHERE account_id = ?",
+                        (dispute["payee_id"],),
+                    ).fetchone()
+                    payee_balance = (
+                        balance_record["balance_micros"]
+                        if balance_record is not None
+                        else 0
+                    )
+                    # 退款校验总余额；不足时争议维持 open 且冻结不变。
+                    if payee_balance < amount:
+                        database.execute("ROLLBACK")
+                        return HTTPStatus.CONFLICT, {"error": "insufficient_funds"}
+                    payee_after = self._adjust_account(
+                        database, dispute["payee_id"], -amount
+                    )
+                    payer_after = self._adjust_account(
+                        database, dispute["payer_id"], amount
+                    )
+                    self._record_entry(
+                        database, "dispute_refund", dispute["settlement_seq"],
+                        dispute["payee_id"], -amount, payee_after, created_at_ms,
+                    )
+                    self._record_entry(
+                        database, "dispute_refund", dispute["settlement_seq"],
+                        dispute["payer_id"], amount, payer_after, created_at_ms,
+                    )
+                    new_state = "refunded"
+                    payload = {"id": dispute_id, "refunded": True, "amount": amount}
+                else:
+                    new_state = "released"
+                    payload = {"id": dispute_id, "released": True, "amount": amount}
+                database.execute(
+                    "UPDATE disputes SET state = ? WHERE id = ?",
+                    (new_state, dispute_id),
+                )
+                database.execute(
+                    "INSERT INTO dispute_resolution_idempotency_records"
+                    "(key, dispute_id, request_json, status, response_json)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        dispute_id,
+                        request_json,
+                        int(HTTPStatus.OK),
+                        json.dumps(payload, separators=(",", ":")),
+                    ),
+                )
+                database.execute("COMMIT")
+                return HTTPStatus.OK, payload
             except BaseException:
                 database.execute("ROLLBACK")
                 raise
