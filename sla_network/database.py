@@ -58,7 +58,12 @@ CREATE TABLE IF NOT EXISTS capability_idempotency_records (
     machine_id TEXT NOT NULL,
     request_json TEXT NOT NULL,
     status INTEGER NOT NULL,
-    response_json TEXT NOT NULL
+    response_json TEXT NOT NULL,
+    auth_machine_id TEXT,
+    auth_key_version INTEGER,
+    auth_request_time_ms INTEGER,
+    auth_nonce TEXT,
+    auth_signature TEXT
 );
 CREATE TABLE IF NOT EXISTS sla_templates (
     id TEXT PRIMARY KEY,
@@ -102,7 +107,12 @@ CREATE TABLE IF NOT EXISTS sla_confirmation_idempotency_records (
     sla_id TEXT NOT NULL,
     request_json TEXT NOT NULL,
     status INTEGER NOT NULL,
-    response_json TEXT NOT NULL
+    response_json TEXT NOT NULL,
+    auth_machine_id TEXT,
+    auth_key_version INTEGER,
+    auth_request_time_ms INTEGER,
+    auth_nonce TEXT,
+    auth_signature TEXT
 );
 CREATE TABLE IF NOT EXISTS sla_telemetry_events (
     sla_id TEXT NOT NULL,
@@ -217,7 +227,12 @@ CREATE TABLE IF NOT EXISTS dispute_evidence_idempotency_records (
     dispute_id TEXT NOT NULL,
     request_json TEXT NOT NULL,
     status INTEGER NOT NULL,
-    response_json TEXT NOT NULL
+    response_json TEXT NOT NULL,
+    auth_machine_id TEXT,
+    auth_key_version INTEGER,
+    auth_request_time_ms INTEGER,
+    auth_nonce TEXT,
+    auth_signature TEXT
 );
 CREATE TABLE IF NOT EXISTS dispute_evidence_proofs (
     proof_seq INTEGER PRIMARY KEY,
@@ -232,12 +247,25 @@ CREATE TABLE IF NOT EXISTS dispute_evidence_proof_idempotency_records (
     key TEXT PRIMARY KEY,
     request_json TEXT NOT NULL,
     status INTEGER NOT NULL,
-    response_json TEXT NOT NULL
+    response_json TEXT NOT NULL,
+    auth_machine_id TEXT,
+    auth_key_version INTEGER,
+    auth_request_time_ms INTEGER,
+    auth_nonce TEXT,
+    auth_signature TEXT
+);
+CREATE TABLE IF NOT EXISTS auth_nonce_records (
+    machine_id TEXT NOT NULL,
+    nonce TEXT NOT NULL,
+    request_time_ms INTEGER NOT NULL,
+    PRIMARY KEY (machine_id, nonce)
 );
 CREATE INDEX IF NOT EXISTS idx_dispute_evidences_dispute_seq
 ON dispute_evidences(dispute_id, evidence_seq);
 CREATE INDEX IF NOT EXISTS idx_dispute_evidence_proofs_evidence_seq
 ON dispute_evidence_proofs(evidence_seq, proof_seq);
+CREATE INDEX IF NOT EXISTS idx_auth_nonce_records_machine_time
+ON auth_nonce_records(machine_id, request_time_ms);
 """
 
 TELEMETRY_SEQ_MARKER = "telemetry_commit_seq_renumbered"
@@ -249,6 +277,21 @@ EVALUATION_SEQ_INDEX = "idx_sla_evaluation_seq_unique"
 DISPUTE_EVENT_MARKER = "dispute_events_backfilled"
 DISPUTE_EVENT_INDEX = "idx_dispute_events_dispute_seq"
 MACHINE_KEYS_MARKER = "machine_keys_backfilled"
+SLA_AUTH_MARKER = "sla_auth_added"
+
+AUTH_IDEMPOTENCY_TABLES = (
+    "capability_idempotency_records",
+    "sla_confirmation_idempotency_records",
+    "dispute_evidence_idempotency_records",
+    "dispute_evidence_proof_idempotency_records",
+)
+AUTH_IDEMPOTENCY_COLUMNS = (
+    "auth_machine_id TEXT",
+    "auth_key_version INTEGER",
+    "auth_request_time_ms INTEGER",
+    "auth_nonce TEXT",
+    "auth_signature TEXT",
+)
 
 
 def _renumber_commit_seq(connection: sqlite3.Connection) -> None:
@@ -504,6 +547,44 @@ def _backfill_machine_keys(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _add_sla_auth(connection: sqlite3.Connection) -> None:
+    # 仅在一次性迁移（含空库首次连接）时取写锁；BEGIN IMMEDIATE 串行并发首启。
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        if (
+            connection.execute(
+                "SELECT 1 FROM schema_metadata WHERE key = ?",
+                (SLA_AUTH_MARKER,),
+            ).fetchone()
+            is not None
+        ):
+            # 其他连接已完成迁移，直接释放写锁。
+            connection.execute("COMMIT")
+            return
+        # 升级前幂等记录的认证五段一律保持 NULL：作为唯一例外按原请求先行重放，
+        # 不补认证数据；随机数表为空，旧记录重放不消费随机数。
+        for table in AUTH_IDEMPOTENCY_TABLES:
+            existing = {
+                row["name"]
+                for row in connection.execute(f"PRAGMA table_info({table})")
+            }
+            for name, declaration in (
+                column.split(" ", 1) for column in AUTH_IDEMPOTENCY_COLUMNS
+            ):
+                if name not in existing:
+                    connection.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {name} {declaration}"
+                    )
+        connection.execute(
+            "INSERT INTO schema_metadata(key, value) VALUES (?, '1')",
+            (SLA_AUTH_MARKER,),
+        )
+        connection.execute("COMMIT")
+    except BaseException:
+        connection.execute("ROLLBACK")
+        raise
+
+
 def connect(path: str) -> sqlite3.Connection:
     database = Path(path)
     database.parent.mkdir(parents=True, exist_ok=True)
@@ -570,6 +651,14 @@ def connect(path: str) -> sqlite3.Connection:
         is None
     ):
         _backfill_machine_keys(connection)
+    if (
+        connection.execute(
+            "SELECT 1 FROM schema_metadata WHERE key = ?",
+            (SLA_AUTH_MARKER,),
+        ).fetchone()
+        is None
+    ):
+        _add_sla_auth(connection)
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_settlements_sla_seq"
         " ON settlements(sla_id, settlement_seq)"

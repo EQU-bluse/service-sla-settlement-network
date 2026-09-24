@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import hashlib
 import json
+import re
 import sqlite3
 import tempfile
 import threading
@@ -10,7 +11,7 @@ import time
 import unittest
 from pathlib import Path
 from urllib.error import HTTPError
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
 from sla_network.server import ApiServer, Handler
@@ -61,6 +62,11 @@ def _ed25519_sign(seed: bytes, message: bytes) -> bytes:
 # 生产机器使用可签名的真实 Ed25519 密钥对（遥测签名需用对应私钥种子生成）。
 PRODUCER_SEED = b"\x01" * 32
 PUBLIC_KEY_A = _ed25519_public_key(PRODUCER_SEED).hex()
+# 消费者与第三方同样使用可签名密钥对（SLA-Auth、确认/证据/证明均需私钥签名）。
+PUBLIC_KEY_SEED_B = b"\x02" * 32
+PUBLIC_KEY_SEED_C = b"\x03" * 32
+PUBLIC_KEY_B = _ed25519_public_key(PUBLIC_KEY_SEED_B).hex()
+PUBLIC_KEY_C = _ed25519_public_key(PUBLIC_KEY_SEED_C).hex()
 
 
 def telemetry_signature(
@@ -101,6 +107,193 @@ def key_revocation_signature(
 ) -> str:
     message = f"key-revoke-v1\n{machine}\n{version}".encode("utf-8")
     return _ed25519_sign(seed, message).hex()
+
+
+class _SlaAuthRegistry:
+    # 同键同请求的重试、并发与重启后重放必须逐字节复用同一组认证五段
+    # （服务规定同键更换认证五段即为冲突）；异键分配不同随机数。
+    # 以数据库路径为作用域：重启后服务对象更换但路径不变，重放须复用；
+    # 不同用例路径不同，各自取新鲜时间戳，避免长测试运行后时间戳过期。
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._counter = 0
+        self._headers: dict[tuple[object, ...], str] = {}
+
+    def header(
+        self,
+        scope: str,
+        idempotency_key: str | None,
+        seed: bytes,
+        actor_id: str,
+        method: str,
+        path: str,
+        body: bytes,
+        key_version: int,
+        request_time_ms: int | None = None,
+        nonce: str | None = None,
+    ) -> str:
+        use_cache = request_time_ms is None and nonce is None
+        cache_key = (
+            scope,
+            idempotency_key,
+            seed,
+            actor_id,
+            method,
+            path,
+            body,
+            key_version,
+        )
+        if use_cache:
+            # 整段取锁做 get-or-create：同键并发线程必须逐字节复用同一组五段。
+            with self._lock:
+                cached = self._headers.get(cache_key)
+                if cached is None:
+                    cached = self._build(
+                        cache_key,
+                        seed,
+                        actor_id,
+                        method,
+                        path,
+                        body,
+                        key_version,
+                        int(time.time() * 1000),
+                        f"nonce-{self._next_counter_locked():020d}",
+                    )
+                    self._headers[cache_key] = cached
+            return cached
+        if request_time_ms is None:
+            request_time_ms = int(time.time() * 1000)
+        if nonce is None:
+            with self._lock:
+                nonce = f"nonce-{self._next_counter_locked():020d}"
+        return self._build(
+            cache_key,
+            seed,
+            actor_id,
+            method,
+            path,
+            body,
+            key_version,
+            request_time_ms,
+            nonce,
+        )
+
+    def _next_counter_locked(self) -> int:
+        self._counter += 1
+        return self._counter
+
+    @staticmethod
+    def _build(
+        cache_key: tuple[object, ...],
+        seed: bytes,
+        actor_id: str,
+        method: str,
+        path: str,
+        body: bytes,
+        key_version: int,
+        request_time_ms: int,
+        nonce: str,
+    ) -> str:
+        body_digest = hashlib.sha256(body).hexdigest()
+        message = (
+            f"request-auth-v1\n{method}\n{path}\n{body_digest}\n"
+            f"{request_time_ms}\n{nonce}\n{key_version}\n{actor_id}"
+        ).encode("utf-8")
+        signature = _ed25519_sign(seed, message).hex()
+        return (
+            f"{actor_id};{key_version};{request_time_ms};{nonce};{signature}"
+        )
+
+
+_SLA_AUTH_REGISTRY = _SlaAuthRegistry()
+
+
+def make_sla_auth(
+    server: ApiServer,
+    idempotency_key: str | None,
+    seed: bytes,
+    actor_id: str,
+    method: str,
+    path: str,
+    body: bytes,
+    key_version: int = 1,
+    *,
+    request_time_ms: int | None = None,
+    nonce: str | None = None,
+) -> str:
+    return _SLA_AUTH_REGISTRY.header(
+        server.database_path,
+        idempotency_key,
+        seed,
+        actor_id,
+        method,
+        path,
+        body,
+        key_version,
+        request_time_ms,
+        nonce,
+    )
+
+
+# 受保护入口测试中使用的全部已知私钥种子（含他机 b"\x03"*32）。
+_KNOWN_SEEDS = (b"\x01" * 32, b"\x02" * 32, b"\x03" * 32)
+
+
+def seed_for_actor(actor_id: str) -> bytes:
+    for seed in _KNOWN_SEEDS:
+        if machine_id(_ed25519_public_key(seed).hex()) == actor_id:
+            return seed
+    # 未知机器（资源不存在 404、参与方不符 403 等用例）：结构合法即可，
+    # 资源/签名者判定先于验签，签名内容不会被校验。
+    return b"\x01" * 32
+
+
+_SLA_AUTH_PATH_MACHINE = re.compile(r"^/v1/machines/([0-9a-f]{64})/capabilities$")
+_SLA_AUTH_CONFIRMATION = re.compile(r"^/v1/slas/([^/]+)/confirmations$")
+_SLA_AUTH_EVIDENCE = re.compile(r"^/v1/disputes/([^/]+)/evidence$")
+
+
+def _sla_auth_actor(path: str, body: bytes) -> str | None:
+    match = _SLA_AUTH_PATH_MACHINE.fullmatch(path)
+    if match is not None:
+        return match.group(1)
+    if (
+        _SLA_AUTH_CONFIRMATION.fullmatch(path) is not None
+        or _SLA_AUTH_EVIDENCE.fullmatch(path) is not None
+        or path == "/v1/evidence-proofs"
+    ):
+        try:
+            parsed = json.loads(body)
+        except ValueError:
+            return None
+        if isinstance(parsed, dict) and isinstance(parsed.get("actorId"), str):
+            actor = parsed["actorId"]
+            if re.fullmatch(r"[0-9a-f]{64}", actor) is not None:
+                return actor
+    return None
+
+
+def add_sla_auth(request: Request, server: ApiServer) -> None:
+    # 从 Request 对象自身派生认证头：非受保护路径或无法确定签名者时不加。
+    path = urlsplit(request.full_url).path
+    body = request.data if isinstance(request.data, bytes) else b""
+    actor_id = _sla_auth_actor(path, body)
+    if actor_id is None:
+        return
+    idempotency_key = request.headers.get("Idempotency-key")
+    request.add_header(
+        "SLA-Auth",
+        make_sla_auth(
+            server,
+            idempotency_key,
+            seed_for_actor(actor_id),
+            actor_id,
+            request.get_method(),
+            path,
+            body,
+            1,
+        ),
+    )
 
 
 class ServerTests(unittest.TestCase):
@@ -297,6 +490,7 @@ class CapabilityTests(unittest.TestCase):
         )
         if idempotency_key is not None:
             request.add_header("Idempotency-Key", idempotency_key)
+        add_sla_auth(request, self.server)
         try:
             with urlopen(request, timeout=5) as response:
                 return response.status, response.read(), response.headers["Content-Type"]
@@ -536,6 +730,7 @@ class SlaTemplateTests(unittest.TestCase):
             method="POST",
         )
         request.add_header("Idempotency-Key", "cap-1")
+        add_sla_auth(request, self.server)
         with urlopen(request, timeout=5) as response:
             self.assertEqual(response.status, 201)
 
@@ -779,6 +974,7 @@ class SlaTests(unittest.TestCase):
             method="POST",
         )
         request.add_header("Idempotency-Key", "cap-1")
+        add_sla_auth(request, self.server)
         with urlopen(request, timeout=5) as response:
             self.assertEqual(response.status, 201)
         request = Request(
@@ -824,6 +1020,7 @@ class SlaTests(unittest.TestCase):
         request = Request(self.url("/v1/slas"), data=body, method="POST")
         if idempotency_key is not None:
             request.add_header("Idempotency-Key", idempotency_key)
+        add_sla_auth(request, self.server)
         try:
             with urlopen(request, timeout=5) as response:
                 return response.status, response.read(), response.headers["Content-Type"]
@@ -937,6 +1134,7 @@ class SlaTests(unittest.TestCase):
             method="POST",
         )
         request.add_header("Idempotency-Key", "cap-2")
+        add_sla_auth(request, self.server)
         with urlopen(request, timeout=5) as response:
             self.assertEqual(response.status, 200)
         status, body, _ = self.post_sla(self.sla_body())
@@ -1109,6 +1307,7 @@ class ConfirmationTests(unittest.TestCase):
             method="POST",
         )
         request.add_header("Idempotency-Key", "cap-1")
+        add_sla_auth(request, self.server)
         with urlopen(request, timeout=5) as response:
             self.assertEqual(response.status, 201)
         request = Request(
@@ -1176,6 +1375,7 @@ class ConfirmationTests(unittest.TestCase):
         )
         if idempotency_key is not None:
             request.add_header("Idempotency-Key", idempotency_key)
+        add_sla_auth(request, self.server)
         try:
             with urlopen(request, timeout=5) as response:
                 return response.status, response.read(), response.headers["Content-Type"]
@@ -1382,6 +1582,7 @@ class ConfirmationTests(unittest.TestCase):
             method="POST",
         )
         request.add_header("Idempotency-Key", "cap-2")
+        add_sla_auth(request, self.server)
         with urlopen(request, timeout=5) as response:
             self.assertEqual(response.status, 200)
         status, body, _ = self.post_confirmation(
@@ -1569,6 +1770,7 @@ class TelemetryTests(unittest.TestCase):
             method="POST",
         )
         request.add_header("Idempotency-Key", "cap-1")
+        add_sla_auth(request, self.server)
         with urlopen(request, timeout=5) as response:
             self.assertEqual(response.status, 201)
         request = Request(
@@ -1627,6 +1829,7 @@ class TelemetryTests(unittest.TestCase):
                 method="POST",
             )
             request.add_header("Idempotency-Key", key)
+            add_sla_auth(request, self.server)
             with urlopen(request, timeout=5) as response:
                 self.assertEqual(response.status, 200)
 
@@ -2197,6 +2400,7 @@ class TelemetryTests(unittest.TestCase):
                 method="POST",
             )
             request.add_header("Idempotency-Key", key)
+            add_sla_auth(request, self.server)
             with urlopen(request, timeout=5) as response:
                 self.assertEqual(response.status, 200)
         timestamp = self.start * 1000 + 500
@@ -2479,6 +2683,7 @@ class EvaluationTests(unittest.TestCase):
             method="POST",
         )
         request.add_header("Idempotency-Key", "cap-1")
+        add_sla_auth(request, self.server)
         with urlopen(request, timeout=5) as response:
             self.assertEqual(response.status, 201)
         request = Request(
@@ -2542,6 +2747,7 @@ class EvaluationTests(unittest.TestCase):
                 method="POST",
             )
             request.add_header("Idempotency-Key", f"conf-{sla_id}-{index}")
+            add_sla_auth(request, self.server)
             with urlopen(request, timeout=5) as response:
                 self.assertEqual(response.status, 200)
 
@@ -3333,6 +3539,7 @@ class TelemetrySignatureMigrationTests(unittest.TestCase):
             method="POST",
         )
         request.add_header("Idempotency-Key", key)
+        add_sla_auth(request, self.server)
         try:
             with urlopen(request, timeout=5) as response:
                 return response.status, response.read()
@@ -3666,6 +3873,7 @@ class SettlementTests(unittest.TestCase):
             method="POST",
         )
         request.add_header("Idempotency-Key", "cap-1")
+        add_sla_auth(request, self.server)
         with urlopen(request, timeout=5) as response:
             self.assertEqual(response.status, 201)
         request = Request(
@@ -3729,6 +3937,7 @@ class SettlementTests(unittest.TestCase):
                 method="POST",
             )
             request.add_header("Idempotency-Key", f"conf-{sla_id}-{index}")
+            add_sla_auth(request, self.server)
             with urlopen(request, timeout=5) as response:
                 self.assertEqual(response.status, 200)
 
@@ -4065,6 +4274,7 @@ class DisputeTests(unittest.TestCase):
             method="POST",
         )
         request.add_header("Idempotency-Key", "cap-1")
+        add_sla_auth(request, self.server)
         with urlopen(request, timeout=5) as response:
             self.assertEqual(response.status, 201)
         request = Request(
@@ -4105,6 +4315,7 @@ class DisputeTests(unittest.TestCase):
         request = Request(self.url(path), data=data, method="POST")
         if key is not None:
             request.add_header("Idempotency-Key", key)
+        add_sla_auth(request, self.server)
         try:
             with urlopen(request, timeout=5) as response:
                 return response.status, response.read()
@@ -5102,6 +5313,7 @@ class DisputeEventMigrationTests(unittest.TestCase):
                 method="POST",
             )
             request.add_header("Idempotency-Key", key)
+            add_sla_auth(request, self.server)
             try:
                 with urlopen(request, timeout=5) as response:
                     return response.status, response.read()
@@ -5284,6 +5496,7 @@ class DisputeCollectionTests(unittest.TestCase):
         request = Request(self.url(path), data=data, method="POST")
         if key is not None:
             request.add_header("Idempotency-Key", key)
+        add_sla_auth(request, self.server)
         try:
             with urlopen(request, timeout=5) as response:
                 return response.status, response.read()
@@ -5668,6 +5881,7 @@ class DisputeEvidenceTests(unittest.TestCase):
             method="POST",
         )
         request.add_header("Idempotency-Key", "cap-1")
+        add_sla_auth(request, self.server)
         with urlopen(request, timeout=5) as response:
             self.assertEqual(response.status, 201)
         request = Request(
@@ -5787,6 +6001,7 @@ class DisputeEvidenceTests(unittest.TestCase):
         request = Request(self.url(path), data=data, method="POST")
         if key is not None:
             request.add_header("Idempotency-Key", key)
+        add_sla_auth(request, self.server)
         try:
             with urlopen(request, timeout=5) as response:
                 return response.status, response.read()
@@ -6415,6 +6630,7 @@ class EvidenceProofTests(unittest.TestCase):
         request = Request(self.url(path), data=data, method="POST")
         if key is not None:
             request.add_header("Idempotency-Key", key)
+        add_sla_auth(request, self.server)
         try:
             with urlopen(request, timeout=5) as response:
                 return response.status, response.read()
@@ -6871,6 +7087,7 @@ class KeyLifecycleTests(unittest.TestCase):
         )
         if key is not None:
             request.add_header("Idempotency-Key", key)
+        add_sla_auth(request, self.server)
         try:
             with urlopen(request, timeout=5) as response:
                 return response.status, response.read()
@@ -7435,6 +7652,7 @@ class MachineKeysMigrationTests(unittest.TestCase):
             method="POST",
         )
         request.add_header("Idempotency-Key", key)
+        add_sla_auth(request, self.server)
         try:
             with urlopen(request, timeout=5) as response:
                 return response.status, response.read()
@@ -7528,3 +7746,356 @@ class MachineKeysMigrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+class SlaAuthTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "sla.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.producer = machine_id(PUBLIC_KEY_A)
+        self.consumer = machine_id(PUBLIC_KEY_B)
+        for key, public_key in (
+            ("reg-a", PUBLIC_KEY_A),
+            ("reg-b", PUBLIC_KEY_B),
+        ):
+            self.assertEqual(self.post("/v1/machines", json.dumps(
+                {"publicKey": public_key}).encode(), key, auth=None)[0], 201)
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temporary.cleanup()
+
+    def url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}{path}"
+
+    def post(
+        self,
+        path: str,
+        body: bytes,
+        key: str | None,
+        *,
+        seed: bytes | None = None,
+        actor: str | None = None,
+        key_version: int = 1,
+        auth: str | bool | None = None,
+        request_time_ms: int | None = None,
+        nonce: str | None = None,
+    ) -> tuple[int, bytes]:
+        request = Request(self.url(path), data=body, method="POST")
+        if key is not None:
+            request.add_header("Idempotency-Key", key)
+        if auth is None and seed is not None:
+            auth = True
+        if auth is True:
+            if actor is None:
+                raise ValueError("actor required")
+            request.add_header(
+                "SLA-Auth",
+                make_sla_auth(
+                    self.server, key, seed, actor, "POST", path, body,
+                    key_version, request_time_ms=request_time_ms, nonce=nonce,
+                ),
+            )
+        elif isinstance(auth, str):
+            request.add_header("SLA-Auth", auth)
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def cap_body(self, expected: int = 0, capacity: int = 10) -> bytes:
+        return json.dumps({
+            "expectedVersion": expected, "name": "pump-01", "protocol": "mqtt",
+            "region": "cn", "unit": "call", "capacity": capacity,
+        }).encode()
+
+    @property
+    def cap_path(self) -> str:
+        return f"/v1/machines/{self.producer}/capabilities"
+
+    def test_missing_duplicate_or_malformed_header_is_400_before_resource(self) -> None:
+        body = self.cap_body()
+        status, payload = self.post(self.cap_path, body, "k1", auth=None)
+        self.assertEqual((status, json.loads(payload)), (400, {"error": "invalid_request"}))
+        ghost = f"/v1/machines/{machine_id(PUBLIC_KEY_C)}/capabilities"
+        status, payload = self.post(ghost, body, "k2", auth=None)
+        self.assertEqual((status, json.loads(payload)), (400, {"error": "invalid_request"}))
+        now = int(time.time() * 1000)
+        for raw in (
+            "x",
+            "a;b;c;d",
+            f"{self.producer};01;{now};nonce-0123456789ab;{'a' * 128}",
+            f"{self.producer};1;01;nonce-0123456789ab;{'a' * 128}",
+            f"{self.producer};1;{now};short;{'a' * 128}",
+            f"{self.producer};1;{now};nonce-0123456789ab;{'A' * 128}",
+            f"{'A' * 64};1;{now};nonce-0123456789ab;{'a' * 128}",
+        ):
+            status, response = self.post(self.cap_path, body, "k3", auth=raw)
+            self.assertEqual((status, json.loads(response)),
+                             (400, {"error": "invalid_request"}), raw)
+        # 重复认证头同样 400（urllib 会同名去重，直接用 http.client 发两个头）。
+        import http.client
+        target = urlsplit(self.url(self.cap_path))
+        connection = http.client.HTTPConnection(target.hostname, target.port, timeout=5)
+        connection.putrequest("POST", target.path)
+        connection.putheader("Idempotency-Key", "k4")
+        connection.putheader("Content-Length", str(len(body)))
+        connection.putheader("SLA-Auth", "a")
+        connection.putheader("SLA-Auth", "b")
+        connection.endheaders()
+        connection.send(body)
+        response = connection.getresponse()
+        self.assertEqual(response.status, 400)
+        self.assertEqual(json.loads(response.read()), {"error": "invalid_request"})
+        connection.close()
+
+    def test_resource_check_precedes_authentication(self) -> None:
+        body = self.cap_body()
+        status, payload = self.post(
+            f"/v1/machines/{machine_id(PUBLIC_KEY_C)}/capabilities", body,
+            "k5", seed=PUBLIC_KEY_SEED_C, actor=machine_id(PUBLIC_KEY_C),
+        )
+        self.assertEqual((status, json.loads(payload)), (404, {"error": "not_found"}))
+
+    def test_declare_and_replay_preserves_first_response(self) -> None:
+        body = self.cap_body()
+        status, payload = self.post(
+            self.cap_path, body, "cap", seed=PRODUCER_SEED,
+            actor=self.producer, auth=True
+        )
+        self.assertEqual((status, payload), (201, b'{"version":1}'))
+        status, payload = self.post(
+            self.cap_path, body, "cap", seed=PRODUCER_SEED,
+            actor=self.producer, auth=True
+        )
+        self.assertEqual((status, payload), (201, b'{"version":1}'))
+
+    def test_machine_mismatch_is_403(self) -> None:
+        body = self.cap_body()
+        status, payload = self.post(
+            self.cap_path, body, "k6", seed=PUBLIC_KEY_SEED_B, actor=self.consumer
+        )
+        self.assertEqual((status, json.loads(payload)), (403, {"error": "forbidden"}))
+
+    def test_stale_request_time_is_401(self) -> None:
+        for delta in (-400_000, 400_000):
+            status, payload = self.post(
+                self.cap_path, self.cap_body(), f"stale-{delta}",
+                seed=PRODUCER_SEED, actor=self.producer,
+                request_time_ms=int(time.time() * 1000) + delta,
+            )
+            self.assertEqual((status, json.loads(payload)),
+                             (401, {"error": "stale_request"}), delta)
+
+    def test_unknown_not_latest_and_revoked_key_are_401(self) -> None:
+        body = self.cap_body()
+        status, payload = self.post(
+            self.cap_path, body, "ver-missing", seed=PRODUCER_SEED,
+            actor=self.producer, key_version=9,
+        )
+        self.assertEqual((status, json.loads(payload)),
+                         (401, {"error": "invalid_authentication"}))
+        # 轮换到版本二：版本一不再是最新。
+        new_seed = b"\x0a" * 32
+        new_public = _ed25519_public_key(new_seed).hex()
+        current_sig, new_sig = key_rotation_signatures(
+            PRODUCER_SEED, new_seed, self.producer, 1, new_public
+        )
+        rotation = json.dumps({
+            "expectedVersion": 1, "publicKey": new_public,
+            "currentSignature": current_sig, "newSignature": new_sig,
+        }).encode()
+        status, _ = self.post(
+            f"/v1/machines/{self.producer}/keys", rotation, "rotate-1", auth=None
+        )
+        self.assertEqual(status, 201)
+        status, payload = self.post(
+            self.cap_path, self.cap_body(1, 20), "ver-old",
+            seed=PRODUCER_SEED, actor=self.producer, key_version=1,
+        )
+        self.assertEqual((status, json.loads(payload)),
+                         (401, {"error": "invalid_authentication"}))
+        # 再轮换到版本三后吊销版本二：已吊销版本签名拒绝。
+        third_seed = b"\x0b" * 32
+        third_public = _ed25519_public_key(third_seed).hex()
+        c2, n2 = key_rotation_signatures(
+            new_seed, third_seed, self.producer, 2, third_public
+        )
+        status, _ = self.post(
+            f"/v1/machines/{self.producer}/keys",
+            json.dumps({"expectedVersion": 2, "publicKey": third_public,
+                        "currentSignature": c2, "newSignature": n2}).encode(),
+            "rotate-2", auth=None,
+        )
+        self.assertEqual(status, 201)
+        revoke = json.dumps({
+            "signature": key_revocation_signature(third_seed, self.producer, 2)
+        }).encode()
+        status, _ = self.post(
+            f"/v1/machines/{self.producer}/keys/2/revocation", revoke,
+            "revoke-2", auth=None,
+        )
+        self.assertEqual(status, 200)
+        status, payload = self.post(
+            self.cap_path, self.cap_body(1, 20), "ver-revoked",
+            seed=new_seed, actor=self.producer, key_version=2,
+        )
+        self.assertEqual((status, json.loads(payload)),
+                         (401, {"error": "invalid_authentication"}))
+
+    def test_body_digest_tampering_is_401(self) -> None:
+        signed = self.cap_body(1, 30)
+        tampered = self.cap_body(1, 31)
+        status, payload = self._post_presigned_body(
+            self.cap_path, signed, tampered, "digest-1"
+        )
+        self.assertEqual((status, json.loads(payload)),
+                         (401, {"error": "invalid_authentication"}))
+
+    def _post_presigned_body(
+        self, path: str, signed_body: bytes, sent_body: bytes, key: str
+    ) -> tuple[int, bytes]:
+        header = make_sla_auth(
+            self.server, key, PRODUCER_SEED, self.producer, "POST",
+            path, signed_body, 1,
+        )
+        return self.post(path, sent_body, key, auth=header)
+
+    def test_nonce_reuse_is_replay_detected_but_replay_does_not_consume(self) -> None:
+        body = self.cap_body()
+        header = make_sla_auth(
+            self.server, "nonce-1", PRODUCER_SEED, self.producer, "POST",
+            self.cap_path, body, 1,
+        )
+        status, _ = self.post(self.cap_path, body, "nonce-1", auth=header)
+        self.assertEqual(status, 201)
+        # 异键复用同一五段（同随机数）：409 replay_detected。
+        status, payload = self.post(self.cap_path, body, "nonce-2", auth=header)
+        self.assertEqual((status, json.loads(payload)),
+                         (409, {"error": "replay_detected"}))
+        # 同键同请求照常重放首次响应，不再次消费随机数。
+        status, payload = self.post(self.cap_path, body, "nonce-1", auth=header)
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(payload), {"version": 1})
+
+    def test_same_key_different_auth_is_conflict(self) -> None:
+        body = self.cap_body()
+        self.assertEqual(self.post(
+            self.cap_path, body, "same-key", seed=PRODUCER_SEED,
+            actor=self.producer)[0], 201)
+        status, payload = self.post(
+            self.cap_path, body, "same-key", seed=PRODUCER_SEED,
+            actor=self.producer, nonce="nonce-different-0000001",
+        )
+        self.assertEqual((status, json.loads(payload)),
+                         (409, {"error": "conflict"}))
+
+    def test_business_failure_does_not_consume_nonce(self) -> None:
+        bad_body = self.cap_body(99)
+        ts = int(time.time() * 1000)
+        nonce = "nonce-business-fail-01"
+        status, payload = self.post(
+            self.cap_path, bad_body, "biz-fail", seed=PRODUCER_SEED,
+            actor=self.producer, request_time_ms=ts, nonce=nonce,
+        )
+        self.assertEqual((status, json.loads(payload)),
+                         (409, {"error": "conflict"}))
+        good_body = self.cap_body()
+        status, payload = self.post(
+            self.cap_path, good_body, "biz-ok", seed=PRODUCER_SEED,
+            actor=self.producer, request_time_ms=ts, nonce=nonce,
+        )
+        self.assertEqual((status, payload), (201, b'{"version":1}'))
+
+    def test_expired_nonce_can_be_reused_after_retention(self) -> None:
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            connection.execute(
+                "INSERT INTO auth_nonce_records(machine_id, nonce, request_time_ms)"
+                " VALUES (?, ?, ?)",
+                (self.producer, "nonce-expired-0001", int(time.time() * 1000) - 601_000),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        body = self.cap_body()
+        status, _ = self.post(
+            self.cap_path, body, "expired", seed=PRODUCER_SEED,
+            actor=self.producer, nonce="nonce-expired-0001",
+        )
+        self.assertEqual(status, 201)
+
+    def test_confirmation_requires_actor_signature(self) -> None:
+        # 建能力、模板与 SLA。
+        self.assertEqual(self.post(
+            self.cap_path, self.cap_body(), "cap", seed=PRODUCER_SEED,
+            actor=self.producer)[0], 201)
+        self.assertEqual(self.post(
+            "/v1/sla-templates",
+            json.dumps({"id": "t1", "machineId": self.producer,
+                        "capabilityVersion": 1, "priceMicros": 100,
+                        "maxLatencyMs": 50}).encode(),
+            "tpl", auth=None)[0], 201)
+        now = int(time.time())
+        self.assertEqual(self.post(
+            "/v1/slas",
+            json.dumps({"id": "s1", "templateId": "t1",
+                        "consumerId": self.consumer, "start": now - 100,
+                        "end": now + 3600}).encode(),
+            "sla", auth=None)[0], 201)
+        path = "/v1/slas/s1/confirmations"
+        producer_body = json.dumps(
+            {"party": "producer", "actorId": self.producer}).encode()
+        # 生产方由消费者私钥代签：机器标识不等于 actorId -> 403。
+        status, payload = self.post(
+            path, producer_body, "conf-wrong", seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer,
+        )
+        self.assertEqual((status, json.loads(payload)),
+                         (403, {"error": "forbidden"}))
+        # 正确签名确认成功。
+        status, payload = self.post(
+            path, producer_body, "conf-p", seed=PRODUCER_SEED, actor=self.producer
+        )
+        self.assertEqual((status, payload), (200, b'{"state":"pending"}'))
+        consumer_body = json.dumps(
+            {"party": "consumer", "actorId": self.consumer}).encode()
+        status, payload = self.post(
+            path, consumer_body, "conf-c", seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer,
+        )
+        self.assertEqual((status, payload), (200, b'{"state":"active"}'))
+
+    def test_legacy_idempotency_record_replays_without_auth(self) -> None:
+        body = self.cap_body()
+        request_json = json.dumps(json.loads(body), sort_keys=True,
+                                  separators=(",", ":"))
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            connection.execute(
+                "INSERT INTO capability_idempotency_records"
+                "(key, machine_id, request_json, status, response_json)"
+                " VALUES (?, ?, ?, ?, ?)",
+                ("legacy", self.producer, request_json, 200, '{"version":7}'),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        # 无认证头、坏认证头都按旧记录重放。
+        status, payload = self.post(self.cap_path, body, "legacy", auth=None)
+        self.assertEqual((status, payload), (200, b'{"version":7}'))
+        status, payload = self.post(self.cap_path, body, "legacy", auth="garbage")
+        self.assertEqual((status, payload), (200, b'{"version":7}'))
+        # 同键异体不再走旧重放：坏头 400，合法头 409。
+        other = self.cap_body(0, 11)
+        status, _ = self.post(self.cap_path, other, "legacy", auth="garbage")
+        self.assertEqual(status, 400)
+        status, payload = self.post(
+            self.cap_path, other, "legacy", seed=PRODUCER_SEED, actor=self.producer
+        )
+        self.assertEqual((status, json.loads(payload)),
+                         (409, {"error": "conflict"}))
