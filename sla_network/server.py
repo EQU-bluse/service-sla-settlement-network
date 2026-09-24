@@ -42,6 +42,8 @@ SLA_FIELDS = {"id", "templateId", "consumerId", "start", "end"}
 CONFIRMATION_FIELDS = {"party", "actorId"}
 CONFIRMATION_PARTIES = {"producer", "consumer"}
 TELEMETRY_FIELDS = {"eventId", "timestamp", "latencyMs", "digest"}
+TELEMETRY_SIGNED_FIELDS = TELEMETRY_FIELDS | {"signature"}
+SIGNATURE_PATTERN = re.compile(r"[0-9a-f]{128}")
 EVALUATION_FIELDS = {"from", "to"}
 FUND_FIELDS = {"amountMicros", "reference"}
 SETTLEMENT_FIELDS = {"slaId", "evaluationSeq"}
@@ -1611,7 +1613,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _read_telemetry_object(self) -> dict[str, Any] | None:
         parsed = self._read_json_object()
-        if parsed is None or set(parsed) != TELEMETRY_FIELDS:
+        if parsed is None:
+            return None
+        keys = set(parsed)
+        # 兼容升级前的四字段旧体：仅用于旧幂等键精确重放，其余按非法正文。
+        if keys != TELEMETRY_FIELDS and keys != TELEMETRY_SIGNED_FIELDS:
             return None
         event_id = parsed["eventId"]
         if not isinstance(event_id, str) or TEMPLATE_ID_PATTERN.fullmatch(event_id) is None:
@@ -1623,6 +1629,10 @@ class Handler(BaseHTTPRequestHandler):
         digest = parsed["digest"]
         if not isinstance(digest, str) or PUBLIC_KEY_PATTERN.fullmatch(digest) is None:
             return None
+        if "signature" in parsed:
+            signature = parsed["signature"]
+            if not isinstance(signature, str) or SIGNATURE_PATTERN.fullmatch(signature) is None:
+                return None
         return parsed
 
     def _apply_telemetry(
@@ -1641,7 +1651,13 @@ class Handler(BaseHTTPRequestHandler):
                     database.execute("ROLLBACK")
                     if record["sla_id"] == sla_id and record["request_json"] == request_json:
                         return HTTPStatus(record["status"]), json.loads(record["response_json"])
+                    if "signature" not in fields:
+                        # 无签名提交仅在与旧幂等记录精确匹配时重放，其余按非法正文。
+                        return HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
                     return HTTPStatus.CONFLICT, {"error": "conflict"}
+                if "signature" not in fields:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
                 sla = database.execute(
                     "SELECT machine_id, start_unix, end_unix, state FROM slas WHERE id = ?",
                     (sla_id,),
@@ -1663,6 +1679,26 @@ class Handler(BaseHTTPRequestHandler):
                 if hashlib.sha256(message.encode("utf-8")).hexdigest() != fields["digest"]:
                     database.execute("ROLLBACK")
                     return HTTPStatus.CONFLICT, {"error": "conflict"}
+                # 摘要有效后才验签：签名覆盖 telemetry-v1 前缀与全部业务字段，
+                # 用生产机器登记的 publicKey 按 RFC 8032 验证 Ed25519。
+                machine = database.execute(
+                    "SELECT public_key FROM machines WHERE id = ?",
+                    (sla["machine_id"],),
+                ).fetchone()
+                signature_valid = False
+                if machine is not None:
+                    signed_message = (
+                        f"telemetry-v1\n{sla_id}\n{fields['eventId']}\n{timestamp}\n"
+                        f"{fields['latencyMs']}\n{fields['digest']}\n{sla['machine_id']}"
+                    ).encode("utf-8")
+                    signature_valid = ed25519_verify(
+                        bytes.fromhex(machine["public_key"]),
+                        signed_message,
+                        bytes.fromhex(fields["signature"]),
+                    )
+                if not signature_valid:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "invalid_signature"}
                 existing = database.execute(
                     "SELECT event_id FROM sla_telemetry_events"
                     " WHERE sla_id = ? AND event_id = ?",
@@ -1679,14 +1715,16 @@ class Handler(BaseHTTPRequestHandler):
                 payload = {"eventId": fields["eventId"]}
                 database.execute(
                     "INSERT INTO sla_telemetry_events"
-                    "(sla_id, event_id, timestamp_ms, latency_ms, digest, commit_seq)"
-                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    "(sla_id, event_id, timestamp_ms, latency_ms, digest, signature,"
+                    " commit_seq)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
                         sla_id,
                         fields["eventId"],
                         timestamp,
                         fields["latencyMs"],
                         fields["digest"],
+                        fields["signature"],
                         commit_seq,
                     ),
                 )

@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS sla_telemetry_events (
     timestamp_ms INTEGER NOT NULL,
     latency_ms INTEGER NOT NULL,
     digest TEXT NOT NULL,
+    signature TEXT,
     commit_seq INTEGER NOT NULL,
     PRIMARY KEY (sla_id, event_id)
 );
@@ -391,6 +392,15 @@ def connect(path: str) -> sqlite3.Connection:
     ):
         _renumber_commit_seq(connection)
     # 此处 commit_seq 必然存在：新库由 SCHEMA 建列，旧库由迁移补列。
+    # signature 为可空列：升级前的无签名事件保留 NULL，不补造签名。
+    telemetry_columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(sla_telemetry_events)")
+    }
+    if "signature" not in telemetry_columns:
+        connection.execute(
+            "ALTER TABLE sla_telemetry_events ADD COLUMN signature TEXT"
+        )
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_sla_telemetry_commit"
         " ON sla_telemetry_events(sla_id, commit_seq, timestamp_ms, event_id)"

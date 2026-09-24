@@ -15,13 +15,65 @@ from urllib.request import Request, urlopen
 
 from sla_network.server import ApiServer, Handler
 
-PUBLIC_KEY_A = "aa" * 32
+def machine_id(public_key: str) -> str:
+    return hashlib.sha256(bytes.fromhex(public_key)).hexdigest()
+
+
+def _ed25519_enc(point: tuple[int, int]) -> bytes:
+    x, y = point
+    return (y | ((x & 1) << 255)).to_bytes(32, "little")
+
+
+def _ed25519_public_key(seed: bytes) -> bytes:
+    from sla_network.ed25519 import _BASEPOINT, _scalar_multiply
+
+    digest = hashlib.sha512(seed).digest()
+    scalar = bytearray(digest[:32])
+    scalar[0] &= 248
+    scalar[31] &= 127
+    scalar[31] |= 64
+    return _ed25519_enc(_scalar_multiply(int.from_bytes(scalar, "little"), _BASEPOINT))
+
+
+def _ed25519_sign(seed: bytes, message: bytes) -> bytes:
+    from sla_network.ed25519 import _BASEPOINT, _L, _scalar_multiply
+
+    digest = hashlib.sha512(seed).digest()
+    scalar = bytearray(digest[:32])
+    scalar[0] &= 248
+    scalar[31] &= 127
+    scalar[31] |= 64
+    secret = int.from_bytes(bytes(scalar), "little")
+    public = _scalar_multiply(secret, _BASEPOINT)
+    r = int.from_bytes(hashlib.sha512(digest[32:] + message).digest(), "little") % _L
+    r_point = _scalar_multiply(r, _BASEPOINT)
+    k = int.from_bytes(
+        hashlib.sha512(_ed25519_enc(r_point) + _ed25519_enc(public) + message).digest(),
+        "little",
+    ) % _L
+    return _ed25519_enc(r_point) + ((r + k * secret) % _L).to_bytes(32, "little")
+
+
+SEED_A = b"\x0a" * 32
+PUBLIC_KEY_A = _ed25519_public_key(SEED_A).hex()
 PUBLIC_KEY_B = "bb" * 32
 PUBLIC_KEY_C = "cc" * 32
 
 
-def machine_id(public_key: str) -> str:
-    return hashlib.sha256(bytes.fromhex(public_key)).hexdigest()
+def telemetry_signature(
+    sla_id: str,
+    event_id: str,
+    timestamp: int,
+    latency_ms: int,
+    digest: str,
+    machine: str,
+    seed: bytes = SEED_A,
+) -> str:
+    message = (
+        f"telemetry-v1\n{sla_id}\n{event_id}\n{timestamp}\n"
+        f"{latency_ms}\n{digest}\n{machine}"
+    )
+    return _ed25519_sign(seed, message.encode("utf-8")).hex()
 
 
 class ServerTests(unittest.TestCase):
@@ -1562,17 +1614,23 @@ class TelemetryTests(unittest.TestCase):
         timestamp: int | None = None,
         latency_ms: int = 12,
         digest: str | None = None,
+        signature: str | None = None,
     ) -> bytes:
         if timestamp is None:
             timestamp = self.start * 1000 + 500
         if digest is None:
             digest = self.digest(sla_id, event_id, timestamp, latency_ms)
+        if signature is None:
+            signature = telemetry_signature(
+                sla_id, event_id, timestamp, latency_ms, digest, self.machine_id
+            )
         return json.dumps(
             {
                 "eventId": event_id,
                 "timestamp": timestamp,
                 "latencyMs": latency_ms,
                 "digest": digest,
+                "signature": signature,
             }
         ).encode()
 
@@ -1980,6 +2038,9 @@ class TelemetryTests(unittest.TestCase):
             json.dumps(
                 {key: value for key, value in valid.items() if key != "digest"}
             ).encode(),
+            json.dumps(
+                {key: value for key, value in valid.items() if key != "signature"}
+            ).encode(),
             json.dumps(dict(valid, eventId="")).encode(),
             json.dumps(dict(valid, eventId="Evt_1")).encode(),
             json.dumps(dict(valid, eventId="x" * 65)).encode(),
@@ -1998,16 +2059,179 @@ class TelemetryTests(unittest.TestCase):
             json.dumps(dict(valid, digest="A" * 64)).encode(),
             json.dumps(dict(valid, digest="0" * 63)).encode(),
             json.dumps(dict(valid, digest=123)).encode(),
+            json.dumps(dict(valid, signature="")).encode(),
+            json.dumps(dict(valid, signature="0" * 127)).encode(),
+            json.dumps(dict(valid, signature="0" * 129)).encode(),
+            json.dumps(dict(valid, signature="A" * 128)).encode(),
+            json.dumps(dict(valid, signature="g" * 128)).encode(),
+            json.dumps(dict(valid, signature=123)).encode(),
             b'{"eventId":"evt-1","eventId":"evt-2","timestamp":'
             + str(valid["timestamp"]).encode()
             + b',"latencyMs":12,"digest":"'
             + valid["digest"].encode()
+            + b'","signature":"'
+            + valid["signature"].encode()
             + b'"}',
         ]
         for body in cases:
             status, response_body, _ = self.post_telemetry(body)
             self.assertEqual(status, 400, body)
             self.assertEqual(json.loads(response_body), {"error": "invalid_request"})
+
+    def test_invalid_signature_conflicts(self) -> None:
+        self.activate()
+        status, body, _ = self.post_telemetry(
+            self.telemetry_body(signature="0" * 128)
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "invalid_signature"})
+
+    def test_signature_must_cover_all_fields(self) -> None:
+        self.activate()
+        # 摘要与正文一致，但签名覆盖的是另一组字段：验签失败。
+        timestamp = self.start * 1000 + 500
+        digest = self.digest("sla-1", "evt-1", timestamp, 12)
+        foreign = telemetry_signature(
+            "sla-1", "evt-2", timestamp, 12, digest, self.machine_id
+        )
+        status, body, _ = self.post_telemetry(
+            self.telemetry_body(digest=digest, signature=foreign)
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "invalid_signature"})
+        other_sla = telemetry_signature(
+            "sla-2", "evt-1", timestamp, 12, digest, self.machine_id
+        )
+        status, body, _ = self.post_telemetry(
+            self.telemetry_body(digest=digest, signature=other_sla),
+            idempotency_key="tel-other-sla",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "invalid_signature"})
+
+    def test_digest_checked_before_signature(self) -> None:
+        self.activate()
+        # 摘要错误时不进入验签：仍返回 conflict 而非 invalid_signature。
+        status, body, _ = self.post_telemetry(
+            self.telemetry_body(digest="0" * 64, signature="0" * 128)
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_missing_machine_key_is_invalid_signature(self) -> None:
+        self.activate()
+        with sqlite3.connect(self.server.database_path) as database:
+            database.execute("DELETE FROM machines WHERE id = ?", (self.machine_id,))
+        status, body, _ = self.post_telemetry(self.telemetry_body())
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "invalid_signature"})
+
+    def test_signature_failure_leaves_no_records(self) -> None:
+        self.activate()
+        status, _, _ = self.post_telemetry(self.telemetry_body(signature="0" * 128))
+        self.assertEqual(status, 409)
+        # 失败不写事件、不占幂等键、不推进提交序号：随后同键成功提交序号为 1。
+        status, body, _ = self.post_telemetry(self.telemetry_body())
+        self.assertEqual((status, body), (201, b'{"eventId":"evt-1"}'))
+        with sqlite3.connect(self.server.database_path) as database:
+            row = database.execute(
+                "SELECT commit_seq, signature FROM sla_telemetry_events"
+                " WHERE sla_id = 'sla-1' AND event_id = 'evt-1'"
+            ).fetchone()
+        self.assertEqual(row[0], 1)
+        self.assertEqual(row[1], json.loads(self.telemetry_body())["signature"])
+
+    def test_same_key_different_signature_conflicts(self) -> None:
+        self.activate()
+        self.assertEqual(self.post_telemetry(self.telemetry_body())[0], 201)
+        other = telemetry_signature(
+            "sla-1", "evt-1", self.start * 1000 + 500, 12, "0" * 64, self.machine_id
+        )
+        status, body, _ = self.post_telemetry(self.telemetry_body(signature=other))
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_unsigned_body_with_fresh_key_is_invalid_request(self) -> None:
+        self.activate()
+        body = json.dumps(
+            {
+                "eventId": "evt-1",
+                "timestamp": self.start * 1000 + 500,
+                "latencyMs": 12,
+                "digest": self.digest("sla-1", "evt-1", self.start * 1000 + 500, 12),
+            }
+        ).encode()
+        status, response_body, _ = self.post_telemetry(body)
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(response_body), {"error": "invalid_request"})
+
+    def test_legacy_unsigned_record_replays_and_participates(self) -> None:
+        self.activate()
+        # 模拟升级前写入：事件无签名，幂等记录为四字段请求。
+        timestamp = self.start * 1000 + 500
+        digest = self.digest("sla-1", "evt-old", timestamp, 12)
+        request_json = json.dumps(
+            {
+                "eventId": "evt-old",
+                "timestamp": timestamp,
+                "latencyMs": 12,
+                "digest": digest,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        with sqlite3.connect(self.server.database_path) as database:
+            database.execute(
+                "INSERT INTO sla_telemetry_events"
+                "(sla_id, event_id, timestamp_ms, latency_ms, digest, commit_seq)"
+                " VALUES ('sla-1', 'evt-old', ?, 12, ?, 1)",
+                (timestamp, digest),
+            )
+            database.execute(
+                "INSERT INTO sla_telemetry_idempotency_records"
+                "(key, sla_id, request_json, status, response_json)"
+                " VALUES ('tel-old', 'sla-1', ?, 201, ?)",
+                (request_json, json.dumps({"eventId": "evt-old"}, separators=(",", ":"))),
+            )
+        # 旧键与原四字段请求精确匹配：重放原响应字节。
+        status, body, _ = self.post_telemetry(
+            request_json.encode(), idempotency_key="tel-old"
+        )
+        self.assertEqual((status, body), (201, b'{"eventId":"evt-old"}'))
+        # 无签名事件继续参与查询与评估。
+        status, telemetry, _ = self.get_telemetry("from=0&to=2147483648000")
+        self.assertEqual(status, 200)
+        self.assertEqual([event["eventId"] for event in telemetry["events"]], ["evt-old"])
+        self.assertEqual(telemetry["summary"]["count"], 1)
+        request = Request(
+            self.url("/v1/slas/sla-1/evaluations"),
+            data=json.dumps(
+                {"from": self.start * 1000, "to": self.end * 1000}
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "eval-legacy")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+            evaluation = json.loads(response.read())
+        self.assertEqual(evaluation["count"], 1)
+        # 同键异体或异键的无签名提交按非法正文处理。
+        changed = json.dumps(
+            {
+                "eventId": "evt-old",
+                "timestamp": timestamp,
+                "latencyMs": 13,
+                "digest": digest,
+            }
+        ).encode()
+        status, body, _ = self.post_telemetry(changed, idempotency_key="tel-old")
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        status, body, _ = self.post_telemetry(
+            request_json.encode(), idempotency_key="tel-other"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
 
 
 class EvaluationTests(unittest.TestCase):
@@ -2117,12 +2341,16 @@ class EvaluationTests(unittest.TestCase):
         self, index: int, timestamp: int, latency_ms: int, sla_id: str = "sla-1"
     ) -> None:
         event_id = f"evt-{index:03d}"
+        digest = self.digest(sla_id, event_id, timestamp, latency_ms)
         body = json.dumps(
             {
                 "eventId": event_id,
                 "timestamp": timestamp,
                 "latencyMs": latency_ms,
-                "digest": self.digest(sla_id, event_id, timestamp, latency_ms),
+                "digest": digest,
+                "signature": telemetry_signature(
+                    sla_id, event_id, timestamp, latency_ms, digest, self.machine_id
+                ),
             }
         ).encode()
         request = Request(
@@ -3077,12 +3305,16 @@ class SettlementTests(unittest.TestCase):
         message = (
             f"sla-1\n{event_id}\n{timestamp}\n{latency_ms}\n{self.machine_id}"
         )
+        digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
         body = json.dumps(
             {
                 "eventId": event_id,
                 "timestamp": timestamp,
                 "latencyMs": latency_ms,
-                "digest": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                "digest": digest,
+                "signature": telemetry_signature(
+                    "sla-1", event_id, timestamp, latency_ms, digest, self.machine_id
+                ),
             }
         ).encode()
         request = Request(self.url("/v1/slas/sla-1/telemetry"), data=body, method="POST")
@@ -3485,13 +3717,17 @@ class DisputeTests(unittest.TestCase):
         event_id = f"evt-{sla_id}-{index}"
         timestamp = self.start * 1000 + index
         message = f"{sla_id}\n{event_id}\n{timestamp}\n{latency_ms}\n{self.machine_id}"
+        digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
         status, _ = self.post_json(
             f"/v1/slas/{sla_id}/telemetry",
             {
                 "eventId": event_id,
                 "timestamp": timestamp,
                 "latencyMs": latency_ms,
-                "digest": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                "digest": digest,
+                "signature": telemetry_signature(
+                    sla_id, event_id, timestamp, latency_ms, digest, self.machine_id
+                ),
             },
             f"tel-{sla_id}-{index}",
         )
@@ -4485,13 +4721,17 @@ class DisputeEventMigrationTests(unittest.TestCase):
             self.assertEqual(status, 200)
         timestamp = (current - 10) * 1000
         message = f"sla-new\nevt-1\n{timestamp}\n10\n{machine}"
+        digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
         status, _ = post(
             "/v1/slas/sla-new/telemetry",
             {
                 "eventId": "evt-1",
                 "timestamp": timestamp,
                 "latencyMs": 10,
-                "digest": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                "digest": digest,
+                "signature": telemetry_signature(
+                    "sla-new", "evt-1", timestamp, 10, digest, machine
+                ),
             },
             "tel-1",
         )
@@ -4648,13 +4888,17 @@ class DisputeCollectionTests(unittest.TestCase):
         event_id = f"evt-{index}"
         timestamp = self.start * 1000 + 1
         message = f"{sla_id}\n{event_id}\n{timestamp}\n10\n{self.machine_id}"
+        digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
         status, _ = self.post_json(
             f"/v1/slas/{sla_id}/telemetry",
             {
                 "eventId": event_id,
                 "timestamp": timestamp,
                 "latencyMs": 10,
-                "digest": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                "digest": digest,
+                "signature": telemetry_signature(
+                    sla_id, event_id, timestamp, 10, digest, self.machine_id
+                ),
             },
             f"tel-{index}",
         )
@@ -5028,13 +5272,17 @@ class DisputeEvidenceTests(unittest.TestCase):
         event_id = "evt-1"
         timestamp = self.start * 1000 + 1
         message = f"sla-1\n{event_id}\n{timestamp}\n10\n{self.machine_id}"
+        digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
         status, _ = self.post_json(
             "/v1/slas/sla-1/telemetry",
             {
                 "eventId": event_id,
                 "timestamp": timestamp,
                 "latencyMs": 10,
-                "digest": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                "digest": digest,
+                "signature": telemetry_signature(
+                    "sla-1", event_id, timestamp, 10, digest, self.machine_id
+                ),
             },
             "tel-1",
         )
@@ -5270,13 +5518,17 @@ class DisputeEvidenceTests(unittest.TestCase):
         event_id = "evt-2"
         timestamp = self.start * 1000 + 2
         message = f"sla-2\n{event_id}\n{timestamp}\n100\n{self.machine_id}"
+        digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
         status, _ = self.post_json(
             "/v1/slas/sla-2/telemetry",
             {
                 "eventId": event_id,
                 "timestamp": timestamp,
                 "latencyMs": 100,
-                "digest": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                "digest": digest,
+                "signature": telemetry_signature(
+                    "sla-2", event_id, timestamp, 100, digest, self.machine_id
+                ),
             },
             "tel-2",
         )
@@ -5558,41 +5810,6 @@ class DisputeEvidenceTests(unittest.TestCase):
         self.assertEqual(json.loads(body), {"evidenceSeq": 2})
 
 
-def _ed25519_enc(point: tuple[int, int]) -> bytes:
-    x, y = point
-    return (y | ((x & 1) << 255)).to_bytes(32, "little")
-
-
-def _ed25519_public_key(seed: bytes) -> bytes:
-    from sla_network.ed25519 import _BASEPOINT, _scalar_multiply
-
-    digest = hashlib.sha512(seed).digest()
-    scalar = bytearray(digest[:32])
-    scalar[0] &= 248
-    scalar[31] &= 127
-    scalar[31] |= 64
-    return _ed25519_enc(_scalar_multiply(int.from_bytes(scalar, "little"), _BASEPOINT))
-
-
-def _ed25519_sign(seed: bytes, message: bytes) -> bytes:
-    from sla_network.ed25519 import _BASEPOINT, _L, _scalar_multiply
-
-    digest = hashlib.sha512(seed).digest()
-    scalar = bytearray(digest[:32])
-    scalar[0] &= 248
-    scalar[31] &= 127
-    scalar[31] |= 64
-    secret = int.from_bytes(bytes(scalar), "little")
-    public = _scalar_multiply(secret, _BASEPOINT)
-    r = int.from_bytes(hashlib.sha512(digest[32:] + message).digest(), "little") % _L
-    r_point = _scalar_multiply(r, _BASEPOINT)
-    k = int.from_bytes(
-        hashlib.sha512(_ed25519_enc(r_point) + _ed25519_enc(public) + message).digest(),
-        "little",
-    ) % _L
-    return _ed25519_enc(r_point) + ((r + k * secret) % _L).to_bytes(32, "little")
-
-
 class EvidenceProofTests(unittest.TestCase):
     PRODUCER_SEED = b"\x01" * 32
     CONSUMER_SEED = b"\x02" * 32
@@ -5664,13 +5881,23 @@ class EvidenceProofTests(unittest.TestCase):
             self.assertEqual(status, 200)
         timestamp = self.start * 1000 + 1
         message = f"sla-1\nevt-1\n{timestamp}\n10\n{self.producer_id}"
+        digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
         status, _ = self.post_json(
             "/v1/slas/sla-1/telemetry",
             {
                 "eventId": "evt-1",
                 "timestamp": timestamp,
                 "latencyMs": 10,
-                "digest": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                "digest": digest,
+                "signature": telemetry_signature(
+                    "sla-1",
+                    "evt-1",
+                    timestamp,
+                    10,
+                    digest,
+                    self.producer_id,
+                    seed=self.PRODUCER_SEED,
+                ),
             },
             "tel-1",
         )
