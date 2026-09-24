@@ -13,6 +13,7 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from sla_network.server import ApiServer, Handler
+from sla_network import ed25519
 
 PUBLIC_KEY_A = "aa" * 32
 PUBLIC_KEY_B = "bb" * 32
@@ -5555,6 +5556,716 @@ class DisputeEvidenceTests(unittest.TestCase):
         )
         self.assertEqual(status, 201)
         self.assertEqual(json.loads(body), {"evidenceSeq": 2})
+
+
+class EvidenceProofTests(unittest.TestCase):
+    SEED_PAYER = bytes(range(32))
+    SEED_PAYEE = bytes(range(1, 33))
+    SEED_STRANGER = bytes(range(2, 34))
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.payer_key = ed25519.public_key(self.SEED_PAYER).hex()
+        self.payee_key = ed25519.public_key(self.SEED_PAYEE).hex()
+        self.stranger_key = ed25519.public_key(self.SEED_STRANGER).hex()
+        self.payer_id = machine_id(self.payer_key)
+        self.payee_id = machine_id(self.payee_key)
+        self.stranger_id = machine_id(self.stranger_key)
+        for key, public_key in (
+            ("reg-payer", self.payer_key),
+            ("reg-payee", self.payee_key),
+        ):
+            request = Request(
+                self.url("/v1/machines"),
+                data=json.dumps({"publicKey": public_key}).encode(),
+                method="POST",
+            )
+            request.add_header("Idempotency-Key", key)
+            with urlopen(request, timeout=5) as response:
+                self.assertEqual(response.status, 201)
+        # charged 结算：消费者 payer 付款给生产者 payee。
+        self.producer_id = self.payee_id
+        self.consumer_id = self.payer_id
+        request = Request(
+            self.url(f"/v1/machines/{self.producer_id}/capabilities"),
+            data=json.dumps(
+                {
+                    "expectedVersion": 0,
+                    "name": "pump-01",
+                    "protocol": "mqtt",
+                    "region": "cn",
+                    "unit": "call",
+                    "capacity": 10,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "cap-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        request = Request(
+            self.url("/v1/sla-templates"),
+            data=json.dumps(
+                {
+                    "id": "tpl-1",
+                    "machineId": self.producer_id,
+                    "capabilityVersion": 1,
+                    "priceMicros": 1000,
+                    "maxLatencyMs": 50,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "tpl-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        current = int(time.time())
+        self.start = current - 10
+        self.end = current + 3600
+        self.assertEqual(
+            self.post_json(
+                "/v1/slas",
+                {
+                    "id": "sla-1",
+                    "templateId": "tpl-1",
+                    "consumerId": self.consumer_id,
+                    "start": self.start,
+                    "end": self.end,
+                },
+                "sla-1",
+            )[0],
+            201,
+        )
+        for index, (party, actor) in enumerate(
+            (("producer", self.producer_id), ("consumer", self.consumer_id))
+        ):
+            self.assertEqual(
+                self.post_json(
+                    "/v1/slas/sla-1/confirmations",
+                    {"party": party, "actorId": actor},
+                    f"conf-{index}",
+                )[0],
+                200,
+            )
+        timestamp = self.start * 1000 + 1
+        message = f"sla-1\nevt-1\n{timestamp}\n10\n{self.producer_id}"
+        self.assertEqual(
+            self.post_json(
+                "/v1/slas/sla-1/telemetry",
+                {
+                    "eventId": "evt-1",
+                    "timestamp": timestamp,
+                    "latencyMs": 10,
+                    "digest": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                },
+                "tel-1",
+            )[0],
+            201,
+        )
+        status, body = self.post_json(
+            "/v1/slas/sla-1/evaluations",
+            {"from": self.start * 1000, "to": self.end * 1000},
+            "eval-1",
+        )
+        self.assertEqual(status, 201)
+        evaluation_seq = json.loads(body)["evaluationSeq"]
+        self.assertEqual(
+            self.post_json(
+                f"/v1/funds/{self.consumer_id}",
+                {"amountMicros": 100000, "reference": "ref-fund-1"},
+                "fund-1",
+            )[0],
+            201,
+        )
+        status, body = self.post_json(
+            "/v1/settlements",
+            {"slaId": "sla-1", "evaluationSeq": evaluation_seq},
+            "settle-1",
+        )
+        self.assertEqual(status, 201)
+        self.settlement_seq = json.loads(body)["settlementSeq"]
+        self.assertEqual(
+            self.post_json(
+                "/v1/disputes",
+                {
+                    "id": "dispute-1",
+                    "settlementSeq": self.settlement_seq,
+                    "claimantId": self.consumer_id,
+                },
+                "dispute-1",
+            )[0],
+            201,
+        )
+        self.digest = "ab" * 32
+        status, body = self.post_json(
+            "/v1/disputes/dispute-1/evidence",
+            {
+                "evidenceId": "ev-1",
+                "actorId": self.consumer_id,
+                "observedAt": self.start * 1000,
+                "digest": self.digest,
+            },
+            "evidence-1",
+        )
+        self.assertEqual(status, 201)
+        self.evidence_seq = json.loads(body)["evidenceSeq"]
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temporary.cleanup()
+
+    def restart(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}{path}"
+
+    def post_json(
+        self, path: str, payload: object, key: str | None
+    ) -> tuple[int, bytes]:
+        data = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+        request = Request(self.url(path), data=data, method="POST")
+        if key is not None:
+            request.add_header("Idempotency-Key", key)
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def get_json(self, path: str) -> tuple[int, dict]:
+        try:
+            with urlopen(self.url(path), timeout=5) as response:
+                return response.status, json.load(response)
+        except HTTPError as error:
+            return error.code, json.load(error)
+
+    def proof_message(
+        self,
+        dispute_id: str = "dispute-1",
+        evidence_seq: int | None = None,
+        digest: str | None = None,
+        actor_id: str | None = None,
+    ) -> bytes:
+        return (
+            f"proof-v1\n{dispute_id}\n{self.evidence_seq if evidence_seq is None else evidence_seq}\n"
+            f"{self.digest if digest is None else digest}\n"
+            f"{self.payer_id if actor_id is None else actor_id}"
+        ).encode("utf-8")
+
+    def sign_proof(
+        self,
+        seed: bytes = SEED_PAYER,
+        *,
+        dispute_id: str = "dispute-1",
+        evidence_seq: int | None = None,
+        digest: str | None = None,
+        actor_id: str | None = None,
+    ) -> str:
+        return ed25519.sign(
+            self.proof_message(dispute_id, evidence_seq, digest, actor_id), seed
+        ).hex()
+
+    def proof_body(self, **overrides: object) -> dict:
+        body: dict[str, object] = {
+            "evidenceSeq": self.evidence_seq,
+            "actorId": self.payer_id,
+            "signature": self.sign_proof(),
+        }
+        body.update(overrides)
+        return body
+
+    def post_proof(
+        self,
+        payload: object | None = None,
+        key: str | None = "proof-1",
+        path: str = "/v1/evidence-proofs",
+    ) -> tuple[int, bytes]:
+        return self.post_json(
+            path,
+            payload if payload is not None else self.proof_body(),
+            key,
+        )
+
+    def test_proof_created(self) -> None:
+        status, body = self.post_proof()
+        self.assertEqual(status, 201)
+        payload = json.loads(body)
+        self.assertEqual(list(payload), ["proofSeq", "verified", "createdAt"])
+        self.assertEqual(payload["proofSeq"], 1)
+        self.assertIs(payload["verified"], True)
+        self.assertIsInstance(payload["createdAt"], int)
+        self.assertGreaterEqual(payload["createdAt"], 0)
+        self.assertEqual(body, json.dumps(payload, separators=(",", ":")).encode())
+
+    def test_payee_may_also_prove(self) -> None:
+        status, body = self.post_proof()
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(body)["proofSeq"], 1)
+        status, body = self.post_proof(
+            payload=self.proof_body(
+                actorId=self.payee_id,
+                signature=self.sign_proof(
+                    self.SEED_PAYEE, actor_id=self.payee_id
+                ),
+            ),
+            key="proof-2",
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(body)["proofSeq"], 2)
+
+    def test_replay_returns_first_bytes(self) -> None:
+        status, first = self.post_proof()
+        self.assertEqual(status, 201)
+        status, replay = self.post_proof()
+        self.assertEqual(status, 201)
+        self.assertEqual(replay, first)
+
+    def test_replay_survives_restart(self) -> None:
+        status, first = self.post_proof()
+        self.assertEqual(status, 201)
+        self.restart()
+        status, replay = self.post_proof()
+        self.assertEqual(status, 201)
+        self.assertEqual(replay, first)
+        status, payload = self.get_json(
+            f"/v1/evidence/{self.evidence_seq}/proofs"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(len(payload["proofs"]), 1)
+        self.assertEqual(payload["proofs"][0]["proofSeq"], 1)
+
+    def test_same_key_different_body_conflicts_before_lookup(self) -> None:
+        status, _ = self.post_proof()
+        self.assertEqual(status, 201)
+        # 同键异签名：冲突先于资源查询，即使证据序号不存在也仍为 409/conflict。
+        status, body = self.post_proof(
+            payload=self.proof_body(signature="cd" * 64)
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+        status, body = self.post_proof(
+            payload=self.proof_body(
+                evidenceSeq=999999, signature="cd" * 64
+            )
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_evidence_missing_is_not_found(self) -> None:
+        for evidence_seq in (999999, 2**62):
+            status, body = self.post_proof(
+                payload=self.proof_body(
+                    evidenceSeq=evidence_seq,
+                    signature=self.sign_proof(evidence_seq=evidence_seq),
+                ),
+                key=f"missing-{evidence_seq}",
+            )
+            self.assertEqual(status, 404, evidence_seq)
+            self.assertEqual(json.loads(body), {"error": "not_found"})
+
+    def test_signer_must_be_party(self) -> None:
+        request = Request(
+            self.url("/v1/machines"),
+            data=json.dumps({"publicKey": self.stranger_key}).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "reg-stranger")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        status, body = self.post_proof(
+            payload=self.proof_body(
+                actorId=self.stranger_id,
+                signature=self.sign_proof(
+                    self.SEED_STRANGER, actor_id=self.stranger_id
+                ),
+            ),
+            key="proof-stranger",
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body), {"error": "forbidden"})
+
+    def test_resolved_dispute_rejects_proof_but_allows_reads(self) -> None:
+        status, body = self.post_proof()
+        self.assertEqual(status, 201)
+        status, _ = self.post_json(
+            "/v1/disputes/dispute-1/resolution",
+            {"decision": "release"},
+            "resolve-1",
+        )
+        self.assertEqual(status, 200)
+        status, body = self.post_proof(
+            payload=self.proof_body(
+                actorId=self.payee_id,
+                signature=self.sign_proof(
+                    self.SEED_PAYEE, actor_id=self.payee_id
+                ),
+            ),
+            key="proof-2",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "already_resolved"})
+        status, payload = self.get_json(
+            f"/v1/evidence/{self.evidence_seq}/proofs"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(len(payload["proofs"]), 1)
+
+    def test_invalid_signature(self) -> None:
+        # 签名者私钥与登记公钥不符。
+        wrong = ed25519.sign(self.proof_message(), self.SEED_STRANGER).hex()
+        status, body = self.post_proof(
+            payload=self.proof_body(signature=wrong), key="proof-bad"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "invalid_signature"})
+        # 消息内容被篡改（digest 不同）同样验签失败。
+        status, body = self.post_proof(
+            payload=self.proof_body(
+                signature=self.sign_proof(digest="cd" * 32)
+            ),
+            key="proof-bad-2",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "invalid_signature"})
+        # 失败不推进序号。
+        status, body = self.post_proof(key="proof-ok")
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(body)["proofSeq"], 1)
+
+    def test_same_signer_twice_is_proof_exists(self) -> None:
+        status, _ = self.post_proof()
+        self.assertEqual(status, 201)
+        # 异键、同证据同签名者、签名本身仍有效：重复证明判 proof_exists。
+        status, body = self.post_proof(key="proof-same-signer")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "proof_exists"})
+        # 同签名者但签名无效时先判 invalid_signature（判定次序在前）。
+        status, body = self.post_proof(
+            payload=self.proof_body(signature="cd" * 64), key="proof-same-bad"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "invalid_signature"})
+
+    def test_invalid_requests(self) -> None:
+        valid = self.proof_body()
+        cases = [
+            b"",
+            b"{not json",
+            json.dumps({}).encode(),
+            json.dumps({k: v for k, v in valid.items() if k != "signature"}).encode(),
+            json.dumps({**valid, "extra": 1}).encode(),
+            json.dumps({**valid, "evidenceSeq": 0}).encode(),
+            json.dumps({**valid, "evidenceSeq": -1}).encode(),
+            json.dumps({**valid, "evidenceSeq": True}).encode(),
+            json.dumps({**valid, "evidenceSeq": "1"}).encode(),
+            json.dumps({**valid, "evidenceSeq": 1.5}).encode(),
+            json.dumps({**valid, "actorId": "zz"}).encode(),
+            json.dumps({**valid, "actorId": valid["actorId"].upper()}).encode(),
+            json.dumps({**valid, "signature": "ab" * 64 + "c"}).encode(),
+            json.dumps({**valid, "signature": "AB" * 64}).encode(),
+            json.dumps({**valid, "signature": "ab" * 32}).encode(),
+        ]
+        for index, body_bytes in enumerate(cases):
+            status, response = self.post_proof(payload=body_bytes, key=f"bad-{index}")
+            self.assertEqual(status, 400, body_bytes)
+            self.assertEqual(json.loads(response), {"error": "invalid_request"})
+        status, response = self.post_proof(key=None)
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(response), {"error": "invalid_request"})
+        status, response = self.post_json(
+            "/v1/evidence-proofs?foo=bar", valid, "bad-query"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(response), {"error": "invalid_request"})
+
+    def test_concurrent_same_signer_succeeds_once(self) -> None:
+        results: list[int] = []
+        lock = threading.Lock()
+
+        def submit(index: int) -> None:
+            # 同一签名者、同一证据：除首个外其余携带相同签名也应判 proof_exists。
+            status, _ = self.post_proof(key=f"race-{index}")
+            with lock:
+                results.append(status)
+
+        threads = [threading.Thread(target=submit, args=(index,)) for index in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual(sorted(results), [201] + [409] * 7)
+        status, payload = self.get_json(
+            f"/v1/evidence/{self.evidence_seq}/proofs"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(len(payload["proofs"]), 1)
+        self.assertEqual(payload["proofs"][0]["proofSeq"], 1)
+
+    def test_concurrent_same_key_all_replay(self) -> None:
+        results: list[int] = []
+        lock = threading.Lock()
+        body = json.dumps(self.proof_body()).encode()
+
+        def submit() -> None:
+            status, _ = self.post_json("/v1/evidence-proofs", body, "same-key")
+            with lock:
+                results.append(status)
+
+        threads = [threading.Thread(target=submit) for _ in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual(results, [201] * 6)
+        status, payload = self.get_json(
+            f"/v1/evidence/{self.evidence_seq}/proofs"
+        )
+        self.assertEqual(len(payload["proofs"]), 1)
+
+    def test_get_proofs_empty_page(self) -> None:
+        # 证据存在但尚无证明：空页 200。
+        second_digest = "cd" * 32
+        status, body = self.post_json(
+            "/v1/disputes/dispute-1/evidence",
+            {
+                "evidenceId": "ev-2",
+                "actorId": self.payer_id,
+                "observedAt": self.start * 1000,
+                "digest": second_digest,
+            },
+            "evidence-2",
+        )
+        self.assertEqual(status, 201)
+        second_seq = json.loads(body)["evidenceSeq"]
+        status, payload = self.get_json(f"/v1/evidence/{second_seq}/proofs")
+        self.assertEqual(status, 200)
+        self.assertEqual(list(payload), ["proofs", "nextCursor"])
+        self.assertEqual(payload["proofs"], [])
+        self.assertIsNone(payload["nextCursor"])
+
+    def test_get_proofs_lists_records_in_seq_order(self) -> None:
+        first_signature = self.sign_proof()
+        status, _ = self.post_proof(
+            payload=self.proof_body(signature=first_signature), key="proof-1"
+        )
+        self.assertEqual(status, 201)
+        second_signature = self.sign_proof(self.SEED_PAYEE, actor_id=self.payee_id)
+        status, _ = self.post_proof(
+            payload=self.proof_body(
+                actorId=self.payee_id, signature=second_signature
+            ),
+            key="proof-2",
+        )
+        self.assertEqual(status, 201)
+        status, payload = self.get_json(
+            f"/v1/evidence/{self.evidence_seq}/proofs"
+        )
+        self.assertEqual(status, 200)
+        proofs = payload["proofs"]
+        self.assertEqual(len(proofs), 2)
+        self.assertEqual(
+            [list(item) for item in proofs],
+            [
+                ["proofSeq", "actorId", "signature", "verified", "createdAt"],
+                ["proofSeq", "actorId", "signature", "verified", "createdAt"],
+            ],
+        )
+        self.assertEqual([item["proofSeq"] for item in proofs], [1, 2])
+        self.assertEqual(proofs[0]["actorId"], self.payer_id)
+        self.assertEqual(proofs[0]["signature"], first_signature)
+        self.assertIs(proofs[0]["verified"], True)
+        self.assertEqual(proofs[1]["actorId"], self.payee_id)
+        self.assertEqual(proofs[1]["signature"], second_signature)
+        self.assertIsNone(payload["nextCursor"])
+
+    def test_get_proofs_pagination_and_cursor(self) -> None:
+        # 同一证据最多两条证明，分页用 limit=1 覆盖两页。
+        status, _ = self.post_proof(key="proof-1")
+        self.assertEqual(status, 201)
+        status, _ = self.post_proof(
+            payload=self.proof_body(
+                actorId=self.payee_id,
+                signature=self.sign_proof(self.SEED_PAYEE, actor_id=self.payee_id),
+            ),
+            key="proof-2",
+        )
+        self.assertEqual(status, 201)
+        status, first_page = self.get_json(
+            f"/v1/evidence/{self.evidence_seq}/proofs?limit=1"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["proofSeq"] for item in first_page["proofs"]], [1]
+        )
+        self.assertEqual(first_page["nextCursor"], "2:1")
+        status, second_page = self.get_json(
+            f"/v1/evidence/{self.evidence_seq}/proofs?limit=1"
+            f"&cursor={first_page['nextCursor']}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["proofSeq"] for item in second_page["proofs"]], [2]
+        )
+        self.assertIsNone(second_page["nextCursor"])
+
+    def test_proof_cursor_cut_isolates_later_appends(self) -> None:
+        status, _ = self.post_proof()
+        self.assertEqual(status, 201)
+        # 第二条证据的证明推进全库最大 proofSeq；旧 cut=1 续页不得看到它。
+        second_digest = "cd" * 32
+        status, body = self.post_json(
+            "/v1/disputes/dispute-1/evidence",
+            {
+                "evidenceId": "ev-2",
+                "actorId": self.payer_id,
+                "observedAt": self.start * 1000,
+                "digest": second_digest,
+            },
+            "evidence-2",
+        )
+        self.assertEqual(status, 201)
+        second_seq = json.loads(body)["evidenceSeq"]
+        status, _ = self.post_proof(
+            payload={
+                "evidenceSeq": second_seq,
+                "actorId": self.payer_id,
+                "signature": self.sign_proof(
+                    evidence_seq=second_seq, digest=second_digest
+                ),
+            },
+            key="proof-2",
+        )
+        self.assertEqual(status, 201)
+        status, continuation = self.get_json(
+            f"/v1/evidence/{self.evidence_seq}/proofs?cursor=1:1"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(continuation["proofs"], [])
+        self.assertIsNone(continuation["nextCursor"])
+        _, fresh = self.get_json(f"/v1/evidence/{second_seq}/proofs")
+        self.assertEqual([item["proofSeq"] for item in fresh["proofs"]], [2])
+
+    def test_get_proofs_invalid_query_params(self) -> None:
+        self.assertEqual(self.post_proof()[0], 201)
+        for query in (
+            "limit=0",
+            "limit=101",
+            "limit=01",
+            "limit=1&limit=2",
+            "unknown=1",
+            "cursor=1",
+            "cursor=x:1",
+            "cursor=1:y",
+            "cursor=01:1",
+        ):
+            status, payload = self.get_json(
+                f"/v1/evidence/{self.evidence_seq}/proofs?{query}"
+            )
+            self.assertEqual(status, 400, query)
+            self.assertEqual(payload, {"error": "invalid_request"})
+        # 参数错误先于证据查询。
+        status, payload = self.get_json("/v1/evidence/999999/proofs?limit=0")
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "invalid_request"})
+
+    def test_get_proofs_cut_ahead_or_anchor_mismatch(self) -> None:
+        self.assertEqual(self.post_proof()[0], 201)
+        status, payload = self.get_json(
+            f"/v1/evidence/{self.evidence_seq}/proofs?cursor=999:1"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "invalid_request"})
+        status, payload = self.get_json(
+            f"/v1/evidence/{self.evidence_seq}/proofs?cursor=1:5"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "invalid_request"})
+        # 证明 2 属于另一条证据时，作为本证据锚点无效。
+        second_digest = "cd" * 32
+        status, body = self.post_json(
+            "/v1/disputes/dispute-1/evidence",
+            {
+                "evidenceId": "ev-2",
+                "actorId": self.payer_id,
+                "observedAt": self.start * 1000,
+                "digest": second_digest,
+            },
+            "evidence-2",
+        )
+        self.assertEqual(status, 201)
+        second_seq = json.loads(body)["evidenceSeq"]
+        status, _ = self.post_proof(
+            payload={
+                "evidenceSeq": second_seq,
+                "actorId": self.payer_id,
+                "signature": self.sign_proof(
+                    evidence_seq=second_seq, digest=second_digest
+                ),
+            },
+            key="proof-2",
+        )
+        self.assertEqual(status, 201)
+        status, payload = self.get_json(
+            f"/v1/evidence/{self.evidence_seq}/proofs?cursor=2:2"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "invalid_request"})
+
+    def test_get_proofs_invalid_or_missing_evidence_is_not_found(self) -> None:
+        for path in (
+            "/v1/evidence/abc/proofs",
+            "/v1/evidence/01/proofs",
+            "/v1/evidence/0/proofs",
+            "/v1/evidence/999999/proofs",
+        ):
+            status, payload = self.get_json(path)
+            self.assertEqual(status, 404, path)
+            self.assertEqual(payload, {"error": "not_found"})
+
+    def test_proof_sequences_continue_after_restart(self) -> None:
+        self.assertEqual(self.post_proof()[0], 201)
+        second_digest = "cd" * 32
+        status, body = self.post_json(
+            "/v1/disputes/dispute-1/evidence",
+            {
+                "evidenceId": "ev-2",
+                "actorId": self.payee_id,
+                "observedAt": self.start * 1000,
+                "digest": second_digest,
+            },
+            "evidence-2",
+        )
+        self.assertEqual(status, 201)
+        second_seq = json.loads(body)["evidenceSeq"]
+        self.restart()
+        status, body = self.post_proof(
+            payload={
+                "evidenceSeq": second_seq,
+                "actorId": self.payee_id,
+                "signature": self.sign_proof(
+                    self.SEED_PAYEE,
+                    evidence_seq=second_seq,
+                    digest=second_digest,
+                    actor_id=self.payee_id,
+                ),
+            },
+            key="proof-2",
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(body)["proofSeq"], 2)
 
 
 if __name__ == "__main__":

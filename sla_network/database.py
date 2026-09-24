@@ -192,8 +192,28 @@ CREATE TABLE IF NOT EXISTS dispute_evidence_idempotency_records (
     status INTEGER NOT NULL,
     response_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS evidence_proofs (
+    proof_seq INTEGER PRIMARY KEY,
+    evidence_seq INTEGER NOT NULL,
+    actor_id TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    verified INTEGER NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    UNIQUE (evidence_seq, actor_id)
+);
+CREATE TABLE IF NOT EXISTS evidence_proof_idempotency_records (
+    key TEXT PRIMARY KEY,
+    evidence_seq INTEGER NOT NULL,
+    actor_id TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    response_json TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_dispute_evidences_dispute_seq
 ON dispute_evidences(dispute_id, evidence_seq);
+CREATE INDEX IF NOT EXISTS idx_evidence_proofs_evidence_seq
+ON evidence_proofs(evidence_seq, proof_seq);
 """
 
 TELEMETRY_SEQ_MARKER = "telemetry_commit_seq_renumbered"
