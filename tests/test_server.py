@@ -4949,5 +4949,708 @@ class DisputeCollectionTests(unittest.TestCase):
         self.assertIsNone(second_page["nextCursor"])
 
 
+class DisputeEvidenceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.machine_id = machine_id(PUBLIC_KEY_A)
+        self.consumer_id = machine_id(PUBLIC_KEY_B)
+        self.outsider_id = machine_id(PUBLIC_KEY_C)
+        for key, public_key in (
+            ("register-1", PUBLIC_KEY_A),
+            ("register-2", PUBLIC_KEY_B),
+            ("register-3", PUBLIC_KEY_C),
+        ):
+            request = Request(
+                self.url("/v1/machines"),
+                data=json.dumps({"publicKey": public_key}).encode(),
+                method="POST",
+            )
+            request.add_header("Idempotency-Key", key)
+            with urlopen(request, timeout=5) as response:
+                self.assertEqual(response.status, 201)
+        request = Request(
+            self.url(f"/v1/machines/{self.machine_id}/capabilities"),
+            data=json.dumps(
+                {
+                    "expectedVersion": 0,
+                    "name": "pump-01",
+                    "protocol": "mqtt",
+                    "region": "cn",
+                    "unit": "call",
+                    "capacity": 10,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "cap-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        request = Request(
+            self.url("/v1/sla-templates"),
+            data=json.dumps(
+                {
+                    "id": "tpl-1",
+                    "machineId": self.machine_id,
+                    "capabilityVersion": 1,
+                    "priceMicros": 1000,
+                    "maxLatencyMs": 50,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "tpl-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        current = int(time.time())
+        self.start = current - 10
+        self.end = current + 3600
+        self.create_sla("sla-1", "sla-create-1")
+        self.activate("sla-1")
+        self.deposit(self.consumer_id, 100000, "fund-1")
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temporary.cleanup()
+
+    def url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}{path}"
+
+    def create_sla(self, sla_id: str, key: str) -> None:
+        request = Request(
+            self.url("/v1/slas"),
+            data=json.dumps(
+                {
+                    "id": sla_id,
+                    "templateId": "tpl-1",
+                    "consumerId": self.consumer_id,
+                    "start": self.start,
+                    "end": self.end,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", key)
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+
+    def activate(self, sla_id: str) -> None:
+        for index, (party, actor) in enumerate(
+            (
+                ("producer", self.machine_id),
+                ("consumer", self.consumer_id),
+            )
+        ):
+            request = Request(
+                self.url(f"/v1/slas/{sla_id}/confirmations"),
+                data=json.dumps({"party": party, "actorId": actor}).encode(),
+                method="POST",
+            )
+            request.add_header("Idempotency-Key", f"conf-{sla_id}-{index}")
+            with urlopen(request, timeout=5) as response:
+                self.assertEqual(response.status, 200)
+
+    def deposit(self, account: str, amount: int, key: str) -> None:
+        request = Request(
+            self.url(f"/v1/funds/{account}"),
+            data=json.dumps(
+                {"amountMicros": amount, "reference": f"ref-{key}"}
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", key)
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+
+    def settle_charged(self, index: int) -> int:
+        event_id = f"evt-{index}"
+        timestamp = self.start * 1000 + index
+        message = (
+            f"sla-1\n{event_id}\n{timestamp}\n10\n{self.machine_id}"
+        )
+        request = Request(
+            self.url("/v1/slas/sla-1/telemetry"),
+            data=json.dumps(
+                {
+                    "eventId": event_id,
+                    "timestamp": timestamp,
+                    "latencyMs": 10,
+                    "digest": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", f"tel-{index}")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        request = Request(
+            self.url("/v1/slas/sla-1/evaluations"),
+            data=json.dumps(
+                {"from": self.start * 1000, "to": self.end * 1000}
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", f"eval-{index}")
+        with urlopen(request, timeout=5) as response:
+            evaluation_seq = json.load(response)["evaluationSeq"]
+        request = Request(
+            self.url("/v1/settlements"),
+            data=json.dumps(
+                {"slaId": "sla-1", "evaluationSeq": evaluation_seq}
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", f"settle-{index}")
+        with urlopen(request, timeout=5) as response:
+            payload = json.load(response)
+        self.assertEqual(payload["result"], "charged")
+        return payload["settlementSeq"]
+
+    def create_dispute(self, index: int) -> str:
+        settlement_seq = self.settle_charged(index)
+        dispute_id = f"dispute-{index}"
+        request = Request(
+            self.url("/v1/disputes"),
+            data=json.dumps(
+                {
+                    "id": dispute_id,
+                    "settlementSeq": settlement_seq,
+                    "claimantId": self.consumer_id,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", f"dispute-{index}")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        return dispute_id
+
+    def resolve(self, dispute_id: str, decision: str, key: str) -> None:
+        request = Request(
+            self.url(f"/v1/disputes/{dispute_id}/resolution"),
+            data=json.dumps({"decision": decision}).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", key)
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+
+    def evidence_body(self, **overrides: object) -> dict:
+        body: dict[str, object] = {
+            "evidenceId": "ev-1",
+            "actorId": self.consumer_id,
+            "observedAt": 1234567890,
+            "digest": "d1" * 32,
+        }
+        body.update(overrides)
+        return body
+
+    def post_evidence(
+        self,
+        dispute_id: str,
+        payload: object,
+        key: str | None = "evidence-key-1",
+        suffix: str = "",
+    ) -> tuple[int, bytes]:
+        data = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+        request = Request(
+            self.url(f"/v1/disputes/{dispute_id}/evidence{suffix}"),
+            data=data,
+            method="POST",
+        )
+        if key is not None:
+            request.add_header("Idempotency-Key", key)
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def get_evidence(self, query: str = "") -> tuple[int, object]:
+        path = "/v1/disputes/dispute-1/evidence"
+        if query:
+            path = f"{path}?{query}"
+        try:
+            with urlopen(self.url(path), timeout=5) as response:
+                return response.status, json.loads(response.read())
+        except HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    def get_evidence_raw(self, query: str = "") -> tuple[int, bytes]:
+        path = "/v1/disputes/dispute-1/evidence"
+        if query:
+            path = f"{path}?{query}"
+        try:
+            with urlopen(self.url(path), timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def add_evidence(self, dispute_id: str, index: int, actor: str | None = None) -> int:
+        status, body = self.post_evidence(
+            dispute_id,
+            self.evidence_body(
+                evidenceId=f"ev-{index}",
+                actorId=self.consumer_id if actor is None else actor,
+                observedAt=1000 + index,
+                digest=f"{index:02x}" * 32,
+            ),
+            key=f"evidence-{dispute_id}-{index}",
+        )
+        self.assertEqual(status, 201)
+        return json.loads(body)["evidenceSeq"]
+
+    def test_submit_evidence_created_shape(self) -> None:
+        self.create_dispute(1)
+        status, body = self.post_evidence("dispute-1", self.evidence_body())
+        self.assertEqual(status, 201)
+        self.assertEqual(body, b'{"evidenceSeq":1}')
+
+    def test_payee_can_submit_and_seq_is_global_cross_dispute(self) -> None:
+        self.create_dispute(1)
+        self.create_dispute(2)
+        seq_one = self.add_evidence("dispute-1", 1, actor=self.consumer_id)
+        seq_two = self.add_evidence("dispute-2", 2, actor=self.machine_id)
+        self.assertEqual((seq_one, seq_two), (1, 2))
+
+    def test_replay_returns_first_status_and_bytes(self) -> None:
+        self.create_dispute(1)
+        status, first = self.post_evidence("dispute-1", self.evidence_body())
+        self.assertEqual(status, 201)
+        status, second = self.post_evidence("dispute-1", self.evidence_body())
+        self.assertEqual(status, 201)
+        self.assertEqual(second, first)
+
+    def test_replay_survives_restart(self) -> None:
+        self.create_dispute(1)
+        status, first = self.post_evidence("dispute-1", self.evidence_body())
+        self.assertEqual(status, 201)
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        status, second = self.post_evidence("dispute-1", self.evidence_body())
+        self.assertEqual(status, 201)
+        self.assertEqual(second, first)
+
+    def test_same_key_different_dispute_or_body_conflicts(self) -> None:
+        self.create_dispute(1)
+        self.create_dispute(2)
+        status, _ = self.post_evidence("dispute-1", self.evidence_body(), key="shared")
+        self.assertEqual(status, 201)
+        status, payload = self.post_evidence(
+            "dispute-2", self.evidence_body(), key="shared"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(payload, b'{"error":"conflict"}')
+        status, payload = self.post_evidence(
+            "dispute-1", self.evidence_body(observedAt=1), key="shared"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(payload, b'{"error":"conflict"}')
+
+    def test_idempotency_conflict_before_dispute_lookup(self) -> None:
+        self.create_dispute(1)
+        status, _ = self.post_evidence("dispute-1", self.evidence_body(), key="shared")
+        self.assertEqual(status, 201)
+        status, payload = self.post_evidence(
+            "missing-dispute", self.evidence_body(), key="shared"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(payload, b'{"error":"conflict"}')
+
+    def test_dispute_missing_or_invalid_is_not_found(self) -> None:
+        self.create_dispute(1)
+        for index, dispute_id in enumerate(("missing-dispute", "bad id", "é")):
+            status, payload = self.post_evidence(
+                quote(dispute_id, safe=""),
+                self.evidence_body(),
+                key=f"missing-{index}",
+            )
+            self.assertEqual(status, 404)
+            self.assertEqual(payload, b'{"error":"not_found"}')
+
+    def test_actor_not_a_participant_is_forbidden(self) -> None:
+        self.create_dispute(1)
+        status, payload = self.post_evidence(
+            "dispute-1", self.evidence_body(actorId=self.outsider_id), key="forbidden-1"
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(payload, b'{"error":"forbidden"}')
+
+    def test_forbidden_is_checked_before_resolved_state(self) -> None:
+        dispute_id = self.create_dispute(1)
+        self.resolve(dispute_id, "release", "resolve-1")
+        status, payload = self.post_evidence(
+            dispute_id, self.evidence_body(actorId=self.outsider_id), key="forbidden-2"
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(payload, b'{"error":"forbidden"}')
+
+    def test_resolved_dispute_is_already_resolved_for_participant(self) -> None:
+        dispute_id = self.create_dispute(1)
+        self.resolve(dispute_id, "refund", "resolve-1")
+        status, payload = self.post_evidence(
+            dispute_id, self.evidence_body(), key="late-1"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(payload, b'{"error":"already_resolved"}')
+
+    def test_duplicate_evidence_id_or_digest_with_other_key_is_evidence_exists(self) -> None:
+        self.create_dispute(1)
+        status, _ = self.post_evidence("dispute-1", self.evidence_body(), key="first")
+        self.assertEqual(status, 201)
+        status, payload = self.post_evidence(
+            "dispute-1",
+            self.evidence_body(digest="aa" * 32),
+            key="same-evidence-id",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(payload, b'{"error":"evidence_exists"}')
+        status, payload = self.post_evidence(
+            "dispute-1",
+            self.evidence_body(evidenceId="ev-other"),
+            key="same-digest",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(payload, b'{"error":"evidence_exists"}')
+
+    def test_same_evidence_id_and_digest_allowed_in_other_dispute(self) -> None:
+        self.create_dispute(1)
+        self.create_dispute(2)
+        status, _ = self.post_evidence("dispute-1", self.evidence_body(), key="first")
+        self.assertEqual(status, 201)
+        status, body = self.post_evidence(
+            "dispute-2", self.evidence_body(), key="second"
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(body)["evidenceSeq"], 2)
+
+    def test_failed_request_leaves_no_record_and_does_not_advance_seq(self) -> None:
+        self.create_dispute(1)
+        status, _ = self.post_evidence(
+            "dispute-1", self.evidence_body(actorId=self.outsider_id), key="failed"
+        )
+        self.assertEqual(status, 403)
+        # 失败不残留幂等记录：同键改用于合法请求可首次成功。
+        status, body = self.post_evidence(
+            "dispute-1", self.evidence_body(actorId=self.consumer_id), key="failed"
+        )
+        self.assertEqual(status, 201)
+        # 失败不推进序号：此前无成功提交，首条序号为 1。
+        self.assertEqual(body, b'{"evidenceSeq":1}')
+
+    def test_invalid_idempotency_key(self) -> None:
+        self.create_dispute(1)
+        for key in (None, "", "bad key", "bad_key", "x" * 65, "é"):
+            status, payload = self.post_evidence(
+                "dispute-1", self.evidence_body(), key=key
+            )
+            self.assertEqual(status, 400)
+            self.assertEqual(payload, b'{"error":"invalid_request"}')
+
+    def test_query_string_on_post_is_invalid_request(self) -> None:
+        self.create_dispute(1)
+        status, payload = self.post_evidence(
+            "dispute-1", self.evidence_body(), key="with-query", suffix="?x=1"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, b'{"error":"invalid_request"}')
+
+    def test_invalid_bodies(self) -> None:
+        self.create_dispute(1)
+        valid_digest = "d1" * 32
+        invalid_bodies = [
+            b"not json",
+            b"[]",
+            b"null",
+            json.dumps(
+                {
+                    "evidenceId": "ev-1",
+                    "actorId": self.consumer_id,
+                    "observedAt": 1,
+                }
+            ).encode(),
+            json.dumps(
+                {
+                    "evidenceId": "ev-1",
+                    "actorId": self.consumer_id,
+                    "observedAt": 1,
+                    "digest": valid_digest,
+                    "extra": 1,
+                }
+            ).encode(),
+            b'{"evidenceId":"ev-1","evidenceId":"ev-2","actorId":"'
+            + self.consumer_id.encode()
+            + b'","observedAt":1,"digest":"'
+            + valid_digest.encode()
+            + b'"}',
+        ]
+        for index, body in enumerate(invalid_bodies):
+            status, payload = self.post_evidence(
+                "dispute-1", body, key=f"bad-body-{index:02d}"
+            )
+            self.assertEqual(status, 400, body)
+            self.assertEqual(payload, b'{"error":"invalid_request"}')
+        invalid_fields = [
+            {"evidenceId": "Bad-Id"},
+            {"evidenceId": "ev_1"},
+            {"evidenceId": "x" * 65},
+            {"evidenceId": 1},
+            {"actorId": "gg" * 32},
+            {"actorId": "a" * 63},
+            {"actorId": 1},
+            {"observedAt": -1},
+            {"observedAt": 2147483648000},
+            {"observedAt": True},
+            {"observedAt": False},
+            {"observedAt": "1"},
+            {"observedAt": 1.5},
+            {"digest": "D1" * 32},
+            {"digest": "g1" * 32},
+            {"digest": "d1" * 31 + "d"},
+            {"digest": 1},
+        ]
+        for index, overrides in enumerate(invalid_fields):
+            status, payload = self.post_evidence(
+                "dispute-1",
+                self.evidence_body(**overrides),
+                key=f"bad-field-{index:02d}",
+            )
+            self.assertEqual(status, 400, overrides)
+            self.assertEqual(payload, b'{"error":"invalid_request"}')
+
+    def test_concurrent_same_key_all_replay_created_bytes(self) -> None:
+        self.create_dispute(1)
+        results: list[tuple[int, bytes]] = []
+        lock = threading.Lock()
+
+        def post() -> None:
+            status, body = self.post_evidence(
+                "dispute-1", self.evidence_body(), key="race-same"
+            )
+            with lock:
+                results.append((status, body))
+
+        threads = [threading.Thread(target=post) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual(results, [(201, b'{"evidenceSeq":1}')] * 8)
+
+    def test_concurrent_distinct_keys_same_evidence_id_single_winner(self) -> None:
+        self.create_dispute(1)
+        results: list[int] = []
+        lock = threading.Lock()
+
+        def post(index: int) -> None:
+            status, _ = self.post_evidence(
+                "dispute-1",
+                self.evidence_body(digest=f"{index + 10:02x}" * 32),
+                key=f"race-id-{index}",
+            )
+            with lock:
+                results.append(status)
+
+        threads = [threading.Thread(target=post, args=(index,)) for index in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual(sorted(results), [201] + [409] * 7)
+
+    def test_concurrent_distinct_keys_same_digest_single_winner(self) -> None:
+        self.create_dispute(1)
+        results: list[int] = []
+        lock = threading.Lock()
+
+        def post(index: int) -> None:
+            status, _ = self.post_evidence(
+                "dispute-1",
+                self.evidence_body(evidenceId=f"ev-race-{index}"),
+                key=f"race-digest-{index}",
+            )
+            with lock:
+                results.append(status)
+
+        threads = [threading.Thread(target=post, args=(index,)) for index in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual(sorted(results), [201] + [409] * 7)
+
+    def test_get_evidence_empty_page_key_order(self) -> None:
+        self.create_dispute(1)
+        status, body = self.get_evidence_raw()
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b'{"evidence":[],"nextCursor":null}')
+
+    def test_get_evidence_item_shape_and_order(self) -> None:
+        self.create_dispute(1)
+        self.add_evidence("dispute-1", 2)
+        self.add_evidence("dispute-1", 1, actor=self.machine_id)
+        status, payload = self.get_evidence()
+        self.assertEqual(status, 200)
+        self.assertEqual(list(payload), ["evidence", "nextCursor"])
+        items = payload["evidence"]
+        self.assertEqual(
+            [list(item) for item in items],
+            [
+                ["evidenceSeq", "evidenceId", "actorId", "observedAt", "digest"],
+                ["evidenceSeq", "evidenceId", "actorId", "observedAt", "digest"],
+            ],
+        )
+        self.assertEqual(items[0]["evidenceId"], "ev-2")
+        self.assertEqual(items[0]["observedAt"], 1002)
+        self.assertEqual(items[1]["actorId"], self.machine_id)
+        self.assertEqual([item["evidenceSeq"] for item in items], [1, 2])
+
+    def test_get_evidence_available_after_resolution(self) -> None:
+        dispute_id = self.create_dispute(1)
+        self.add_evidence(dispute_id, 1)
+        self.resolve(dispute_id, "release", "resolve-1")
+        status, payload = self.get_evidence()
+        self.assertEqual(status, 200)
+        self.assertEqual(len(payload["evidence"]), 1)
+
+    def test_get_evidence_pagination_pins_cut(self) -> None:
+        self.create_dispute(1)
+        self.add_evidence("dispute-1", 1)
+        self.add_evidence("dispute-1", 2)
+        status, first_page = self.get_evidence("limit=1")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["evidenceId"] for item in first_page["evidence"]], ["ev-1"]
+        )
+        cursor = first_page["nextCursor"]
+        self.assertIsInstance(cursor, str)
+        # 续页期间新增的证据不进入旧快照。
+        self.add_evidence("dispute-1", 3)
+        status, second_page = self.get_evidence(f"limit=1&cursor={cursor}")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["evidenceId"] for item in second_page["evidence"]], ["ev-2"]
+        )
+        self.assertIsNone(second_page["nextCursor"])
+        # 全新首页取新 cut，可见新证据。
+        status, fresh_page = self.get_evidence("limit=1")
+        self.assertEqual(status, 200)
+        self.assertEqual(fresh_page["nextCursor"], "3:1")
+
+    def test_get_evidence_default_limit_is_50(self) -> None:
+        self.create_dispute(1)
+        for index in range(1, 52):
+            self.add_evidence("dispute-1", index)
+        status, page = self.get_evidence()
+        self.assertEqual(status, 200)
+        self.assertEqual(len(page["evidence"]), 50)
+        self.assertEqual(page["nextCursor"], f"51:{page['evidence'][-1]['evidenceSeq']}")
+
+    def test_get_evidence_scoped_to_dispute_but_cut_is_global(self) -> None:
+        self.create_dispute(1)
+        self.create_dispute(2)
+        seq_two = self.add_evidence("dispute-1", 1)
+        self.add_evidence("dispute-2", 2)
+        seq_three = self.add_evidence("dispute-1", 3)
+        self.assertEqual((seq_two, seq_three), (1, 3))
+        try:
+            with urlopen(
+                self.url("/v1/disputes/dispute-1/evidence"), timeout=5
+            ) as response:
+                page = json.load(response)
+        except HTTPError as error:
+            self.fail(error.read())
+        self.assertEqual([item["evidenceSeq"] for item in page["evidence"]], [1, 3])
+        # cut 为全库最大序号（3），即使争议 1 没有 seq 2 也不报错。
+        self.assertIsNone(page["nextCursor"])
+
+    def test_get_evidence_cursor_survives_restart(self) -> None:
+        self.create_dispute(1)
+        self.add_evidence("dispute-1", 1)
+        self.add_evidence("dispute-1", 2)
+        status, first_page = self.get_evidence("limit=1")
+        self.assertEqual(status, 200)
+        cursor = first_page["nextCursor"]
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        status, second_page = self.get_evidence(f"limit=1&cursor={cursor}")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["evidenceId"] for item in second_page["evidence"]], ["ev-2"]
+        )
+        self.assertIsNone(second_page["nextCursor"])
+
+    def test_get_evidence_invalid_query_before_dispute_lookup(self) -> None:
+        for query in (
+            "unknown=1",
+            "limit=1&limit=2",
+            "limit=0",
+            "limit=101",
+            "limit=01",
+            "limit=1x",
+            "cursor=1",
+            "cursor=x:1",
+            "cursor=1:x",
+            "cursor=1:",
+            "accountId=abc",
+        ):
+            status, payload = self.get_evidence_raw(query)
+            self.assertEqual(status, 400, query)
+            self.assertEqual(payload, b'{"error":"invalid_request"}', query)
+        # 参数非法先于争议查询：不存在的争议同样返回 400。
+        try:
+            with urlopen(
+                self.url("/v1/disputes/missing/evidence?limit=0"), timeout=5
+            ) as response:
+                status, body = response.status, response.read()
+        except HTTPError as error:
+            status, body = error.code, error.read()
+        self.assertEqual(status, 400)
+        self.assertEqual(body, b'{"error":"invalid_request"}')
+
+    def test_get_evidence_dispute_not_found(self) -> None:
+        try:
+            with urlopen(
+                self.url("/v1/disputes/missing/evidence"), timeout=5
+            ) as response:
+                status, body = response.status, response.read()
+        except HTTPError as error:
+            status, body = error.code, error.read()
+        self.assertEqual(status, 404)
+        self.assertEqual(body, b'{"error":"not_found"}')
+
+    def test_get_evidence_cursor_cut_and_anchor_validation(self) -> None:
+        self.create_dispute(1)
+        self.create_dispute(2)
+        self.add_evidence("dispute-1", 1)
+        self.add_evidence("dispute-2", 2)
+        # cut 大于当前全库最大序号。
+        status, _ = self.get_evidence("cursor=3:1")
+        self.assertEqual(status, 400)
+        # lastSeq 属于其他争议（不大于 cut 但在目标争议内不存在）。
+        status, _ = self.get_evidence("cursor=2:2")
+        self.assertEqual(status, 400)
+        # 合法锚点可续页。
+        status, page = self.get_evidence("limit=1&cursor=2:1")
+        self.assertEqual(status, 200)
+        self.assertEqual(page["evidence"], [])
+        self.assertIsNone(page["nextCursor"])
+
+
 if __name__ == "__main__":
     unittest.main()

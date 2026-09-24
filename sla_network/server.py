@@ -26,6 +26,7 @@ ACCOUNT_LEDGER_PATH_PATTERN = re.compile(r"/v1/accounts/([^/]+)/ledger")
 FUNDS_PATH_PATTERN = re.compile(r"/v1/funds/([^/]+)")
 DISPUTE_PATH_PATTERN = re.compile(r"/v1/disputes/([^/]+)")
 DISPUTE_EVENTS_PATH_PATTERN = re.compile(r"/v1/disputes/([^/]+)/events")
+DISPUTE_EVIDENCE_PATH_PATTERN = re.compile(r"/v1/disputes/([^/]+)/evidence")
 DISPUTE_RESOLUTION_PATH_PATTERN = re.compile(r"/v1/disputes/([^/]+)/resolution")
 CAPABILITY_FIELDS = {"expectedVersion", "name", "protocol", "region", "unit", "capacity"}
 SLA_TEMPLATE_FIELDS = {
@@ -43,6 +44,7 @@ EVALUATION_FIELDS = {"from", "to"}
 FUND_FIELDS = {"amountMicros", "reference"}
 SETTLEMENT_FIELDS = {"slaId", "evaluationSeq"}
 DISPUTE_FIELDS = {"id", "settlementSeq", "claimantId"}
+EVIDENCE_FIELDS = {"evidenceId", "actorId", "observedAt", "digest"}
 RESOLUTION_FIELDS = {"decision"}
 DISPUTE_DECISIONS = {"release", "refund"}
 DISPUTABLE_RESULTS = {"charged", "compensated"}
@@ -54,6 +56,7 @@ EVALUATION_QUERY_PARAMS = {"limit", "cursor"}
 SETTLEMENT_QUERY_PARAMS = {"limit", "cursor"}
 LEDGER_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTE_EVENTS_QUERY_PARAMS = {"limit", "cursor"}
+DISPUTE_EVIDENCE_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTES_QUERY_PARAMS = {"accountId", "state", "limit", "cursor"}
 DISPUTE_SNAPSHOT_STATES = {"open", "released", "refunded"}
 TELEMETRY_TIME_MAX = 2147483648000
@@ -135,6 +138,12 @@ class Handler(BaseHTTPRequestHandler):
         if dispute_events_match is not None:
             self._get_dispute_events(
                 dispute_events_match.group(1), target.query
+            )
+            return
+        dispute_evidence_match = DISPUTE_EVIDENCE_PATH_PATTERN.fullmatch(target.path)
+        if dispute_evidence_match is not None:
+            self._get_dispute_evidence(
+                dispute_evidence_match.group(1), target.query
             )
             return
         dispute_match = DISPUTE_PATH_PATTERN.fullmatch(target.path)
@@ -772,6 +781,85 @@ class Handler(BaseHTTPRequestHandler):
             {"events": events, "nextCursor": next_cursor},
         )
 
+    def _get_dispute_evidence(self, dispute_id: str, query: str) -> None:
+        parsed = self._parse_evaluation_query(query, DISPUTE_EVIDENCE_QUERY_PARAMS)
+        if parsed is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        limit, cursor = parsed
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN")
+            try:
+                record = database.execute(
+                    "SELECT 1 FROM disputes WHERE id = ?", (dispute_id,)
+                ).fetchone()
+                if record is None:
+                    database.execute("ROLLBACK")
+                    self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                    return
+                # cut 为读事务起点的全库最大证据序号（空库为 0），跨争议全局。
+                max_record = database.execute(
+                    "SELECT MAX(evidence_seq) AS current_max FROM dispute_evidences"
+                ).fetchone()
+                current_max = max_record["current_max"]
+                if current_max is None:
+                    current_max = 0
+                if cursor is None:
+                    cut = current_max
+                    last_seq = 0
+                else:
+                    cut, last_seq = cursor
+                    if cut > current_max:
+                        database.execute("ROLLBACK")
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                        )
+                        return
+                    anchor = database.execute(
+                        "SELECT 1 FROM dispute_evidences"
+                        " WHERE dispute_id = ? AND evidence_seq = ?"
+                        " AND evidence_seq <= ?",
+                        (dispute_id, last_seq, cut),
+                    ).fetchone()
+                    if anchor is None:
+                        database.execute("ROLLBACK")
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                        )
+                        return
+                rows = database.execute(
+                    "SELECT evidence_seq, evidence_id, actor_id, observed_at, digest"
+                    " FROM dispute_evidences"
+                    " WHERE dispute_id = ? AND evidence_seq <= ? AND evidence_seq > ?"
+                    " ORDER BY evidence_seq ASC"
+                    " LIMIT ?",
+                    (dispute_id, cut, last_seq, limit + 1),
+                ).fetchall()
+                database.execute("ROLLBACK")
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+        has_next = len(rows) > limit
+        page = rows[:limit]
+        evidence = [
+            {
+                "evidenceSeq": row["evidence_seq"],
+                "evidenceId": row["evidence_id"],
+                "actorId": row["actor_id"],
+                "observedAt": row["observed_at"],
+                "digest": row["digest"],
+            }
+            for row in page
+        ]
+        if has_next:
+            next_cursor = f"{cut}:{page[-1]['evidence_seq']}"
+        else:
+            next_cursor = None
+        self._json(
+            HTTPStatus.OK,
+            {"evidence": evidence, "nextCursor": next_cursor},
+        )
+
     def _parse_disputes_query(
         self, query: str
     ) -> tuple[str, str | None, int, tuple[int, int] | None] | None:
@@ -983,6 +1071,12 @@ class Handler(BaseHTTPRequestHandler):
         resolution_match = DISPUTE_RESOLUTION_PATH_PATTERN.fullmatch(self.path)
         if resolution_match is not None:
             self._resolve_dispute(resolution_match.group(1))
+            return
+        evidence_match = DISPUTE_EVIDENCE_PATH_PATTERN.fullmatch(
+            urlsplit(self.path).path
+        )
+        if evidence_match is not None:
+            self._submit_evidence(evidence_match.group(1))
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
@@ -2274,6 +2368,118 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 database.execute("COMMIT")
                 return HTTPStatus.OK, payload
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+
+    def _submit_evidence(self, dispute_id: str) -> None:
+        # 查询参数非法与头、体非法同为 400，先于幂等与争议判定。
+        if urlsplit(self.path).query:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        idempotency_key = self.headers.get("Idempotency-Key")
+        if idempotency_key is None or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        fields = self._read_evidence_object()
+        if fields is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        status, payload = self._apply_evidence(idempotency_key, dispute_id, fields)
+        self._json(status, payload)
+
+    def _read_evidence_object(self) -> dict[str, Any] | None:
+        parsed = self._read_json_object()
+        if parsed is None or set(parsed) != EVIDENCE_FIELDS:
+            return None
+        evidence_id = parsed["evidenceId"]
+        if not isinstance(evidence_id, str) or TEMPLATE_ID_PATTERN.fullmatch(evidence_id) is None:
+            return None
+        actor_id = parsed["actorId"]
+        if not isinstance(actor_id, str) or PUBLIC_KEY_PATTERN.fullmatch(actor_id) is None:
+            return None
+        if not _bounded_int(parsed["observedAt"], 0, 2147483647999):
+            return None
+        digest = parsed["digest"]
+        if not isinstance(digest, str) or PUBLIC_KEY_PATTERN.fullmatch(digest) is None:
+            return None
+        return parsed
+
+    def _apply_evidence(
+        self, idempotency_key: str, dispute_id: str, fields: dict[str, Any]
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                record = database.execute(
+                    "SELECT dispute_id, request_json, status, response_json"
+                    " FROM dispute_evidence_idempotency_records WHERE key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    if record["dispute_id"] == dispute_id and record["request_json"] == request_json:
+                        return HTTPStatus(record["status"]), json.loads(record["response_json"])
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                dispute = database.execute(
+                    "SELECT payer_id, payee_id, state FROM disputes WHERE id = ?",
+                    (dispute_id,),
+                ).fetchone()
+                if dispute is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                actor_id = fields["actorId"]
+                if actor_id != dispute["payer_id"] and actor_id != dispute["payee_id"]:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
+                if dispute["state"] != "open":
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "already_resolved"}
+                existing = database.execute(
+                    "SELECT 1 FROM dispute_evidences"
+                    " WHERE dispute_id = ? AND (evidence_id = ? OR digest = ?)",
+                    (dispute_id, fields["evidenceId"], fields["digest"]),
+                ).fetchone()
+                if existing is not None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "evidence_exists"}
+                # 全库共享一条持久化证据序号：取写锁后取全库最大序号 + 1（空表 1）。
+                next_record = database.execute(
+                    "SELECT COALESCE(MAX(evidence_seq), 0) + 1 AS next_seq"
+                    " FROM dispute_evidences"
+                ).fetchone()
+                evidence_seq = next_record["next_seq"]
+                database.execute(
+                    "INSERT INTO dispute_evidences"
+                    "(evidence_seq, dispute_id, evidence_id, actor_id,"
+                    " observed_at, digest)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        evidence_seq,
+                        dispute_id,
+                        fields["evidenceId"],
+                        actor_id,
+                        fields["observedAt"],
+                        fields["digest"],
+                    ),
+                )
+                payload = {"evidenceSeq": evidence_seq}
+                database.execute(
+                    "INSERT INTO dispute_evidence_idempotency_records"
+                    "(key, dispute_id, request_json, status, response_json, evidence_seq)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        dispute_id,
+                        request_json,
+                        int(HTTPStatus.CREATED),
+                        json.dumps(payload, separators=(",", ":")),
+                        evidence_seq,
+                    ),
+                )
+                database.execute("COMMIT")
+                return HTTPStatus.CREATED, payload
             except BaseException:
                 database.execute("ROLLBACK")
                 raise
