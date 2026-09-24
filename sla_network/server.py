@@ -54,6 +54,8 @@ EVALUATION_QUERY_PARAMS = {"limit", "cursor"}
 SETTLEMENT_QUERY_PARAMS = {"limit", "cursor"}
 LEDGER_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTE_EVENTS_QUERY_PARAMS = {"limit", "cursor"}
+DISPUTE_COLLECTION_QUERY_PARAMS = {"accountId", "state", "limit", "cursor"}
+DISPUTE_COLLECTION_STATES = {"open", "released", "refunded"}
 TELEMETRY_TIME_MAX = 2147483648000
 TELEMETRY_DEFAULT_LIMIT = 50
 TELEMETRY_MAX_LIMIT = 100
@@ -109,6 +111,9 @@ class Handler(BaseHTTPRequestHandler):
                     "time": datetime.now(UTC).isoformat(),
                 },
             )
+            return
+        if target.path == "/v1/disputes":
+            self._get_disputes(target.query)
             return
         telemetry_match = SLA_TELEMETRY_PATH_PATTERN.fullmatch(target.path)
         if telemetry_match is not None:
@@ -765,6 +770,208 @@ class Handler(BaseHTTPRequestHandler):
         self._json(
             HTTPStatus.OK,
             {"events": events, "nextCursor": next_cursor},
+        )
+
+    def _parse_disputes_query(
+        self, query: str
+    ) -> tuple[str, str | None, int, tuple[int, int] | None] | None:
+        parameters: dict[str, list[str]] = {}
+        for key, value in parse_qsl(query, keep_blank_values=True):
+            parameters.setdefault(key, []).append(value)
+        if not set(parameters) <= DISPUTE_COLLECTION_QUERY_PARAMS:
+            return None
+        if any(len(values) != 1 for values in parameters.values()):
+            return None
+        # accountId 必填单值；参数先验校验全部通过后才查账户。
+        if "accountId" not in parameters:
+            return None
+        account_id = parameters["accountId"][0]
+        if PUBLIC_KEY_PATTERN.fullmatch(account_id) is None:
+            return None
+        state: str | None = None
+        if "state" in parameters:
+            state = parameters["state"][0]
+            if state not in DISPUTE_COLLECTION_STATES:
+                return None
+
+        def decimal(text: str) -> int | None:
+            if DECIMAL_PATTERN.fullmatch(text) is None:
+                return None
+            return int(text)
+
+        if "limit" in parameters:
+            limit = decimal(parameters["limit"][0])
+            if limit is None or not 1 <= limit <= TELEMETRY_MAX_LIMIT:
+                return None
+        else:
+            limit = TELEMETRY_DEFAULT_LIMIT
+        cursor: tuple[int, int] | None = None
+        if "cursor" in parameters:
+            parts = parameters["cursor"][0].split(":")
+            if len(parts) != 2:
+                return None
+            cut = decimal(parts[0])
+            last_opened_seq = decimal(parts[1])
+            if cut is None or last_opened_seq is None:
+                return None
+            cursor = (cut, last_opened_seq)
+        return account_id, state, limit, cursor
+
+    def _get_disputes(self, query: str) -> None:
+        parsed = self._parse_disputes_query(query)
+        if parsed is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        account_id, state, limit, cursor = parsed
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN")
+            try:
+                # accountId 只接受已登记机器；外部清算账户不在争议参与方之列。
+                account = database.execute(
+                    "SELECT 1 FROM machines WHERE id = ?", (account_id,)
+                ).fetchone()
+                if account is None:
+                    database.execute("ROLLBACK")
+                    self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                    return
+                # cut 为读事务起点的全库最大争议事件序号（空库为 0），跨争议全局。
+                max_record = database.execute(
+                    "SELECT MAX(event_seq) AS current_max FROM dispute_events"
+                ).fetchone()
+                current_max = max_record["current_max"]
+                if current_max is None:
+                    current_max = 0
+                if cursor is None:
+                    cut = current_max
+                    last_opened_seq = 0
+                else:
+                    cut, last_opened_seq = cursor
+                    if cut > current_max:
+                        database.execute("ROLLBACK")
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                        )
+                        return
+                    # 锚点须是当前账户参与、仍属本快照且满足状态筛选的争议的
+                    # opened 事件本身（opened 是首事件，其序号即 openedEventSeq）。
+                    anchor_sql = (
+                        "SELECT 1 FROM disputes AS d"
+                        " JOIN dispute_events AS o"
+                        " ON o.dispute_id = d.id AND o.type = 'opened'"
+                        " WHERE (d.payer_id = ? OR d.payee_id = ?)"
+                        " AND o.event_seq = ? AND o.event_seq <= ?"
+                    )
+                    anchor_params: list[Any] = [
+                        account_id,
+                        account_id,
+                        last_opened_seq,
+                        cut,
+                    ]
+                    if state is not None:
+                        anchor_sql += (
+                            " AND (SELECT e.type FROM dispute_events AS e"
+                            " WHERE e.dispute_id = d.id AND e.event_seq <= ?"
+                            " ORDER BY e.event_seq DESC LIMIT 1) = ?"
+                        )
+                        anchor_params.extend(
+                            (cut, "opened" if state == "open" else state)
+                        )
+                    anchor = database.execute(
+                        anchor_sql, tuple(anchor_params)
+                    ).fetchone()
+                    if anchor is None:
+                        database.execute("ROLLBACK")
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                        )
+                        return
+                # 只纳入 opened 事件序号不大于 cut 的争议，按 opened 序号升序；
+                # 每条争议的快照状态由 cut 以内最后一项生命周期事件推导
+                # （相关子查询），不读取 disputes.state 当前值。
+                sql = (
+                    "SELECT d.id AS id, d.amount_micros AS amount_micros,"
+                    " d.claimant_id AS claimant_id, d.payer_id AS payer_id,"
+                    " d.payee_id AS payee_id, d.settlement_seq AS settlement_seq,"
+                    " s.sla_id AS sla_id, s.evaluation_seq AS evaluation_seq,"
+                    " s.result AS result,"
+                    " o.event_seq AS opened_event_seq, o.created_at_ms AS opened_at,"
+                    " (SELECT e.type FROM dispute_events AS e"
+                    " WHERE e.dispute_id = d.id AND e.event_seq <= ?"
+                    " ORDER BY e.event_seq DESC LIMIT 1) AS snapshot_state,"
+                    " (SELECT e.event_seq FROM dispute_events AS e"
+                    " WHERE e.dispute_id = d.id AND e.event_seq <= ?"
+                    " ORDER BY e.event_seq DESC LIMIT 1) AS last_event_seq,"
+                    " (SELECT e.created_at_ms FROM dispute_events AS e"
+                    " WHERE e.dispute_id = d.id AND e.event_seq <= ?"
+                    " ORDER BY e.event_seq DESC LIMIT 1) AS last_event_at"
+                    " FROM disputes AS d"
+                    " JOIN settlements AS s ON s.settlement_seq = d.settlement_seq"
+                    " JOIN dispute_events AS o"
+                    " ON o.dispute_id = d.id AND o.type = 'opened'"
+                    " WHERE (d.payer_id = ? OR d.payee_id = ?)"
+                    " AND o.event_seq <= ? AND o.event_seq > ?"
+                )
+                params: list[Any] = [
+                    cut,
+                    cut,
+                    cut,
+                    account_id,
+                    account_id,
+                    cut,
+                    last_opened_seq,
+                ]
+                if state is not None:
+                    sql += (
+                        " AND (SELECT e.type FROM dispute_events AS e"
+                        " WHERE e.dispute_id = d.id AND e.event_seq <= ?"
+                        " ORDER BY e.event_seq DESC LIMIT 1) = ?"
+                    )
+                    params.extend((cut, "opened" if state == "open" else state))
+                sql += " ORDER BY o.event_seq ASC LIMIT ?"
+                params.append(limit + 1)
+                rows = database.execute(sql, tuple(params)).fetchall()
+                database.execute("ROLLBACK")
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+        has_next = len(rows) > limit
+        page = rows[:limit]
+        disputes: list[dict[str, Any]] = []
+        for row in page:
+            snapshot_state = row["snapshot_state"]
+            if snapshot_state == "opened":
+                # 快照内最后一项事件仍为 opened：争议为 open，裁决字段为空。
+                snapshot_state = "open"
+                resolved_event_seq: int | None = None
+                resolved_at: int | None = None
+            else:
+                resolved_event_seq = row["last_event_seq"]
+                resolved_at = row["last_event_at"]
+            disputes.append(
+                {
+                    "id": row["id"],
+                    "state": snapshot_state,
+                    "amount": row["amount_micros"],
+                    "claimantId": row["claimant_id"],
+                    "payerId": row["payer_id"],
+                    "payeeId": row["payee_id"],
+                    "settlementSeq": row["settlement_seq"],
+                    "slaId": row["sla_id"],
+                    "evaluationSeq": row["evaluation_seq"],
+                    "result": row["result"],
+                    "openedEventSeq": row["opened_event_seq"],
+                    "openedAt": row["opened_at"],
+                    "resolvedEventSeq": resolved_event_seq,
+                    "resolvedAt": resolved_at,
+                }
+            )
+        if has_next:
+            next_cursor = f"{cut}:{page[-1]['opened_event_seq']}"
+        else:
+            next_cursor = None
+        self._json(
+            HTTPStatus.OK,
+            {"disputes": disputes, "nextCursor": next_cursor},
         )
 
     def do_POST(self) -> None:  # noqa: N802

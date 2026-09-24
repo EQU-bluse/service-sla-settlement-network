@@ -4221,6 +4221,324 @@ class DisputeTests(unittest.TestCase):
             ["opened", "released"],
         )
 
+    def create_charged_dispute(self, index: int) -> str:
+        sla_id = f"sla-{index}"
+        self.create_sla(sla_id, f"sla-create-{index}")
+        self.activate(sla_id)
+        self.add_event(sla_id, 1, 10)
+        evaluation_seq = self.evaluate(sla_id, f"eval-{index}")
+        if index == 1:
+            self.deposit(self.consumer_id, 100000, "fund-1")
+        settlement = self.settle(sla_id, evaluation_seq, f"settle-{index}")
+        self.assertEqual(settlement["result"], "charged")
+        dispute_id = f"dispute-{index}"
+        status, _ = self.post_dispute(
+            self.dispute_body(
+                settlement["settlementSeq"], id=dispute_id
+            ),
+            key=f"dispute-{index}",
+        )
+        self.assertEqual(status, 201)
+        return dispute_id
+
+    def create_compensated_open_dispute(self, index: int) -> str:
+        sla_id = f"sla-{index}"
+        self.create_sla(sla_id, f"sla-create-{index}")
+        self.activate(sla_id)
+        self.add_event(sla_id, 1, 100)
+        settlement = self.settle(
+            sla_id, self.evaluate(sla_id, f"eval-{index}"), f"settle-{index}"
+        )
+        self.assertEqual(settlement["result"], "compensated")
+        dispute_id = f"dispute-{index}"
+        status, _ = self.post_dispute(
+            self.dispute_body(
+                settlement["settlementSeq"],
+                id=dispute_id,
+                claimantId=self.machine_id,
+            ),
+            key=f"dispute-{index}",
+        )
+        self.assertEqual(status, 201)
+        return dispute_id
+
+    def restart_server(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def test_list_disputes_empty_page_for_registered_account(self) -> None:
+        status, payload = self.get_json(
+            f"/v1/disputes?accountId={self.consumer_id}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(list(payload), ["disputes", "nextCursor"])
+        self.assertEqual(payload, {"disputes": [], "nextCursor": None})
+
+    def test_list_disputes_unregistered_account_is_404(self) -> None:
+        # 格式合法（64 位十六进制）但尚未登记的机器返回 404，而不是空页。
+        status, payload = self.get_json(
+            f"/v1/disputes?accountId={PUBLIC_KEY_C}"
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(payload, {"error": "not_found"})
+        # 登记后即为合法账户，空结果返回 200 空页。
+        self.assertEqual(
+            self.post_json(
+                "/v1/machines", {"publicKey": PUBLIC_KEY_C}, "register-3"
+            )[0],
+            201,
+        )
+        status, payload = self.get_json(
+            f"/v1/disputes?accountId={machine_id(PUBLIC_KEY_C)}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["disputes"], [])
+
+    def test_list_disputes_invalid_query_is_prior_to_account_lookup(self) -> None:
+        unregistered = PUBLIC_KEY_C
+        queries = (
+            "",
+            "?state=open",
+            f"?accountId={unregistered}&limit=0",
+            "?accountId=zz",
+            "?accountId=external:clearing",
+            f"?accountId={self.consumer_id}&state=bogus",
+            f"?accountId={self.consumer_id}&unknown=1",
+            f"?accountId={self.consumer_id}&accountId={self.machine_id}",
+            f"?accountId={self.consumer_id}&state=open&state=released",
+            f"?accountId={self.consumer_id}&limit=0",
+            f"?accountId={self.consumer_id}&limit=101",
+            f"?accountId={self.consumer_id}&limit=01",
+            f"?accountId={self.consumer_id}&limit=x",
+            f"?accountId={self.consumer_id}&cursor=1",
+            f"?accountId={self.consumer_id}&cursor=x:1",
+            f"?accountId={self.consumer_id}&cursor=1:y",
+            f"?accountId={self.consumer_id}&cursor=01:1",
+            f"?accountId={self.consumer_id}&cursor=1:1:1",
+        )
+        for query in queries:
+            status, payload = self.get_json(f"/v1/disputes{query}")
+            self.assertEqual(status, 400, query)
+            self.assertEqual(payload, {"error": "invalid_request"}, query)
+
+    def test_list_disputes_item_shape_order_and_fields(self) -> None:
+        # dispute-1：消费者付款、机器收款的 charged 争议，随后 release。
+        self.create_open_dispute()
+        self.assertEqual(
+            self.post_resolution("dispute-1", {"decision": "release"})[0], 200
+        )
+        # dispute-2：breached 遥测产生 compensated 争议，机器为付款方，保持 open。
+        self.create_compensated_open_dispute(2)
+        # 两笔争议都有消费者参与（一笔付款方、一笔收款方）。
+        status, payload = self.get_json(
+            f"/v1/disputes?accountId={self.consumer_id}"
+        )
+        self.assertEqual(status, 200)
+        self.assertIsNone(payload["nextCursor"])
+        disputes = payload["disputes"]
+        self.assertEqual([item["id"] for item in disputes], ["dispute-1", "dispute-2"])
+        first, second = disputes
+        self.assertEqual(
+            list(first),
+            [
+                "id",
+                "state",
+                "amount",
+                "claimantId",
+                "payerId",
+                "payeeId",
+                "settlementSeq",
+                "slaId",
+                "evaluationSeq",
+                "result",
+                "openedEventSeq",
+                "openedAt",
+                "resolvedEventSeq",
+                "resolvedAt",
+            ],
+        )
+        self.assertEqual(first["state"], "released")
+        self.assertEqual(first["amount"], 1000)
+        self.assertEqual(first["claimantId"], self.consumer_id)
+        self.assertEqual(first["payerId"], self.consumer_id)
+        self.assertEqual(first["payeeId"], self.machine_id)
+        self.assertEqual(first["settlementSeq"], 1)
+        self.assertEqual(first["slaId"], "sla-1")
+        self.assertEqual(first["evaluationSeq"], 1)
+        self.assertEqual(first["result"], "charged")
+        self.assertEqual(first["openedEventSeq"], 1)
+        self.assertGreaterEqual(first["openedAt"], 0)
+        self.assertEqual(first["resolvedEventSeq"], 2)
+        self.assertGreaterEqual(first["resolvedAt"], first["openedAt"])
+        self.assertEqual(second["state"], "open")
+        self.assertEqual(second["payerId"], self.machine_id)
+        self.assertEqual(second["payeeId"], self.consumer_id)
+        self.assertEqual(second["result"], "compensated")
+        self.assertEqual(second["openedEventSeq"], 3)
+        self.assertIsNone(second["resolvedEventSeq"])
+        self.assertIsNone(second["resolvedAt"])
+        # 机器同样参与两笔争议（收款方与付款方各一），顺序一致。
+        status, payload = self.get_json(
+            f"/v1/disputes?accountId={self.machine_id}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["id"] for item in payload["disputes"]],
+            ["dispute-1", "dispute-2"],
+        )
+
+    def test_list_disputes_state_filter_uses_snapshot_state(self) -> None:
+        self.create_open_dispute()
+        self.assertEqual(
+            self.post_resolution("dispute-1", {"decision": "release"})[0], 200
+        )
+        self.create_compensated_open_dispute(2)
+        base = f"/v1/disputes?accountId={self.consumer_id}"
+        for state, expected in (
+            ("open", ["dispute-2"]),
+            ("released", ["dispute-1"]),
+            ("refunded", []),
+        ):
+            status, payload = self.get_json(f"{base}&state={state}")
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                [item["id"] for item in payload["disputes"]], expected, state
+            )
+
+    def test_list_disputes_pagination_limit_and_cursor(self) -> None:
+        for index in (1, 2, 3):
+            self.create_charged_dispute(index)
+        base = f"/v1/disputes?accountId={self.consumer_id}"
+        status, first_page = self.get_json(f"{base}&limit=1")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["id"] for item in first_page["disputes"]], ["dispute-1"]
+        )
+        self.assertEqual(first_page["nextCursor"], "3:1")
+        status, second_page = self.get_json(
+            f"{base}&limit=1&cursor={first_page['nextCursor']}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["id"] for item in second_page["disputes"]], ["dispute-2"]
+        )
+        self.assertEqual(second_page["nextCursor"], "3:2")
+        status, third_page = self.get_json(
+            f"{base}&limit=1&cursor={second_page['nextCursor']}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["id"] for item in third_page["disputes"]], ["dispute-3"]
+        )
+        self.assertIsNone(third_page["nextCursor"])
+
+    def test_list_disputes_cursor_pins_cut_against_new_events(self) -> None:
+        # 先过账 charged 结算让机器有余额，再过账 compensated 结算并争议，
+        # 最后争议 charged 结算：dispute-2 opened=1，dispute-1 opened=2。
+        charged_settlement_seq = self.create_charged_settlement()
+        self.create_compensated_open_dispute(2)
+        self.assertEqual(
+            self.post_dispute(self.dispute_body(charged_settlement_seq))[0], 201
+        )
+        status, first_page = self.get_json(
+            f"/v1/disputes?accountId={self.consumer_id}&limit=1"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(first_page["disputes"][0]["id"], "dispute-2")
+        self.assertEqual(first_page["disputes"][0]["state"], "open")
+        self.assertEqual(first_page["nextCursor"], "2:1")
+        # 裁决 dispute-1 推进事件序号 3，再新增争议 opened 序号 4。
+        self.assertEqual(
+            self.post_resolution("dispute-1", {"decision": "release"})[0], 200
+        )
+        self.create_charged_dispute(3)
+        # 旧 cut=2 的续页只能看到锚点之后、快照内原有的 dispute-1（仍 open）。
+        status, continuation = self.get_json(
+            f"/v1/disputes?accountId={self.consumer_id}"
+            f"&cursor={first_page['nextCursor']}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [(item["id"], item["state"]) for item in continuation["disputes"]],
+            [("dispute-1", "open")],
+        )
+        self.assertIsNone(continuation["nextCursor"])
+        # 全新首页取新 cut：dispute-1 快照状态已为 released，新争议可见。
+        status, fresh = self.get_json(
+            f"/v1/disputes?accountId={self.consumer_id}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [
+                (item["id"], item["state"], item["resolvedEventSeq"])
+                for item in fresh["disputes"]
+            ],
+            [
+                ("dispute-2", "open", None),
+                ("dispute-1", "released", 3),
+                ("dispute-3", "open", None),
+            ],
+        )
+
+    def test_list_disputes_cursor_survives_restart(self) -> None:
+        for index in (1, 2):
+            self.create_charged_dispute(index)
+        base = f"/v1/disputes?accountId={self.consumer_id}"
+        _, first_page = self.get_json(f"{base}&limit=1")
+        self.assertEqual(
+            [item["id"] for item in first_page["disputes"]], ["dispute-1"]
+        )
+        self.restart_server()
+        status, second_page = self.get_json(
+            f"{base}&limit=1&cursor={first_page['nextCursor']}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["id"] for item in second_page["disputes"]], ["dispute-2"]
+        )
+        self.assertIsNone(second_page["nextCursor"])
+
+    def test_list_disputes_bad_cursor(self) -> None:
+        self.create_open_dispute()
+        self.assertEqual(
+            self.post_resolution("dispute-1", {"decision": "release"})[0], 200
+        )
+        self.create_compensated_open_dispute(2)
+        base = f"/v1/disputes?accountId={self.consumer_id}"
+        # cut 超前当前全库最大争议事件序号。
+        status, payload = self.get_json(f"{base}&cursor=999:1")
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "invalid_request"})
+        # 锚点序号不存在。
+        status, payload = self.get_json(f"{base}&cursor=3:999")
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "invalid_request"})
+        # 序号 2 是裁决事件而非任何争议的 opened 事件，不能作锚点。
+        status, payload = self.get_json(f"{base}&cursor=3:2")
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "invalid_request"})
+        # 锚点争议在旧 cut 内为 open，与 state=released 筛选不符。
+        status, payload = self.get_json(f"{base}&state=released&cursor=1:1")
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "invalid_request"})
+        # 已登记但未参与争议的第三方机器不能用别人的锚点续页。
+        self.assertEqual(
+            self.post_json(
+                "/v1/machines", {"publicKey": PUBLIC_KEY_C}, "register-3"
+            )[0],
+            201,
+        )
+        status, payload = self.get_json(
+            f"/v1/disputes?accountId={machine_id(PUBLIC_KEY_C)}&cursor=3:1"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "invalid_request"})
+
 
 class DisputeEventMigrationTests(unittest.TestCase):
     def setUp(self) -> None:
