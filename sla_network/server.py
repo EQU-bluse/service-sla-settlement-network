@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
 from .database import connect
+from .ed25519 import verify as ed25519_verify
 
 IDEMPOTENCY_KEY_PATTERN = re.compile(r"[A-Za-z0-9-]{1,64}")
 PUBLIC_KEY_PATTERN = re.compile(r"[0-9a-f]{64}")
@@ -28,6 +29,7 @@ DISPUTE_PATH_PATTERN = re.compile(r"/v1/disputes/([^/]+)")
 DISPUTE_EVENTS_PATH_PATTERN = re.compile(r"/v1/disputes/([^/]+)/events")
 DISPUTE_EVIDENCE_PATH_PATTERN = re.compile(r"/v1/disputes/([^/]+)/evidence")
 DISPUTE_RESOLUTION_PATH_PATTERN = re.compile(r"/v1/disputes/([^/]+)/resolution")
+EVIDENCE_PROOFS_PATH_PATTERN = re.compile(r"/v1/evidence/([^/]+)/proofs")
 CAPABILITY_FIELDS = {"expectedVersion", "name", "protocol", "region", "unit", "capacity"}
 SLA_TEMPLATE_FIELDS = {
     "id",
@@ -46,6 +48,7 @@ SETTLEMENT_FIELDS = {"slaId", "evaluationSeq"}
 DISPUTE_FIELDS = {"id", "settlementSeq", "claimantId"}
 RESOLUTION_FIELDS = {"decision"}
 EVIDENCE_FIELDS = {"evidenceId", "actorId", "observedAt", "digest"}
+EVIDENCE_PROOF_FIELDS = {"evidenceSeq", "actorId", "signature"}
 DISPUTE_DECISIONS = {"release", "refund"}
 DISPUTABLE_RESULTS = {"charged", "compensated"}
 AMOUNT_CAP_MICROS = 9_000_000_000_000_000
@@ -144,6 +147,12 @@ class Handler(BaseHTTPRequestHandler):
         if dispute_evidence_match is not None:
             self._get_dispute_evidence(
                 dispute_evidence_match.group(1), target.query
+            )
+            return
+        evidence_proofs_match = EVIDENCE_PROOFS_PATH_PATTERN.fullmatch(target.path)
+        if evidence_proofs_match is not None:
+            self._get_evidence_proofs(
+                evidence_proofs_match.group(1), target.query
             )
             return
         dispute_match = DISPUTE_PATH_PATTERN.fullmatch(target.path)
@@ -1080,6 +1089,9 @@ class Handler(BaseHTTPRequestHandler):
         resolution_match = DISPUTE_RESOLUTION_PATH_PATTERN.fullmatch(self.path)
         if resolution_match is not None:
             self._resolve_dispute(resolution_match.group(1))
+            return
+        if urlsplit(self.path).path == "/v1/evidence-proofs":
+            self._create_evidence_proof()
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
@@ -2383,6 +2395,248 @@ class Handler(BaseHTTPRequestHandler):
             except BaseException:
                 database.execute("ROLLBACK")
                 raise
+
+    def _create_evidence_proof(self) -> None:
+        idempotency_key = self.headers.get("Idempotency-Key")
+        if (
+            idempotency_key is None
+            or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None
+        ):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # POST 证明不接受任何查询参数：参数校验先于体校验与资源查询。
+        if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        fields = self._read_evidence_proof_object()
+        if fields is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        status, payload = self._apply_evidence_proof(idempotency_key, fields)
+        self._json(status, payload)
+
+    def _read_evidence_proof_object(self) -> dict[str, Any] | None:
+        parsed = self._read_json_object()
+        if parsed is None or set(parsed) != EVIDENCE_PROOF_FIELDS:
+            return None
+        evidence_seq = parsed["evidenceSeq"]
+        if not isinstance(evidence_seq, int) or isinstance(evidence_seq, bool):
+            return None
+        if evidence_seq < 1:
+            return None
+        actor_id = parsed["actorId"]
+        if (
+            not isinstance(actor_id, str)
+            or PUBLIC_KEY_PATTERN.fullmatch(actor_id) is None
+        ):
+            return None
+        # 128 位小写十六进制签名，长度恰为 128 个字符。
+        signature = parsed["signature"]
+        if not isinstance(signature, str) or len(signature) != 128:
+            return None
+        if not all(char in "0123456789abcdef" for char in signature):
+            return None
+        return parsed
+
+    def _apply_evidence_proof(
+        self, idempotency_key: str, fields: dict[str, Any]
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+        evidence_seq = fields["evidenceSeq"]
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                # 幂等判定先于一切资源查询：同键异证据、签名者或签名均冲突。
+                record = database.execute(
+                    "SELECT request_json, status, response_json"
+                    " FROM dispute_evidence_proof_idempotency_records WHERE key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    if record["request_json"] == request_json:
+                        return HTTPStatus(record["status"]), json.loads(
+                            record["response_json"]
+                        )
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                evidence = None
+                if evidence_seq <= INT64_MAX:
+                    evidence = database.execute(
+                        "SELECT e.dispute_id AS dispute_id, e.digest AS digest,"
+                        " d.payer_id AS payer_id, d.payee_id AS payee_id,"
+                        " d.state AS state"
+                        " FROM dispute_evidences AS e"
+                        " JOIN disputes AS d ON d.id = e.dispute_id"
+                        " WHERE e.evidence_seq = ?",
+                        (evidence_seq,),
+                    ).fetchone()
+                if evidence is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                actor_id = fields["actorId"]
+                if actor_id not in (evidence["payer_id"], evidence["payee_id"]):
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
+                if evidence["state"] != "open":
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "already_resolved"}
+                # 用登记的 publicKey 按 RFC 8032 验证 Ed25519 签名；
+                # 参与方必为已登记机器，查不到公钥等同验签失败。
+                machine = database.execute(
+                    "SELECT public_key FROM machines WHERE id = ?",
+                    (actor_id,),
+                ).fetchone()
+                signature_valid = False
+                if machine is not None:
+                    message = (
+                        f"proof-v1\n{evidence['dispute_id']}\n{evidence_seq}\n"
+                        f"{evidence['digest']}\n{actor_id}"
+                    ).encode("utf-8")
+                    signature_valid = ed25519_verify(
+                        bytes.fromhex(machine["public_key"]),
+                        message,
+                        bytes.fromhex(fields["signature"]),
+                    )
+                if not signature_valid:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "invalid_signature"}
+                # 每条证据每个签名者至多一条证明：写事务串行下复查 + 唯一约束，
+                # 判定位于验签之后，异键并发至多一项成功。
+                existing = database.execute(
+                    "SELECT 1 FROM dispute_evidence_proofs"
+                    " WHERE evidence_seq = ? AND actor_id = ?",
+                    (evidence_seq, actor_id),
+                ).fetchone()
+                if existing is not None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "proof_exists"}
+                # 全库唯一持久递增证明序号：取写锁后取最大序号 + 1（空表 1）。
+                next_record = database.execute(
+                    "SELECT COALESCE(MAX(proof_seq), 0) + 1 AS next_seq"
+                    " FROM dispute_evidence_proofs"
+                ).fetchone()
+                proof_seq = next_record["next_seq"]
+                created_at_ms = int(datetime.now(UTC).timestamp() * 1000)
+                database.execute(
+                    "INSERT INTO dispute_evidence_proofs"
+                    "(proof_seq, evidence_seq, actor_id, signature,"
+                    " verified, created_at_ms)"
+                    " VALUES (?, ?, ?, ?, 1, ?)",
+                    (
+                        proof_seq,
+                        evidence_seq,
+                        actor_id,
+                        fields["signature"],
+                        created_at_ms,
+                    ),
+                )
+                payload = {
+                    "proofSeq": proof_seq,
+                    "verified": True,
+                    "createdAt": created_at_ms,
+                }
+                database.execute(
+                    "INSERT INTO dispute_evidence_proof_idempotency_records"
+                    "(key, request_json, status, response_json)"
+                    " VALUES (?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        request_json,
+                        int(HTTPStatus.CREATED),
+                        json.dumps(payload, separators=(",", ":")),
+                    ),
+                )
+                database.execute("COMMIT")
+                return HTTPStatus.CREATED, payload
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+
+    def _get_evidence_proofs(self, evidence_seq_text: str, query: str) -> None:
+        # 查询参数、错误次序、cut:lastSeq 游标与并发快照语义均沿用评估历史查询。
+        parsed = self._parse_evaluation_query(query, DISPUTE_EVIDENCE_QUERY_PARAMS)
+        if parsed is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        limit, cursor = parsed
+        # 证据序号非法（非无前导零十进制正整数）按不存在处理。
+        evidence_seq: int | None = None
+        if DECIMAL_PATTERN.fullmatch(evidence_seq_text) is not None:
+            value = int(evidence_seq_text)
+            if 1 <= value <= INT64_MAX:
+                evidence_seq = value
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN")
+            try:
+                if evidence_seq is None or database.execute(
+                    "SELECT 1 FROM dispute_evidences WHERE evidence_seq = ?",
+                    (evidence_seq,),
+                ).fetchone() is None:
+                    database.execute("ROLLBACK")
+                    self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                    return
+                # cut 为读事务起点的全库最大证明序号（空库为 0），跨证据全局。
+                max_record = database.execute(
+                    "SELECT MAX(proof_seq) AS current_max"
+                    " FROM dispute_evidence_proofs"
+                ).fetchone()
+                current_max = max_record["current_max"]
+                if current_max is None:
+                    current_max = 0
+                if cursor is None:
+                    cut = current_max
+                    last_seq = 0
+                else:
+                    cut, last_seq = cursor
+                    if cut > current_max:
+                        database.execute("ROLLBACK")
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                        )
+                        return
+                    anchor = database.execute(
+                        "SELECT 1 FROM dispute_evidence_proofs"
+                        " WHERE evidence_seq = ? AND proof_seq = ? AND proof_seq <= ?",
+                        (evidence_seq, last_seq, cut),
+                    ).fetchone()
+                    if anchor is None:
+                        database.execute("ROLLBACK")
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                        )
+                        return
+                rows = database.execute(
+                    "SELECT proof_seq, actor_id, signature, verified, created_at_ms"
+                    " FROM dispute_evidence_proofs"
+                    " WHERE evidence_seq = ? AND proof_seq <= ? AND proof_seq > ?"
+                    " ORDER BY proof_seq ASC"
+                    " LIMIT ?",
+                    (evidence_seq, cut, last_seq, limit + 1),
+                ).fetchall()
+                database.execute("ROLLBACK")
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+        has_next = len(rows) > limit
+        page = rows[:limit]
+        proofs = [
+            {
+                "proofSeq": row["proof_seq"],
+                "actorId": row["actor_id"],
+                "signature": row["signature"],
+                "verified": row["verified"] == 1,
+                "createdAt": row["created_at_ms"],
+            }
+            for row in page
+        ]
+        if has_next:
+            next_cursor = f"{cut}:{page[-1]['proof_seq']}"
+        else:
+            next_cursor = None
+        self._json(
+            HTTPStatus.OK,
+            {"proofs": proofs, "nextCursor": next_cursor},
+        )
 
     def _resolve_dispute(self, dispute_id: str) -> None:
         idempotency_key = self.headers.get("Idempotency-Key")
