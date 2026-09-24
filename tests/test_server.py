@@ -4537,5 +4537,417 @@ class DisputeEventMigrationTests(unittest.TestCase):
         )
 
 
+class DisputeCollectionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.machine_id = machine_id(PUBLIC_KEY_A)
+        self.consumer_id = machine_id(PUBLIC_KEY_B)
+        for key, public_key in (("register-1", PUBLIC_KEY_A), ("register-2", PUBLIC_KEY_B)):
+            status, _ = self.post_json(
+                "/v1/machines", {"publicKey": public_key}, key
+            )
+            self.assertEqual(status, 201)
+        status, _ = self.post_json(
+            f"/v1/machines/{self.machine_id}/capabilities",
+            {
+                "expectedVersion": 0,
+                "name": "pump-01",
+                "protocol": "mqtt",
+                "region": "cn",
+                "unit": "call",
+                "capacity": 10,
+            },
+            "cap-1",
+        )
+        self.assertEqual(status, 201)
+        status, _ = self.post_json(
+            "/v1/sla-templates",
+            {
+                "id": "tpl-1",
+                "machineId": self.machine_id,
+                "capabilityVersion": 1,
+                "priceMicros": 1000,
+                "maxLatencyMs": 50,
+            },
+            "tpl-1",
+        )
+        self.assertEqual(status, 201)
+        current = int(time.time())
+        self.start = current - 10
+        self.end = current + 3600
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temporary.cleanup()
+
+    def restart(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}{path}"
+
+    def post_json(
+        self, path: str, payload: object, key: str | None
+    ) -> tuple[int, bytes]:
+        data = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+        request = Request(self.url(path), data=data, method="POST")
+        if key is not None:
+            request.add_header("Idempotency-Key", key)
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def get_json(self, path: str) -> tuple[int, dict]:
+        try:
+            with urlopen(self.url(path), timeout=5) as response:
+                return response.status, json.load(response)
+        except HTTPError as error:
+            return error.code, json.load(error)
+
+    def get_collection(self, query: str) -> tuple[int, dict]:
+        return self.get_json(f"/v1/disputes?{query}")
+
+    def create_dispute(self, index: int) -> str:
+        sla_id = f"sla-{index}"
+        status, _ = self.post_json(
+            "/v1/slas",
+            {
+                "id": sla_id,
+                "templateId": "tpl-1",
+                "consumerId": self.consumer_id,
+                "start": self.start,
+                "end": self.end,
+            },
+            f"sla-create-{index}",
+        )
+        self.assertEqual(status, 201)
+        for party_index, (party, actor) in enumerate(
+            (("producer", self.machine_id), ("consumer", self.consumer_id))
+        ):
+            status, _ = self.post_json(
+                f"/v1/slas/{sla_id}/confirmations",
+                {"party": party, "actorId": actor},
+                f"conf-{index}-{party_index}",
+            )
+            self.assertEqual(status, 200)
+        event_id = f"evt-{index}"
+        timestamp = self.start * 1000 + 1
+        message = f"{sla_id}\n{event_id}\n{timestamp}\n10\n{self.machine_id}"
+        status, _ = self.post_json(
+            f"/v1/slas/{sla_id}/telemetry",
+            {
+                "eventId": event_id,
+                "timestamp": timestamp,
+                "latencyMs": 10,
+                "digest": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+            },
+            f"tel-{index}",
+        )
+        self.assertEqual(status, 201)
+        status, body = self.post_json(
+            f"/v1/slas/{sla_id}/evaluations",
+            {"from": self.start * 1000, "to": self.end * 1000},
+            f"eval-{index}",
+        )
+        self.assertEqual(status, 201)
+        evaluation_seq = json.loads(body)["evaluationSeq"]
+        status, _ = self.post_json(
+            f"/v1/funds/{self.consumer_id}",
+            {"amountMicros": 100000, "reference": f"ref-{index}"},
+            f"fund-{index}",
+        )
+        self.assertEqual(status, 201)
+        status, body = self.post_json(
+            "/v1/settlements",
+            {"slaId": sla_id, "evaluationSeq": evaluation_seq},
+            f"settle-{index}",
+        )
+        self.assertEqual(status, 201)
+        settlement_seq = json.loads(body)["settlementSeq"]
+        dispute_id = f"dispute-{index}"
+        status, _ = self.post_json(
+            "/v1/disputes",
+            {
+                "id": dispute_id,
+                "settlementSeq": settlement_seq,
+                "claimantId": self.consumer_id,
+            },
+            f"dispute-create-{index}",
+        )
+        self.assertEqual(status, 201)
+        return dispute_id
+
+    def resolve(self, dispute_id: str, decision: str, key: str) -> None:
+        status, _ = self.post_json(
+            f"/v1/disputes/{dispute_id}/resolution", {"decision": decision}, key
+        )
+        self.assertEqual(status, 200)
+
+    def test_missing_account_id_is_400(self) -> None:
+        status, payload = self.get_json("/v1/disputes")
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "invalid_request"})
+        status, payload = self.get_collection("limit=10")
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "invalid_request"})
+
+    def test_unknown_and_duplicate_params_are_400(self) -> None:
+        status, payload = self.get_collection(
+            f"accountId={self.consumer_id}&foo=1"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "invalid_request"})
+        status, payload = self.get_collection(
+            f"accountId={self.consumer_id}&accountId={self.machine_id}"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "invalid_request"})
+        status, payload = self.get_collection(
+            f"accountId={self.consumer_id}&state=open&state=open"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "invalid_request"})
+
+    def test_invalid_account_id_format_is_400(self) -> None:
+        for account in ("not-a-machine", "external:clearing", ""):
+            status, payload = self.get_collection(f"accountId={account}")
+            self.assertEqual(status, 400)
+            self.assertEqual(payload, {"error": "invalid_request"})
+
+    def test_unregistered_machine_is_404(self) -> None:
+        status, payload = self.get_collection(f"accountId={machine_id(PUBLIC_KEY_C)}")
+        self.assertEqual(status, 404)
+        self.assertEqual(payload, {"error": "not_found"})
+
+    def test_invalid_state_is_400(self) -> None:
+        status, payload = self.get_collection(
+            f"accountId={self.consumer_id}&state=pending"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "invalid_request"})
+
+    def test_invalid_limit_and_cursor_are_400(self) -> None:
+        for query in (
+            "limit=0",
+            "limit=101",
+            "limit=050",
+            "limit=abc",
+            "cursor=1",
+            "cursor=1:2:3",
+            "cursor=01:2",
+            "cursor=2:01",
+            "cursor=a:2",
+        ):
+            status, payload = self.get_collection(
+                f"accountId={self.consumer_id}&{query}"
+            )
+            self.assertEqual(status, 400, query)
+            self.assertEqual(payload, {"error": "invalid_request"})
+
+    def test_account_without_disputes_returns_empty_page(self) -> None:
+        status, payload = self.get_collection(f"accountId={self.consumer_id}")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"disputes": [], "nextCursor": None})
+
+    def test_lists_disputes_for_payer_and_payee_in_key_order(self) -> None:
+        self.create_dispute(1)
+        self.create_dispute(2)
+        status, payload = self.get_collection(f"accountId={self.consumer_id}")
+        self.assertEqual(status, 200)
+        self.assertEqual(list(payload), ["disputes", "nextCursor"])
+        self.assertIsNone(payload["nextCursor"])
+        self.assertEqual(len(payload["disputes"]), 2)
+        first = payload["disputes"][0]
+        self.assertEqual(
+            list(first),
+            [
+                "id",
+                "state",
+                "amount",
+                "claimantId",
+                "payerId",
+                "payeeId",
+                "settlementSeq",
+                "slaId",
+                "evaluationSeq",
+                "result",
+                "openedEventSeq",
+                "openedAt",
+                "resolvedEventSeq",
+                "resolvedAt",
+            ],
+        )
+        self.assertEqual(first["id"], "dispute-1")
+        self.assertEqual(first["state"], "open")
+        self.assertEqual(first["amount"], 1000)
+        self.assertEqual(first["claimantId"], self.consumer_id)
+        self.assertEqual(first["payerId"], self.consumer_id)
+        self.assertEqual(first["payeeId"], self.machine_id)
+        self.assertEqual(first["result"], "charged")
+        self.assertEqual(first["openedEventSeq"], 1)
+        self.assertGreaterEqual(first["openedAt"], 0)
+        self.assertIsNone(first["resolvedEventSeq"])
+        self.assertIsNone(first["resolvedAt"])
+        second = payload["disputes"][1]
+        self.assertEqual(second["id"], "dispute-2")
+        self.assertEqual(second["openedEventSeq"], 2)
+        # 收款方视角看到同一集合。
+        status, payee_payload = self.get_collection(f"accountId={self.machine_id}")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["id"] for item in payee_payload["disputes"]],
+            ["dispute-1", "dispute-2"],
+        )
+
+    def test_uninvolved_machine_gets_empty_page(self) -> None:
+        self.create_dispute(1)
+        status, _ = self.post_json(
+            "/v1/machines", {"publicKey": PUBLIC_KEY_C}, "register-3"
+        )
+        self.assertEqual(status, 201)
+        status, payload = self.get_collection(f"accountId={machine_id(PUBLIC_KEY_C)}")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"disputes": [], "nextCursor": None})
+
+    def test_resolved_dispute_reports_resolution_fields(self) -> None:
+        self.create_dispute(1)
+        self.resolve("dispute-1", "release", "resolve-1")
+        status, payload = self.get_collection(f"accountId={self.consumer_id}")
+        self.assertEqual(status, 200)
+        (item,) = payload["disputes"]
+        self.assertEqual(item["state"], "released")
+        self.assertEqual(item["openedEventSeq"], 1)
+        self.assertEqual(item["resolvedEventSeq"], 2)
+        self.assertGreaterEqual(item["resolvedAt"], item["openedAt"])
+
+    def test_state_filter_narrows_snapshot_states(self) -> None:
+        self.create_dispute(1)
+        self.create_dispute(2)
+        self.resolve("dispute-2", "release", "resolve-2")
+        status, payload = self.get_collection(
+            f"accountId={self.consumer_id}&state=open"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual([item["id"] for item in payload["disputes"]], ["dispute-1"])
+        status, payload = self.get_collection(
+            f"accountId={self.consumer_id}&state=released"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual([item["id"] for item in payload["disputes"]], ["dispute-2"])
+        status, payload = self.get_collection(
+            f"accountId={self.consumer_id}&state=refunded"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"disputes": [], "nextCursor": None})
+
+    def test_pagination_uses_stable_snapshot(self) -> None:
+        self.create_dispute(1)
+        self.create_dispute(2)
+        status, first_page = self.get_collection(
+            f"accountId={self.consumer_id}&limit=1"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual([item["id"] for item in first_page["disputes"]], ["dispute-1"])
+        cursor = first_page["nextCursor"]
+        self.assertEqual(cursor, "2:1")
+        # 首页之后的裁决与新增争议不进入旧快照。
+        self.resolve("dispute-2", "release", "resolve-2")
+        self.create_dispute(3)
+        status, second_page = self.get_collection(
+            f"accountId={self.consumer_id}&limit=1&cursor={cursor}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual([item["id"] for item in second_page["disputes"]], ["dispute-2"])
+        self.assertEqual(second_page["disputes"][0]["state"], "open")
+        self.assertIsNone(second_page["disputes"][0]["resolvedEventSeq"])
+        self.assertIsNone(second_page["nextCursor"])
+        # 全新首页取新 cut，反映裁决与新增争议。
+        status, fresh = self.get_collection(f"accountId={self.consumer_id}")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [(item["id"], item["state"]) for item in fresh["disputes"]],
+            [("dispute-1", "open"), ("dispute-2", "released"), ("dispute-3", "open")],
+        )
+
+    def test_state_filter_applies_to_snapshot_not_current_state(self) -> None:
+        self.create_dispute(1)
+        status, first_page = self.get_collection(
+            f"accountId={self.consumer_id}&state=open&limit=1"
+        )
+        self.assertEqual(status, 200)
+        cursor = first_page["nextCursor"]
+        self.assertIsNone(cursor)
+        self.create_dispute(2)
+        self.resolve("dispute-1", "release", "resolve-1")
+        status, payload = self.get_collection(
+            f"accountId={self.consumer_id}&state=open"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual([item["id"] for item in payload["disputes"]], ["dispute-2"])
+
+    def test_cursor_ahead_of_cut_is_400(self) -> None:
+        self.create_dispute(1)
+        status, payload = self.get_collection(
+            f"accountId={self.consumer_id}&cursor=99:1"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "invalid_request"})
+
+    def test_cursor_anchor_outside_filter_is_400(self) -> None:
+        self.create_dispute(1)
+        self.create_dispute(2)
+        status, first_page = self.get_collection(
+            f"accountId={self.consumer_id}&limit=1"
+        )
+        self.assertEqual(status, 200)
+        cursor = first_page["nextCursor"]
+        # 锚点争议在快照中不为 released，带状态筛选重放锚点被拒绝。
+        status, payload = self.get_collection(
+            f"accountId={self.consumer_id}&state=released&cursor={cursor}"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "invalid_request"})
+        # 锚点不属于其他账户的筛选结果。
+        status, _ = self.post_json(
+            "/v1/machines", {"publicKey": PUBLIC_KEY_C}, "register-3"
+        )
+        self.assertEqual(status, 201)
+        status, payload = self.get_collection(
+            f"accountId={machine_id(PUBLIC_KEY_C)}&cursor={cursor}"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "invalid_request"})
+
+    def test_cursor_survives_restart(self) -> None:
+        self.create_dispute(1)
+        self.create_dispute(2)
+        status, first_page = self.get_collection(
+            f"accountId={self.consumer_id}&limit=1"
+        )
+        self.assertEqual(status, 200)
+        cursor = first_page["nextCursor"]
+        self.restart()
+        status, second_page = self.get_collection(
+            f"accountId={self.consumer_id}&limit=1&cursor={cursor}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual([item["id"] for item in second_page["disputes"]], ["dispute-2"])
+        self.assertIsNone(second_page["nextCursor"])
+
+
 if __name__ == "__main__":
     unittest.main()
