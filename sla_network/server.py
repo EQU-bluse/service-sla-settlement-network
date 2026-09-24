@@ -21,6 +21,7 @@ SLA_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)")
 SLA_CONFIRMATIONS_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/confirmations")
 SLA_TELEMETRY_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/telemetry")
 SLA_EVALUATIONS_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/evaluations")
+FUNDS_PATH_PATTERN = re.compile(r"/v1/funds/([^/]+)")
 CAPABILITY_FIELDS = {"expectedVersion", "name", "protocol", "region", "unit", "capacity"}
 SLA_TEMPLATE_FIELDS = {
     "id",
@@ -34,6 +35,10 @@ CONFIRMATION_FIELDS = {"party", "actorId"}
 CONFIRMATION_PARTIES = {"producer", "consumer"}
 TELEMETRY_FIELDS = {"eventId", "timestamp", "latencyMs", "digest"}
 EVALUATION_FIELDS = {"from", "to"}
+FUND_FIELDS = {"amountMicros", "reference"}
+SETTLEMENT_FIELDS = {"slaId", "evaluationSeq"}
+AMOUNT_MAX = 9_000_000_000_000_000  # 九千万亿（9*10^15）
+EXTERNAL_CLEARING_ACCOUNT = "external-clearing"
 TELEMETRY_QUERY_PARAMS = {"from", "to", "limit", "cursor"}
 EVALUATION_QUERY_PARAMS = {"limit", "cursor"}
 TELEMETRY_TIME_MAX = 2147483648000
@@ -454,6 +459,13 @@ class Handler(BaseHTTPRequestHandler):
         evaluations_match = SLA_EVALUATIONS_PATH_PATTERN.fullmatch(self.path)
         if evaluations_match is not None:
             self._evaluate_sla(evaluations_match.group(1))
+            return
+        if self.path == "/v1/settlements":
+            self._create_settlement()
+            return
+        funds_match = FUNDS_PATH_PATTERN.fullmatch(self.path)
+        if funds_match is not None:
+            self._deposit_funds(funds_match.group(1))
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
@@ -1189,6 +1201,300 @@ class Handler(BaseHTTPRequestHandler):
                         json.dumps(payload, separators=(",", ":")),
                         evaluation_seq,
                         created_at_ms,
+                    ),
+                )
+                database.execute("COMMIT")
+                return HTTPStatus.CREATED, payload
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+
+    def _deposit_funds(self, machine_id: str) -> None:
+        idempotency_key = self.headers.get("Idempotency-Key")
+        if idempotency_key is None or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        fields = self._read_funds_object()
+        if fields is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        status, payload = self._apply_funds_deposit(idempotency_key, machine_id, fields)
+        self._json(status, payload)
+
+    def _read_funds_object(self) -> dict[str, Any] | None:
+        parsed = self._read_json_object()
+        if parsed is None or set(parsed) != FUND_FIELDS:
+            return None
+        if not _bounded_int(parsed["amountMicros"], 1, AMOUNT_MAX):
+            return None
+        reference = parsed["reference"]
+        if not isinstance(reference, str) or TEMPLATE_ID_PATTERN.fullmatch(reference) is None:
+            return None
+        return parsed
+
+    def _apply_funds_deposit(
+        self, idempotency_key: str, machine_id: str, fields: dict[str, Any]
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                record = database.execute(
+                    "SELECT machine_id, request_json, status, response_json"
+                    " FROM fund_deposit_idempotency_records WHERE key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    if record["machine_id"] == machine_id and record["request_json"] == request_json:
+                        return HTTPStatus(record["status"]), json.loads(record["response_json"])
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                machine = database.execute(
+                    "SELECT id FROM machines WHERE id = ?", (machine_id,)
+                ).fetchone()
+                if machine is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                account = database.execute(
+                    "SELECT balance_micros FROM fund_accounts WHERE machine_id = ?",
+                    (machine_id,),
+                ).fetchone()
+                current_balance = account["balance_micros"] if account is not None else 0
+                amount = fields["amountMicros"]
+                new_balance = current_balance + amount
+                next_record = database.execute(
+                    "SELECT COALESCE(MAX(deposit_seq), 0) + 1 AS next_seq"
+                    " FROM fund_deposits"
+                ).fetchone()
+                deposit_seq = next_record["next_seq"]
+                created_at_ms = int(datetime.now(UTC).timestamp() * 1000)
+                database.execute(
+                    "INSERT INTO fund_accounts(machine_id, balance_micros) VALUES (?, ?)"
+                    " ON CONFLICT(machine_id) DO UPDATE SET"
+                    " balance_micros = excluded.balance_micros",
+                    (machine_id, new_balance),
+                )
+                database.execute(
+                    "INSERT INTO fund_deposits"
+                    "(deposit_seq, machine_id, amount_micros, reference,"
+                    " balance_after_micros, created_at_ms)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        deposit_seq,
+                        machine_id,
+                        amount,
+                        fields["reference"],
+                        new_balance,
+                        created_at_ms,
+                    ),
+                )
+                # 双重记账：机器账户入账等额，外部清算账户反向出账。
+                database.execute(
+                    "INSERT INTO ledger_entries"
+                    "(account_id, amount_micros, kind, ref_seq) VALUES (?, ?, 'deposit', ?)",
+                    (machine_id, amount, deposit_seq),
+                )
+                database.execute(
+                    "INSERT INTO ledger_entries"
+                    "(account_id, amount_micros, kind, ref_seq) VALUES (?, ?, 'deposit', ?)",
+                    (EXTERNAL_CLEARING_ACCOUNT, -amount, deposit_seq),
+                )
+                payload = {"depositSeq": deposit_seq, "balanceMicros": new_balance}
+                database.execute(
+                    "INSERT INTO fund_deposit_idempotency_records"
+                    "(key, machine_id, request_json, status, response_json)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        machine_id,
+                        request_json,
+                        int(HTTPStatus.CREATED),
+                        json.dumps(payload, separators=(",", ":")),
+                    ),
+                )
+                database.execute("COMMIT")
+                return HTTPStatus.CREATED, payload
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+
+    def _create_settlement(self) -> None:
+        idempotency_key = self.headers.get("Idempotency-Key")
+        if idempotency_key is None or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        fields = self._read_settlement_object()
+        if fields is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        status, payload = self._apply_settlement(idempotency_key, fields)
+        self._json(status, payload)
+
+    def _read_settlement_object(self) -> dict[str, Any] | None:
+        parsed = self._read_json_object()
+        if parsed is None or set(parsed) != SETTLEMENT_FIELDS:
+            return None
+        sla_id = parsed["slaId"]
+        if not isinstance(sla_id, str) or TEMPLATE_ID_PATTERN.fullmatch(sla_id) is None:
+            return None
+        evaluation_seq = parsed["evaluationSeq"]
+        if not isinstance(evaluation_seq, int) or isinstance(evaluation_seq, bool):
+            return None
+        if evaluation_seq <= 0:
+            return None
+        return parsed
+
+    def _apply_settlement(
+        self, idempotency_key: str, fields: dict[str, Any]
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                record = database.execute(
+                    "SELECT request_json, status, response_json"
+                    " FROM settlement_idempotency_records WHERE key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    if record["request_json"] == request_json:
+                        return HTTPStatus(record["status"]), json.loads(record["response_json"])
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                sla_id = fields["slaId"]
+                evaluation_seq = fields["evaluationSeq"]
+                sla = database.execute(
+                    "SELECT machine_id, consumer_id, price_micros, state"
+                    " FROM slas WHERE id = ?",
+                    (sla_id,),
+                ).fetchone()
+                if sla is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                if sla["state"] != "active":
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                evaluation = None
+                if evaluation_seq <= 9223372036854775807:
+                    evaluation = database.execute(
+                        "SELECT sla_id, response_json"
+                        " FROM sla_evaluation_idempotency_records"
+                        " WHERE evaluation_seq = ?",
+                        (evaluation_seq,),
+                    ).fetchone()
+                if evaluation is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                if evaluation["sla_id"] != sla_id:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                existing = database.execute(
+                    "SELECT 1 FROM settlements WHERE evaluation_seq = ?",
+                    (evaluation_seq,),
+                ).fetchone()
+                if existing is not None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "settlement_exists"}
+                snapshot = json.loads(evaluation["response_json"])
+                outcome = snapshot["outcome"]
+                price = sla["price_micros"]
+                if outcome == "fulfilled":
+                    result = "charged"
+                    amount = price * snapshot["count"]
+                    payer_id = sla["consumer_id"]
+                    payee_id = sla["machine_id"]
+                elif outcome == "breached":
+                    result = "compensated"
+                    amount = price * snapshot["violations"]
+                    payer_id = sla["machine_id"]
+                    payee_id = sla["consumer_id"]
+                else:
+                    result = "pending"
+                    amount = 0
+                    payer_id = payee_id = None
+                # 金额与余额判定均先于余额充足性：任一超出九千万亿返回 amount_overflow。
+                if amount > AMOUNT_MAX:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "amount_overflow"}
+                payer_balance = 0
+                new_payee_balance = 0
+                if payer_id is not None:
+                    payer_row = database.execute(
+                        "SELECT balance_micros FROM fund_accounts WHERE machine_id = ?",
+                        (payer_id,),
+                    ).fetchone()
+                    payer_balance = payer_row["balance_micros"] if payer_row is not None else 0
+                    payee_row = database.execute(
+                        "SELECT balance_micros FROM fund_accounts WHERE machine_id = ?",
+                        (payee_id,),
+                    ).fetchone()
+                    payee_balance = payee_row["balance_micros"] if payee_row is not None else 0
+                    new_payee_balance = payee_balance + amount
+                    if new_payee_balance > AMOUNT_MAX:
+                        database.execute("ROLLBACK")
+                        return HTTPStatus.CONFLICT, {"error": "amount_overflow"}
+                    if payer_balance < amount:
+                        database.execute("ROLLBACK")
+                        return HTTPStatus.CONFLICT, {"error": "insufficient_funds"}
+                next_record = database.execute(
+                    "SELECT COALESCE(MAX(settlement_seq), 0) + 1 AS next_seq"
+                    " FROM settlements"
+                ).fetchone()
+                settlement_seq = next_record["next_seq"]
+                created_at_ms = int(datetime.now(UTC).timestamp() * 1000)
+                database.execute(
+                    "INSERT INTO settlements"
+                    "(settlement_seq, sla_id, evaluation_seq, result,"
+                    " amount_micros, created_at_ms)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        settlement_seq,
+                        sla_id,
+                        evaluation_seq,
+                        result,
+                        amount,
+                        created_at_ms,
+                    ),
+                )
+                if payer_id is not None:
+                    database.execute(
+                        "INSERT INTO fund_accounts(machine_id, balance_micros) VALUES (?, ?)"
+                        " ON CONFLICT(machine_id) DO UPDATE SET"
+                        " balance_micros = excluded.balance_micros",
+                        (payer_id, payer_balance - amount),
+                    )
+                    database.execute(
+                        "INSERT INTO fund_accounts(machine_id, balance_micros) VALUES (?, ?)"
+                        " ON CONFLICT(machine_id) DO UPDATE SET"
+                        " balance_micros = excluded.balance_micros",
+                        (payee_id, new_payee_balance),
+                    )
+                    database.execute(
+                        "INSERT INTO ledger_entries"
+                        "(account_id, amount_micros, kind, ref_seq) VALUES (?, ?, 'settlement', ?)",
+                        (payer_id, -amount, settlement_seq),
+                    )
+                    database.execute(
+                        "INSERT INTO ledger_entries"
+                        "(account_id, amount_micros, kind, ref_seq) VALUES (?, ?, 'settlement', ?)",
+                        (payee_id, amount, settlement_seq),
+                    )
+                payload = {
+                    "settlementSeq": settlement_seq,
+                    "evaluationSeq": evaluation_seq,
+                    "result": result,
+                    "amountMicros": amount,
+                    "createdAt": created_at_ms,
+                }
+                database.execute(
+                    "INSERT INTO settlement_idempotency_records"
+                    "(key, request_json, status, response_json)"
+                    " VALUES (?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        request_json,
+                        int(HTTPStatus.CREATED),
+                        json.dumps(payload, separators=(",", ":")),
                     ),
                 )
                 database.execute("COMMIT")
