@@ -1,7 +1,9 @@
 """Ed25519 签名验证（RFC 8032），仅使用 Python 标准库。
 
 服务只需验证既有公钥下的签名，不涉及私钥与签名生成，因此这里实现
-RFC 8032 5.1.7 节的验证算法：解码公钥与签名、按共模方程校验 R。
+RFC 8032 5.1.7 节的验证算法：严格解码公钥与签名中的 R 点（规范编码、
+位于曲线上、x 为零时符号位不得置位），要求公钥为非单位元且属于素数阶
+子群，最后按严格方程 [s]B == R + [k]A 校验。
 
 标量乘法内部使用扩展扭曲爱德华坐标 (X:Y:Z:T)，整轮数乘只在最后做一次
 求逆转回仿射，避免每步加法都付出模逆开销（纯 Python 大整数下尤为关键）。
@@ -53,6 +55,9 @@ def _point_decompress(encoded: bytes) -> tuple[int, int]:
     if y >= _P:
         raise InvalidSignature("y coordinate out of field")
     x = _x_recover(y)
+    if x == 0 and sign == 1:
+        # x = 0 没有“负”编码：符号位置位属于非规范编码，一律拒绝。
+        raise InvalidSignature("non-canonical sign bit for x = 0")
     if (x & 1) != sign:
         x = _P - x
     point = (x, y)
@@ -151,14 +156,16 @@ def verify(public_key: bytes, message: bytes, signature: bytes) -> bool:
         # 拒绝单位元公钥（其签名验证没有意义）。
         if public_point == (0, 1):
             return False
-        # 先乘余因子把两点压进素数阶子群，再按共模方程
-        # （RFC 8032 式 1.1）校验 [8]R + [8k]A == [8s]B。
-        r8 = _scalar_multiply(8, r_point)
-        a8 = _scalar_multiply(8, public_point)
+        # 登记公钥必须严格属于素数阶子群：[L]A 为单位元才合法。
+        # 低阶点、混合阶点在此被排除，不得进入验证方程。
+        if _scalar_multiply(_L, public_point) != (0, 1):
+            return False
+        # 严格（非共模）方程 [s]B == R + [k]A：公钥已在素数阶子群内，
+        # 仅清除余因子后相等的伪造签名不得被接受。
         digest = hashlib.sha512(r_bytes + public_key + message).digest()
-        k = int.from_bytes(digest, "little")
-        expected = _affine_add(r8, _scalar_multiply(k % _L, a8))
-        computed = _scalar_multiply((8 * s) % _L, _BASEPOINT)
+        k = int.from_bytes(digest, "little") % _L
+        expected = _affine_add(r_point, _scalar_multiply(k, public_point))
+        computed = _scalar_multiply(s, _BASEPOINT)
         return expected == computed
     except InvalidSignature:
         return False
