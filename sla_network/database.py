@@ -14,6 +14,31 @@ CREATE TABLE IF NOT EXISTS machines (
     id TEXT PRIMARY KEY,
     public_key TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS machine_keys (
+    machine_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    public_key TEXT NOT NULL,
+    activated_at_ms INTEGER NOT NULL,
+    revoked INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (machine_id, version)
+);
+CREATE TABLE IF NOT EXISTS machine_key_rotation_idempotency_records (
+    key TEXT PRIMARY KEY,
+    machine_id TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    response_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS machine_key_revocation_idempotency_records (
+    key TEXT PRIMARY KEY,
+    machine_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    request_json TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    response_json TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_machine_keys_key_unique
+ON machine_keys(machine_id, public_key);
 CREATE TABLE IF NOT EXISTS idempotency_records (
     key TEXT PRIMARY KEY,
     machine_id TEXT NOT NULL,
@@ -87,6 +112,7 @@ CREATE TABLE IF NOT EXISTS sla_telemetry_events (
     digest TEXT NOT NULL,
     commit_seq INTEGER NOT NULL,
     signature TEXT,
+    key_version INTEGER,
     PRIMARY KEY (sla_id, event_id)
 );
 CREATE TABLE IF NOT EXISTS sla_telemetry_idempotency_records (
@@ -217,10 +243,12 @@ ON dispute_evidence_proofs(evidence_seq, proof_seq);
 TELEMETRY_SEQ_MARKER = "telemetry_commit_seq_renumbered"
 TELEMETRY_SEQ_INDEX = "idx_sla_telemetry_commit_seq_unique"
 TELEMETRY_SIGNATURE_MARKER = "telemetry_signature_added"
+TELEMETRY_KEY_VERSION_MARKER = "telemetry_key_version_added"
 EVALUATION_SEQ_MARKER = "evaluation_seq_renumbered"
 EVALUATION_SEQ_INDEX = "idx_sla_evaluation_seq_unique"
 DISPUTE_EVENT_MARKER = "dispute_events_backfilled"
 DISPUTE_EVENT_INDEX = "idx_dispute_events_dispute_seq"
+MACHINE_KEYS_MARKER = "machine_keys_backfilled"
 
 
 def _renumber_commit_seq(connection: sqlite3.Connection) -> None:
@@ -295,6 +323,39 @@ def _add_telemetry_signature_column(connection: sqlite3.Connection) -> None:
         connection.execute(
             "INSERT INTO schema_metadata(key, value) VALUES (?, '1')",
             (TELEMETRY_SIGNATURE_MARKER,),
+        )
+        connection.execute("COMMIT")
+    except BaseException:
+        connection.execute("ROLLBACK")
+        raise
+
+
+def _add_telemetry_key_version_column(connection: sqlite3.Connection) -> None:
+    # 仅在一次性迁移（含空库首次连接）时取写锁；BEGIN IMMEDIATE 串行并发首启。
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        if (
+            connection.execute(
+                "SELECT 1 FROM schema_metadata WHERE key = ?",
+                (TELEMETRY_KEY_VERSION_MARKER,),
+            ).fetchone()
+            is not None
+        ):
+            # 其他连接已完成迁移，直接释放写锁。
+            connection.execute("COMMIT")
+            return
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(sla_telemetry_events)")
+        }
+        if "key_version" not in columns:
+            # 旧事件（含签名 v1 事件）不回填密钥版本，保持 NULL：照常查询、评估、结算。
+            connection.execute(
+                "ALTER TABLE sla_telemetry_events ADD COLUMN key_version INTEGER"
+            )
+        connection.execute(
+            "INSERT INTO schema_metadata(key, value) VALUES (?, '1')",
+            (TELEMETRY_KEY_VERSION_MARKER,),
         )
         connection.execute("COMMIT")
     except BaseException:
@@ -409,6 +470,40 @@ def _backfill_dispute_events(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _backfill_machine_keys(connection: sqlite3.Connection) -> None:
+    # 仅在一次性迁移（含空库首次连接）时取写锁；BEGIN IMMEDIATE 串行并发首启。
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        if (
+            connection.execute(
+                "SELECT 1 FROM schema_metadata WHERE key = ?",
+                (MACHINE_KEYS_MARKER,),
+            ).fetchone()
+            is not None
+        ):
+            # 其他连接已完成迁移，直接释放写锁，不再补历史。
+            connection.execute("COMMIT")
+            return
+        # 升级与新登记均建立版本一历史：旧库中每台已登记机器补一条 version=1、
+        # activated_at_ms=0、未吊销的记录，公钥取 machines.public_key。新库首启时
+        # machines 为空，此处不写入；机器登记在登记事务内自行建立版本一。
+        connection.execute(
+            "INSERT INTO machine_keys(machine_id, version, public_key,"
+            " activated_at_ms, revoked)"
+            " SELECT m.id, 1, m.public_key, 0, 0 FROM machines AS m"
+            " WHERE NOT EXISTS ("
+            " SELECT 1 FROM machine_keys AS k WHERE k.machine_id = m.id)"
+        )
+        connection.execute(
+            "INSERT INTO schema_metadata(key, value) VALUES (?, '1')",
+            (MACHINE_KEYS_MARKER,),
+        )
+        connection.execute("COMMIT")
+    except BaseException:
+        connection.execute("ROLLBACK")
+        raise
+
+
 def connect(path: str) -> sqlite3.Connection:
     database = Path(path)
     database.parent.mkdir(parents=True, exist_ok=True)
@@ -441,6 +536,14 @@ def connect(path: str) -> sqlite3.Connection:
     if (
         connection.execute(
             "SELECT 1 FROM schema_metadata WHERE key = ?",
+            (TELEMETRY_KEY_VERSION_MARKER,),
+        ).fetchone()
+        is None
+    ):
+        _add_telemetry_key_version_column(connection)
+    if (
+        connection.execute(
+            "SELECT 1 FROM schema_metadata WHERE key = ?",
             (EVALUATION_SEQ_MARKER,),
         ).fetchone()
         is None
@@ -459,6 +562,14 @@ def connect(path: str) -> sqlite3.Connection:
         is None
     ):
         _backfill_dispute_events(connection)
+    if (
+        connection.execute(
+            "SELECT 1 FROM schema_metadata WHERE key = ?",
+            (MACHINE_KEYS_MARKER,),
+        ).fetchone()
+        is None
+    ):
+        _backfill_machine_keys(connection)
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_settlements_sla_seq"
         " ON settlements(sla_id, settlement_seq)"

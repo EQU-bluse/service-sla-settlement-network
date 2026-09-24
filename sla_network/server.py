@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sqlite3
 from contextlib import closing
 from datetime import UTC, datetime
 from http import HTTPStatus
@@ -16,6 +17,10 @@ from .ed25519 import verify as ed25519_verify
 IDEMPOTENCY_KEY_PATTERN = re.compile(r"[A-Za-z0-9-]{1,64}")
 PUBLIC_KEY_PATTERN = re.compile(r"[0-9a-f]{64}")
 CAPABILITIES_PATH_PATTERN = re.compile(r"/v1/machines/([^/]+)/capabilities")
+MACHINE_KEYS_PATH_PATTERN = re.compile(r"/v1/machines/([^/]+)/keys")
+MACHINE_KEY_REVOCATION_PATH_PATTERN = re.compile(
+    r"/v1/machines/([^/]+)/keys/([^/]+)/revocation"
+)
 CAPABILITY_NAME_PATTERN = re.compile(r"[a-z0-9-]{1,32}")
 TEMPLATE_ID_PATTERN = re.compile(r"[a-z0-9-]{1,64}")
 SLA_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)")
@@ -42,7 +47,8 @@ SLA_FIELDS = {"id", "templateId", "consumerId", "start", "end"}
 CONFIRMATION_FIELDS = {"party", "actorId"}
 CONFIRMATION_PARTIES = {"producer", "consumer"}
 TELEMETRY_FIELDS = {"eventId", "timestamp", "latencyMs", "digest"}
-TELEMETRY_SIGNED_FIELDS = TELEMETRY_FIELDS | {"signature"}
+TELEMETRY_V1_SIGNED_FIELDS = TELEMETRY_FIELDS | {"signature"}
+TELEMETRY_SIGNED_FIELDS = TELEMETRY_FIELDS | {"keyVersion", "signature"}
 SIGNATURE_PATTERN = re.compile(r"[0-9a-f]{128}")
 EVALUATION_FIELDS = {"from", "to"}
 FUND_FIELDS = {"amountMicros", "reference"}
@@ -51,6 +57,13 @@ DISPUTE_FIELDS = {"id", "settlementSeq", "claimantId"}
 RESOLUTION_FIELDS = {"decision"}
 EVIDENCE_FIELDS = {"evidenceId", "actorId", "observedAt", "digest"}
 EVIDENCE_PROOF_FIELDS = {"evidenceSeq", "actorId", "signature"}
+KEY_ROTATION_FIELDS = {
+    "expectedVersion",
+    "publicKey",
+    "currentSignature",
+    "newSignature",
+}
+KEY_REVOCATION_FIELDS = {"signature"}
 DISPUTE_DECISIONS = {"release", "refund"}
 DISPUTABLE_RESULTS = {"charged", "compensated"}
 AMOUNT_CAP_MICROS = 9_000_000_000_000_000
@@ -1054,6 +1067,18 @@ class Handler(BaseHTTPRequestHandler):
         if capabilities_match is not None:
             self._declare_capability(capabilities_match.group(1))
             return
+        revocation_match = MACHINE_KEY_REVOCATION_PATH_PATTERN.fullmatch(
+            urlsplit(self.path).path
+        )
+        if revocation_match is not None:
+            self._revoke_key(
+                revocation_match.group(1), revocation_match.group(2)
+            )
+            return
+        keys_match = MACHINE_KEYS_PATH_PATTERN.fullmatch(urlsplit(self.path).path)
+        if keys_match is not None:
+            self._rotate_key(keys_match.group(1))
+            return
         if self.path == "/v1/sla-templates":
             self._create_sla_template()
             return
@@ -1168,6 +1193,13 @@ class Handler(BaseHTTPRequestHandler):
                     "INSERT INTO machines(id, public_key) VALUES (?, ?)",
                     (machine_id, public_key),
                 )
+                # 新登记即建立版本一历史：零时激活且未吊销。
+                database.execute(
+                    "INSERT INTO machine_keys"
+                    "(machine_id, version, public_key, activated_at_ms, revoked)"
+                    " VALUES (?, 1, ?, 0, 0)",
+                    (machine_id, public_key),
+                )
                 database.execute(
                     "INSERT INTO idempotency_records(key, machine_id, public_key) VALUES (?, ?, ?)",
                     (idempotency_key, machine_id, public_key),
@@ -1278,6 +1310,276 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 database.execute("COMMIT")
                 return status, payload
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+
+    def _rotate_key(self, machine_id: str) -> None:
+        idempotency_key = self.headers.get("Idempotency-Key")
+        if (
+            idempotency_key is None
+            or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None
+        ):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 轮换入口不接受任何查询参数：参数校验先于体校验与机器查询。
+        if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        fields = self._read_key_rotation_object()
+        if fields is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        status, payload = self._apply_key_rotation(idempotency_key, machine_id, fields)
+        self._json(status, payload)
+
+    def _read_key_rotation_object(self) -> dict[str, Any] | None:
+        parsed = self._read_json_object()
+        if parsed is None or set(parsed) != KEY_ROTATION_FIELDS:
+            return None
+        if not _bounded_int(parsed["expectedVersion"], 1, 2147483646):
+            return None
+        public_key = parsed["publicKey"]
+        if not isinstance(public_key, str) or PUBLIC_KEY_PATTERN.fullmatch(public_key) is None:
+            return None
+        current_signature = parsed["currentSignature"]
+        if (
+            not isinstance(current_signature, str)
+            or SIGNATURE_PATTERN.fullmatch(current_signature) is None
+        ):
+            return None
+        new_signature = parsed["newSignature"]
+        if (
+            not isinstance(new_signature, str)
+            or SIGNATURE_PATTERN.fullmatch(new_signature) is None
+        ):
+            return None
+        return parsed
+
+    def _apply_key_rotation(
+        self, idempotency_key: str, machine_id: str, fields: dict[str, Any]
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+        expected_version = fields["expectedVersion"]
+        new_public_key = fields["publicKey"]
+        # key-rotate-v1 消息按 标识、机器id、期望版本、新公钥 逐行连接，末尾无换行；
+        # 旧密钥与新密钥分别对同一消息签名。
+        rotate_message = (
+            f"key-rotate-v1\n{machine_id}\n{expected_version}\n{new_public_key}"
+        ).encode("utf-8")
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                record = database.execute(
+                    "SELECT machine_id, request_json, status, response_json"
+                    " FROM machine_key_rotation_idempotency_records WHERE key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    if record["machine_id"] == machine_id and record["request_json"] == request_json:
+                        return HTTPStatus(record["status"]), json.loads(record["response_json"])
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                machine = database.execute(
+                    "SELECT id FROM machines WHERE id = ?", (machine_id,)
+                ).fetchone()
+                if machine is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                latest = database.execute(
+                    "SELECT version, public_key FROM machine_keys"
+                    " WHERE machine_id = ? ORDER BY version DESC LIMIT 1",
+                    (machine_id,),
+                ).fetchone()
+                # 版本不符：期望版本必须等于当前最新版本（机器必有版本一历史）。
+                if latest is None or latest["version"] != expected_version:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                # 历史公钥复用：新公钥不得等于该机器任一历史版本公钥（含当前）。
+                reused = database.execute(
+                    "SELECT 1 FROM machine_keys"
+                    " WHERE machine_id = ? AND public_key = ?",
+                    (machine_id, new_public_key),
+                ).fetchone()
+                if reused is not None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "key_exists"}
+                current_valid = ed25519_verify(
+                    bytes.fromhex(latest["public_key"]),
+                    rotate_message,
+                    bytes.fromhex(fields["currentSignature"]),
+                )
+                new_valid = ed25519_verify(
+                    bytes.fromhex(new_public_key),
+                    rotate_message,
+                    bytes.fromhex(fields["newSignature"]),
+                )
+                if not current_valid or not new_valid:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "invalid_signature"}
+                new_version = expected_version + 1
+                activated_at_ms = int(datetime.now(UTC).timestamp() * 1000)
+                payload = {
+                    "version": new_version,
+                    "publicKey": new_public_key,
+                    "activatedAt": activated_at_ms,
+                    "revoked": False,
+                }
+                try:
+                    database.execute(
+                        "INSERT INTO machine_keys"
+                        "(machine_id, version, public_key, activated_at_ms, revoked)"
+                        " VALUES (?, ?, ?, ?, 0)",
+                        (machine_id, new_version, new_public_key, activated_at_ms),
+                    )
+                except sqlite3.IntegrityError:
+                    # 异键同版本/同公钥并发：仅一项成功。
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                database.execute(
+                    "INSERT INTO machine_key_rotation_idempotency_records"
+                    "(key, machine_id, request_json, status, response_json)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        machine_id,
+                        request_json,
+                        int(HTTPStatus.CREATED),
+                        json.dumps(payload, separators=(",", ":")),
+                    ),
+                )
+                database.execute("COMMIT")
+                return HTTPStatus.CREATED, payload
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+
+    def _revoke_key(self, machine_id: str, version_text: str) -> None:
+        idempotency_key = self.headers.get("Idempotency-Key")
+        if (
+            idempotency_key is None
+            or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None
+        ):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 吊销入口不接受任何查询参数。
+        if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        fields = self._read_key_revocation_object()
+        if fields is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        status, payload = self._apply_key_revocation(
+            idempotency_key, machine_id, version_text, fields
+        )
+        self._json(status, payload)
+
+    def _read_key_revocation_object(self) -> dict[str, Any] | None:
+        parsed = self._read_json_object()
+        if parsed is None or set(parsed) != KEY_REVOCATION_FIELDS:
+            return None
+        signature = parsed["signature"]
+        if not isinstance(signature, str) or SIGNATURE_PATTERN.fullmatch(signature) is None:
+            return None
+        return parsed
+
+    def _apply_key_revocation(
+        self,
+        idempotency_key: str,
+        machine_id: str,
+        version_text: str,
+        fields: dict[str, Any],
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+        # 路径版本须为无前导零十进制正整数；非法按不存在处理（404）。
+        version: int | None = None
+        if DECIMAL_PATTERN.fullmatch(version_text) is not None:
+            value = int(version_text)
+            if 1 <= value <= INT64_MAX:
+                version = value
+        # key-revoke-v1 消息逐行绑定 机器id、版本，由最新密钥签署。
+        revoke_message = (
+            f"key-revoke-v1\n{machine_id}\n{version_text}"
+        ).encode("utf-8")
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                record = database.execute(
+                    "SELECT machine_id, version, request_json, status, response_json"
+                    " FROM machine_key_revocation_idempotency_records WHERE key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    if (
+                        record["machine_id"] == machine_id
+                        and record["version"] == (version if version is not None else -1)
+                        and record["request_json"] == request_json
+                    ):
+                        return HTTPStatus(record["status"]), json.loads(record["response_json"])
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                machine = database.execute(
+                    "SELECT id FROM machines WHERE id = ?", (machine_id,)
+                ).fetchone()
+                if machine is None or version is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                key_record = database.execute(
+                    "SELECT public_key, revoked FROM machine_keys"
+                    " WHERE machine_id = ? AND version = ?",
+                    (machine_id, version),
+                ).fetchone()
+                if key_record is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                latest = database.execute(
+                    "SELECT MAX(version) AS latest FROM machine_keys"
+                    " WHERE machine_id = ?",
+                    (machine_id,),
+                ).fetchone()
+                if latest["latest"] == version:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                if key_record["revoked"]:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "already_revoked"}
+                latest_record = database.execute(
+                    "SELECT public_key FROM machine_keys"
+                    " WHERE machine_id = ? AND version = ?",
+                    (machine_id, latest["latest"]),
+                ).fetchone()
+                signature_valid = False
+                if latest_record is not None:
+                    signature_valid = ed25519_verify(
+                        bytes.fromhex(latest_record["public_key"]),
+                        revoke_message,
+                        bytes.fromhex(fields["signature"]),
+                    )
+                if not signature_valid:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "invalid_signature"}
+                database.execute(
+                    "UPDATE machine_keys SET revoked = 1"
+                    " WHERE machine_id = ? AND version = ?",
+                    (machine_id, version),
+                )
+                payload = {"version": version, "revoked": True}
+                database.execute(
+                    "INSERT INTO machine_key_revocation_idempotency_records"
+                    "(key, machine_id, version, request_json, status, response_json)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        machine_id,
+                        version,
+                        request_json,
+                        int(HTTPStatus.OK),
+                        json.dumps(payload, separators=(",", ":")),
+                    ),
+                )
+                database.execute("COMMIT")
+                return HTTPStatus.OK, payload
             except BaseException:
                 database.execute("ROLLBACK")
                 raise
@@ -1608,20 +1910,20 @@ class Handler(BaseHTTPRequestHandler):
         if parsed is None:
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
-        fields, signed = parsed
-        status, payload = self._apply_telemetry(idempotency_key, sla_id, fields, signed)
+        fields, kind = parsed
+        status, payload = self._apply_telemetry(idempotency_key, sla_id, fields, kind)
         self._json(status, payload)
 
-    def _read_telemetry_object(self) -> tuple[dict[str, Any], bool] | None:
+    def _read_telemetry_object(self) -> tuple[dict[str, Any], str] | None:
         parsed = self._read_json_object()
         if parsed is None:
             return None
         keys = set(parsed)
         if keys == TELEMETRY_SIGNED_FIELDS:
-            signed = True
-        elif keys == TELEMETRY_FIELDS:
-            # 无签名的旧四字段正文：仅用于精确重放旧幂等记录。
-            signed = False
+            kind = "v2"
+        elif keys == TELEMETRY_V1_SIGNED_FIELDS or keys == TELEMETRY_FIELDS:
+            # 旧正文（签名五字段或无签名四字段）：仅用于精确重放旧幂等记录。
+            kind = "legacy"
         else:
             return None
         event_id = parsed["eventId"]
@@ -1634,14 +1936,18 @@ class Handler(BaseHTTPRequestHandler):
         digest = parsed["digest"]
         if not isinstance(digest, str) or PUBLIC_KEY_PATTERN.fullmatch(digest) is None:
             return None
-        if signed:
+        if "signature" in parsed:
             signature = parsed["signature"]
             if not isinstance(signature, str) or SIGNATURE_PATTERN.fullmatch(signature) is None:
                 return None
-        return parsed, signed
+        if kind == "v2":
+            # keyVersion 为非布尔正整数。
+            if not _bounded_int(parsed["keyVersion"], 1, INT64_MAX):
+                return None
+        return parsed, kind
 
     def _apply_telemetry(
-        self, idempotency_key: str, sla_id: str, fields: dict[str, Any], signed: bool
+        self, idempotency_key: str, sla_id: str, fields: dict[str, Any], kind: str
     ) -> tuple[HTTPStatus, dict[str, Any]]:
         request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
         with closing(connect(self.server.database_path)) as database:
@@ -1655,13 +1961,14 @@ class Handler(BaseHTTPRequestHandler):
                 if record is not None:
                     database.execute("ROLLBACK")
                     if record["sla_id"] == sla_id and record["request_json"] == request_json:
-                        # 同键同请求（含旧四字段记录的精确匹配）重放首次响应。
+                        # 同键同请求（含旧四字段/五字段记录的精确匹配）重放首次响应。
                         return HTTPStatus(record["status"]), json.loads(record["response_json"])
-                    if not signed:
-                        # 其他无签名提交按非法正文处理。
+                    if kind != "v2":
+                        # 其他旧正文提交按非法正文处理。
                         return HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
                     return HTTPStatus.CONFLICT, {"error": "conflict"}
-                if not signed:
+                if kind != "v2":
+                    # 旧正文仅允许精确重放：无匹配幂等记录时按非法正文处理。
                     database.execute("ROLLBACK")
                     return HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
                 sla = database.execute(
@@ -1685,27 +1992,41 @@ class Handler(BaseHTTPRequestHandler):
                 if hashlib.sha256(message.encode("utf-8")).hexdigest() != fields["digest"]:
                     database.execute("ROLLBACK")
                     return HTTPStatus.CONFLICT, {"error": "conflict"}
-                # 摘要有效后才验签：以快照生产机器登记的 publicKey 按 RFC 8032
-                # 验证 Ed25519；查不到公钥等同验签失败。
-                machine = database.execute(
-                    "SELECT public_key FROM machines WHERE id = ?",
-                    (sla["machine_id"],),
+                key_version = fields["keyVersion"]
+                key = database.execute(
+                    "SELECT public_key, activated_at_ms, revoked FROM machine_keys"
+                    " WHERE machine_id = ? AND version = ?",
+                    (sla["machine_id"], key_version),
                 ).fetchone()
+                # 判定在摘要之后、事件重复之前：未知版本、窗外、吊销或验签失败
+                # 均为 invalid_signature，不留数据或幂等结果，也不推进 commit_seq。
                 signature_valid = False
-                if machine is not None:
-                    signed_message = (
-                        f"telemetry-v1\n{sla_id}\n{fields['eventId']}\n{timestamp}\n"
-                        f"{fields['latencyMs']}\n{fields['digest']}\n{sla['machine_id']}"
-                    ).encode("utf-8")
-                    signature_valid = ed25519_verify(
-                        bytes.fromhex(machine["public_key"]),
-                        signed_message,
-                        bytes.fromhex(fields["signature"]),
+                if key is not None and not key["revoked"]:
+                    next_activation = database.execute(
+                        "SELECT activated_at_ms FROM machine_keys"
+                        " WHERE machine_id = ? AND version > ?"
+                        " ORDER BY version ASC LIMIT 1",
+                        (sla["machine_id"], key_version),
+                    ).fetchone()
+                    within_window = timestamp >= key["activated_at_ms"] and (
+                        next_activation is None
+                        or timestamp < next_activation["activated_at_ms"]
                     )
+                    if within_window:
+                        signed_message = (
+                            f"telemetry-v2\n{sla_id}\n{fields['eventId']}\n{timestamp}\n"
+                            f"{fields['latencyMs']}\n{fields['digest']}\n"
+                            f"{key_version}\n{sla['machine_id']}"
+                        ).encode("utf-8")
+                        signature_valid = ed25519_verify(
+                            bytes.fromhex(key["public_key"]),
+                            signed_message,
+                            bytes.fromhex(fields["signature"]),
+                        )
                 if not signature_valid:
                     database.execute("ROLLBACK")
                     return HTTPStatus.CONFLICT, {"error": "invalid_signature"}
-                # 摘要与签名均有效后才判事件重复。
+                # 摘要、版本窗口与签名均有效后才判事件重复。
                 existing = database.execute(
                     "SELECT event_id FROM sla_telemetry_events"
                     " WHERE sla_id = ? AND event_id = ?",
@@ -1723,8 +2044,8 @@ class Handler(BaseHTTPRequestHandler):
                 database.execute(
                     "INSERT INTO sla_telemetry_events"
                     "(sla_id, event_id, timestamp_ms, latency_ms, digest, commit_seq,"
-                    " signature)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    " signature, key_version)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         sla_id,
                         fields["eventId"],
@@ -1733,6 +2054,7 @@ class Handler(BaseHTTPRequestHandler):
                         fields["digest"],
                         commit_seq,
                         fields["signature"],
+                        key_version,
                     ),
                 )
                 database.execute(

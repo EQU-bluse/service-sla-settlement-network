@@ -71,12 +71,36 @@ def telemetry_signature(
     latency_ms: int,
     digest: str,
     machine: str,
+    key_version: int = 1,
 ) -> str:
     message = (
-        f"telemetry-v1\n{sla_id}\n{event_id}\n{timestamp}\n"
-        f"{latency_ms}\n{digest}\n{machine}"
+        f"telemetry-v2\n{sla_id}\n{event_id}\n{timestamp}\n"
+        f"{latency_ms}\n{digest}\n{key_version}\n{machine}"
     )
     return _ed25519_sign(seed, message.encode("utf-8")).hex()
+
+
+def key_rotation_signatures(
+    current_seed: bytes,
+    new_seed: bytes,
+    machine: str,
+    expected_version: int,
+    new_public_key: str,
+) -> tuple[str, str]:
+    message = (
+        f"key-rotate-v1\n{machine}\n{expected_version}\n{new_public_key}"
+    ).encode("utf-8")
+    return (
+        _ed25519_sign(current_seed, message).hex(),
+        _ed25519_sign(new_seed, message).hex(),
+    )
+
+
+def key_revocation_signature(
+    seed: bytes, machine: str, version: int
+) -> str:
+    message = f"key-revoke-v1\n{machine}\n{version}".encode("utf-8")
+    return _ed25519_sign(seed, message).hex()
 
 
 class ServerTests(unittest.TestCase):
@@ -1618,6 +1642,7 @@ class TelemetryTests(unittest.TestCase):
         latency_ms: int = 12,
         digest: str | None = None,
         signature: str | None = None,
+        key_version: int = 1,
     ) -> bytes:
         if timestamp is None:
             timestamp = self.start * 1000 + 500
@@ -1626,7 +1651,7 @@ class TelemetryTests(unittest.TestCase):
         if signature is None:
             signature = telemetry_signature(
                 PRODUCER_SEED, sla_id, event_id, timestamp, latency_ms, digest,
-                self.machine_id,
+                self.machine_id, key_version,
             )
         return json.dumps(
             {
@@ -1634,6 +1659,7 @@ class TelemetryTests(unittest.TestCase):
                 "timestamp": timestamp,
                 "latencyMs": latency_ms,
                 "digest": digest,
+                "keyVersion": key_version,
                 "signature": signature,
             }
         ).encode()
@@ -2069,6 +2095,14 @@ class TelemetryTests(unittest.TestCase):
             json.dumps(dict(valid, signature="A" * 128)).encode(),
             json.dumps(dict(valid, signature="g" * 128)).encode(),
             json.dumps(dict(valid, signature=123)).encode(),
+            json.dumps(
+                {key: value for key, value in valid.items() if key != "keyVersion"}
+            ).encode(),
+            json.dumps(dict(valid, keyVersion=0)).encode(),
+            json.dumps(dict(valid, keyVersion=-1)).encode(),
+            json.dumps(dict(valid, keyVersion=True)).encode(),
+            json.dumps(dict(valid, keyVersion=1.0)).encode(),
+            json.dumps(dict(valid, keyVersion="1")).encode(),
             b'{"eventId":"evt-1","eventId":"evt-2","timestamp":'
             + str(valid["timestamp"]).encode()
             + b',"latencyMs":12,"digest":"'
@@ -2172,6 +2206,7 @@ class TelemetryTests(unittest.TestCase):
             "timestamp": timestamp,
             "latencyMs": 12,
             "digest": digest,
+            "keyVersion": 1,
             "signature": telemetry_signature(
                 PRODUCER_SEED, "sla-1", "evt-1", timestamp, 12, digest, self.machine_id
             ),
@@ -2223,6 +2258,7 @@ class TelemetryTests(unittest.TestCase):
             "timestamp": timestamp,
             "latencyMs": 12,
             "digest": digest,
+            "keyVersion": 1,
             "signature": telemetry_signature(
                 PRODUCER_SEED, "sla-ghost", "evt-1", timestamp, 12, digest, ghost
             ),
@@ -2524,6 +2560,7 @@ class EvaluationTests(unittest.TestCase):
                 "timestamp": timestamp,
                 "latencyMs": latency_ms,
                 "digest": digest,
+                "keyVersion": 1,
                 "signature": telemetry_signature(
                     PRODUCER_SEED, sla_id, event_id, timestamp, latency_ms, digest,
                     self.machine_id,
@@ -3360,7 +3397,7 @@ class TelemetrySignatureMigrationTests(unittest.TestCase):
             f"sla-1\nevt-2\n1600\n20\n{self.machine}".encode()
         ).hexdigest()
         signature = telemetry_signature(
-            PRODUCER_SEED, "sla-1", "evt-2", 1600, 20, digest, self.machine
+            PRODUCER_SEED, "sla-1", "evt-2", 1600, 20, digest, self.machine, 1
         )
         status, _ = self.post_json(
             "/v1/slas/sla-1/telemetry",
@@ -3369,6 +3406,7 @@ class TelemetrySignatureMigrationTests(unittest.TestCase):
                 "timestamp": 1600,
                 "latencyMs": 20,
                 "digest": digest,
+                "keyVersion": 1,
                 "signature": signature,
             },
             "tel-2",
@@ -3378,15 +3416,17 @@ class TelemetrySignatureMigrationTests(unittest.TestCase):
         connection.row_factory = sqlite3.Row
         try:
             rows = connection.execute(
-                "SELECT event_id, commit_seq, signature FROM sla_telemetry_events"
-                " ORDER BY commit_seq ASC"
+                "SELECT event_id, commit_seq, signature, key_version"
+                " FROM sla_telemetry_events ORDER BY commit_seq ASC"
             ).fetchall()
             self.assertEqual(
                 [(row["event_id"], row["commit_seq"]) for row in rows],
                 [("evt-1", 1), ("evt-2", 2)],
             )
             self.assertIsNone(rows[0]["signature"])
+            self.assertIsNone(rows[0]["key_version"])
             self.assertEqual(rows[1]["signature"], signature)
+            self.assertEqual(rows[1]["key_version"], 1)
         finally:
             connection.close()
         # 无签名旧事件与签名新事件一起参与评估。
@@ -3703,6 +3743,7 @@ class SettlementTests(unittest.TestCase):
                 "timestamp": timestamp,
                 "latencyMs": latency_ms,
                 "digest": digest,
+                "keyVersion": 1,
                 "signature": telemetry_signature(
                     PRODUCER_SEED, "sla-1", event_id, timestamp, latency_ms, digest,
                     self.machine_id,
@@ -4118,6 +4159,7 @@ class DisputeTests(unittest.TestCase):
                 "timestamp": timestamp,
                 "latencyMs": latency_ms,
                 "digest": digest,
+                "keyVersion": 1,
                 "signature": telemetry_signature(
                     PRODUCER_SEED, sla_id, event_id, timestamp, latency_ms, digest,
                     self.machine_id,
@@ -5124,6 +5166,7 @@ class DisputeEventMigrationTests(unittest.TestCase):
                 "timestamp": timestamp,
                 "latencyMs": 10,
                 "digest": digest,
+                "keyVersion": 1,
                 "signature": telemetry_signature(
                     PRODUCER_SEED, "sla-new", "evt-1", timestamp, 10, digest, machine,
                 ),
@@ -5292,6 +5335,7 @@ class DisputeCollectionTests(unittest.TestCase):
                 "timestamp": timestamp,
                 "latencyMs": 10,
                 "digest": digest,
+                "keyVersion": 1,
                 "signature": telemetry_signature(
                     PRODUCER_SEED, sla_id, event_id, timestamp, 10, digest,
                     self.machine_id,
@@ -5678,6 +5722,7 @@ class DisputeEvidenceTests(unittest.TestCase):
                 "timestamp": timestamp,
                 "latencyMs": 10,
                 "digest": digest,
+                "keyVersion": 1,
                 "signature": telemetry_signature(
                     PRODUCER_SEED, "sla-1", event_id, timestamp, 10, digest,
                     self.machine_id,
@@ -5926,6 +5971,7 @@ class DisputeEvidenceTests(unittest.TestCase):
                 "timestamp": timestamp,
                 "latencyMs": 100,
                 "digest": digest,
+                "keyVersion": 1,
                 "signature": telemetry_signature(
                     PRODUCER_SEED, "sla-2", event_id, timestamp, 100, digest,
                     self.machine_id,
@@ -6291,6 +6337,7 @@ class EvidenceProofTests(unittest.TestCase):
                 "timestamp": timestamp,
                 "latencyMs": 10,
                 "digest": digest,
+                "keyVersion": 1,
                 "signature": telemetry_signature(
                     self.PRODUCER_SEED, "sla-1", "evt-1", timestamp, 10, digest,
                     self.producer_id,
@@ -6767,6 +6814,716 @@ class EvidenceProofTests(unittest.TestCase):
             results = list(executor.map(submit, range(16)))
         self.assertTrue(all(status == 201 for status, _ in results), results)
         self.assertEqual(len({payload for _, payload in results}), 1, results)
+
+
+class KeyLifecycleTests(unittest.TestCase):
+    PRODUCER_SEED = b"\x01" * 32
+    NEW_SEED = b"\x02" * 32
+    THIRD_SEED = b"\x03" * 32
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.producer_public = _ed25519_public_key(self.PRODUCER_SEED).hex()
+        self.new_public = _ed25519_public_key(self.NEW_SEED).hex()
+        self.third_public = _ed25519_public_key(self.THIRD_SEED).hex()
+        self.machine_id = machine_id(self.producer_public)
+        self.consumer_id = machine_id(PUBLIC_KEY_B)
+        for key, public_key in (
+            ("register-1", self.producer_public),
+            ("register-2", PUBLIC_KEY_B),
+        ):
+            request = Request(
+                self.url("/v1/machines"),
+                data=json.dumps({"publicKey": public_key}).encode(),
+                method="POST",
+            )
+            request.add_header("Idempotency-Key", key)
+            with urlopen(request, timeout=5) as response:
+                self.assertEqual(response.status, 201)
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temporary.cleanup()
+
+    def url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}{path}"
+
+    def restart(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def post_json(self, path: str, payload: object, key: str | None) -> tuple[int, bytes]:
+        request = Request(
+            self.url(path),
+            data=payload if isinstance(payload, bytes) else json.dumps(payload).encode(),
+            method="POST",
+        )
+        if key is not None:
+            request.add_header("Idempotency-Key", key)
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def rotate_body(
+        self,
+        expected_version: int = 1,
+        new_public: str | None = None,
+        current_seed: bytes | None = None,
+        new_seed: bytes | None = None,
+    ) -> dict[str, object]:
+        if new_public is None:
+            new_public = self.new_public
+        if current_seed is None:
+            current_seed = self.PRODUCER_SEED
+        if new_seed is None:
+            new_seed = self.NEW_SEED
+        current_signature, new_signature = key_rotation_signatures(
+            current_seed, new_seed, self.machine_id, expected_version, new_public
+        )
+        return {
+            "expectedVersion": expected_version,
+            "publicKey": new_public,
+            "currentSignature": current_signature,
+            "newSignature": new_signature,
+        }
+
+    def rotate(
+        self,
+        body: object | None = None,
+        key: str = "rotate-1",
+        machine: str | None = None,
+    ) -> tuple[int, bytes]:
+        if body is None:
+            body = self.rotate_body()
+        if machine is None:
+            machine = self.machine_id
+        return self.post_json(f"/v1/machines/{machine}/keys", body, key)
+
+    def revoke(
+        self,
+        version: int,
+        seed: bytes | None = None,
+        machine: str | None = None,
+        key: str = "revoke-1",
+    ) -> tuple[int, bytes]:
+        if seed is None:
+            seed = self.NEW_SEED
+        if machine is None:
+            machine = self.machine_id
+        body = {"signature": key_revocation_signature(seed, machine, version)}
+        return self.post_json(
+            f"/v1/machines/{machine}/keys/{version}/revocation", body, key
+        )
+
+    def key_rows(self) -> list[sqlite3.Row]:
+        connection = sqlite3.connect(self.server.database_path)
+        connection.row_factory = sqlite3.Row
+        try:
+            return connection.execute(
+                "SELECT version, public_key, activated_at_ms, revoked"
+                " FROM machine_keys WHERE machine_id = ? ORDER BY version",
+                (self.machine_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+
+    def test_registration_creates_version_one_history(self) -> None:
+        rows = self.key_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            (rows[0]["version"], rows[0]["public_key"], rows[0]["activated_at_ms"]),
+            (1, self.producer_public, 0),
+        )
+        self.assertEqual(rows[0]["revoked"], 0)
+
+    def test_rotation_created_with_ordered_body(self) -> None:
+        status, body = self.rotate()
+        self.assertEqual(status, 201)
+        payload = json.loads(body)
+        self.assertEqual(list(payload), ["version", "publicKey", "activatedAt", "revoked"])
+        self.assertEqual(payload["version"], 2)
+        self.assertEqual(payload["publicKey"], self.new_public)
+        self.assertIsInstance(payload["activatedAt"], int)
+        self.assertGreaterEqual(payload["activatedAt"], 0)
+        self.assertIs(payload["revoked"], False)
+        rows = self.key_rows()
+        self.assertEqual([row["version"] for row in rows], [1, 2])
+        self.assertEqual(rows[1]["public_key"], self.new_public)
+        self.assertEqual(rows[1]["revoked"], 0)
+
+    def test_rotation_replay_returns_first_bytes_and_survives_restart(self) -> None:
+        status, first = self.rotate()
+        self.assertEqual(status, 201)
+        for _ in range(2):
+            again_status, again = self.rotate()
+            self.assertEqual((again_status, again), (status, first))
+        self.restart()
+        again_status, again = self.rotate()
+        self.assertEqual((again_status, again), (status, first))
+        self.assertEqual(len(self.key_rows()), 2)
+
+    def test_stale_expected_version_conflicts(self) -> None:
+        self.assertEqual(self.rotate()[0], 201)
+        status, body = self.rotate(self.rotate_body(expected_version=1), key="rotate-2")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+        status, body = self.rotate(self.rotate_body(expected_version=3), key="rotate-3")
+        self.assertEqual(status, 409)
+
+    def test_reused_historical_public_key_is_key_exists(self) -> None:
+        self.assertEqual(self.rotate()[0], 201)
+        # 复用版本一公钥（即使两签名都有效）：key_exists。
+        current_signature, new_signature = key_rotation_signatures(
+            self.NEW_SEED,
+            self.PRODUCER_SEED,
+            self.machine_id,
+            2,
+            self.producer_public,
+        )
+        body = {
+            "expectedVersion": 2,
+            "publicKey": self.producer_public,
+            "currentSignature": current_signature,
+            "newSignature": new_signature,
+        }
+        status, response = self.post_json(
+            f"/v1/machines/{self.machine_id}/keys", body, "rotate-2"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(response), {"error": "key_exists"})
+        self.assertEqual(len(self.key_rows()), 2)
+
+    def test_bad_current_or_new_signature_is_invalid_signature(self) -> None:
+        good = self.rotate_body()
+        bad_current = dict(good, currentSignature="0" * 128)
+        status, body = self.rotate(bad_current, key="rotate-bad-current")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "invalid_signature"})
+        bad_new = dict(good, newSignature="0" * 128)
+        status, body = self.rotate(bad_new, key="rotate-bad-new")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "invalid_signature"})
+        # 当前密钥以新私钥签署（公钥不匹配）：验签失败。
+        wrong = self.rotate_body(current_seed=self.NEW_SEED)
+        status, body = self.rotate(wrong, key="rotate-wrong-current")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "invalid_signature"})
+        # 失败不留任何写入。
+        self.assertEqual([row["version"] for row in self.key_rows()], [1])
+
+    def test_rotation_machine_missing_is_404(self) -> None:
+        missing = "ab" * 32
+        current_signature, new_signature = key_rotation_signatures(
+            self.PRODUCER_SEED, self.NEW_SEED, missing, 1, self.new_public
+        )
+        body = {
+            "expectedVersion": 1,
+            "publicKey": self.new_public,
+            "currentSignature": current_signature,
+            "newSignature": new_signature,
+        }
+        status, response = self.post_json(
+            f"/v1/machines/{missing}/keys", body, "rotate-missing"
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(response), {"error": "not_found"})
+
+    def test_rotation_same_key_different_machine_or_body_conflicts(self) -> None:
+        self.assertEqual(self.rotate()[0], 201)
+        # 同键异机器（即使机器未登记）：冲突先于机器查询。
+        missing = "ab" * 32
+        status, body = self.rotate(self.rotate_body(), machine=missing)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+        # 同键异体。
+        other = self.rotate_body(expected_version=2)
+        status, body = self.rotate(other)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_rotation_invalid_requests(self) -> None:
+        good = self.rotate_body()
+        cases = [
+            (json.dumps(dict(good, extra=1)).encode(), "rotate-x1"),
+            (json.dumps({k: v for k, v in good.items() if k != "expectedVersion"}).encode(), "rotate-x2"),
+            (json.dumps(dict(good, expectedVersion=0)).encode(), "rotate-x3"),
+            (json.dumps(dict(good, expectedVersion=2147483647)).encode(), "rotate-x4"),
+            (json.dumps(dict(good, expectedVersion=True)).encode(), "rotate-x5"),
+            (json.dumps(dict(good, expectedVersion="1")).encode(), "rotate-x6"),
+            (json.dumps(dict(good, publicKey="A" * 64)).encode(), "rotate-x7"),
+            (json.dumps(dict(good, currentSignature="0" * 127)).encode(), "rotate-x8"),
+            (json.dumps(dict(good, newSignature="g" * 128)).encode(), "rotate-x9"),
+            (b"{}", "rotate-x10"),
+            (b"not json", "rotate-x11"),
+        ]
+        for body, key in cases:
+            status, response = self.post_json(
+                f"/v1/machines/{self.machine_id}/keys", body, key
+            )
+            self.assertEqual(status, 400, body)
+            self.assertEqual(json.loads(response), {"error": "invalid_request"})
+        # 缺少/非法幂等头。
+        for key in (None, "", "bad key", "x" * 65):
+            status, response = self.post_json(
+                f"/v1/machines/{self.machine_id}/keys", good, key
+            )
+            self.assertEqual(status, 400, key)
+        # 查询参数非法先于体校验。
+        status, response = self.post_json(
+            f"/v1/machines/{self.machine_id}/keys?x=1", good, "rotate-q"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(response), {"error": "invalid_request"})
+
+    def test_rotation_concurrent_distinct_keys_single_winner(self) -> None:
+        def submit(index: int) -> int:
+            status, _ = self.rotate(
+                self.rotate_body(), key=f"rotate-race-{index}"
+            )
+            return status
+
+        with concurrent.futures.ThreadPoolExecutor(8) as executor:
+            results = list(executor.map(submit, range(8)))
+        self.assertEqual(sorted(results), [201] + [409] * 7)
+        self.assertEqual([row["version"] for row in self.key_rows()], [1, 2])
+
+    def test_revocation_success_and_replay(self) -> None:
+        self.assertEqual(self.rotate()[0], 201)
+        status, body = self.revoke(1)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"version": 1, "revoked": True})
+        self.assertEqual(self.key_rows()[0]["revoked"], 1)
+        # 重复吊销（同键重放）返回首次字节；重启后亦然。
+        self.assertEqual(self.revoke(1), (200, body))
+        self.restart()
+        self.assertEqual(self.revoke(1), (200, body))
+
+    def test_revoke_current_version_conflicts(self) -> None:
+        status, body = self.revoke(1, seed=self.PRODUCER_SEED)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+        self.assertEqual(self.rotate()[0], 201)
+        status, body = self.revoke(2)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+        self.assertEqual([row["revoked"] for row in self.key_rows()], [0, 0])
+
+    def test_revoke_already_revoked(self) -> None:
+        self.assertEqual(self.rotate()[0], 201)
+        self.assertEqual(self.revoke(1)[0], 200)
+        status, body = self.revoke(1, key="revoke-again")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "already_revoked"})
+
+    def test_revoke_invalid_signature(self) -> None:
+        self.assertEqual(self.rotate()[0], 201)
+        # 用已被轮换的旧密钥签署：验签失败。
+        status, body = self.revoke(1, seed=self.PRODUCER_SEED, key="revoke-old")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "invalid_signature"})
+        status, body = self.post_json(
+            f"/v1/machines/{self.machine_id}/keys/1/revocation",
+            {"signature": "0" * 128},
+            "revoke-bad",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "invalid_signature"})
+        self.assertEqual([row["revoked"] for row in self.key_rows()], [0, 0])
+
+    def test_revocation_uses_latest_key_after_multiple_rotations(self) -> None:
+        self.assertEqual(self.rotate()[0], 201)
+        current, new = key_rotation_signatures(
+            self.NEW_SEED, self.THIRD_SEED, self.machine_id, 2, self.third_public
+        )
+        status, _ = self.post_json(
+            f"/v1/machines/{self.machine_id}/keys",
+            {
+                "expectedVersion": 2,
+                "publicKey": self.third_public,
+                "currentSignature": current,
+                "newSignature": new,
+            },
+            "rotate-2",
+        )
+        self.assertEqual(status, 201)
+        # 吊销版本一须由最新（版本三）密钥签署。
+        status, body = self.revoke(1, seed=self.NEW_SEED, key="revoke-v2-signer")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "invalid_signature"})
+        status, body = self.revoke(1, seed=self.THIRD_SEED, key="revoke-v3-signer")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"version": 1, "revoked": True})
+
+    def test_revoke_missing_machine_or_version_is_404(self) -> None:
+        # 版本一为当前最新版本，吊销返回 409/conflict，而非 404。
+        status, _ = self.post_json(
+            f"/v1/machines/{self.machine_id}/keys/1/revocation",
+            {"signature": "0" * 128},
+            "revoke-current",
+        )
+        self.assertEqual(status, 409)
+        for version_text in ("0", "01", "abc"):
+            body = {"signature": "0" * 128}
+            status, response = self.post_json(
+                f"/v1/machines/{self.machine_id}/keys/{version_text}/revocation",
+                body,
+                f"revoke-bad-version-{version_text}",
+            )
+            self.assertEqual(status, 404, version_text)
+            self.assertEqual(json.loads(response), {"error": "not_found"})
+        missing = "ab" * 32
+        status, response = self.post_json(
+            f"/v1/machines/{missing}/keys/1/revocation",
+            {"signature": "0" * 128},
+            "revoke-missing-machine",
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(response), {"error": "not_found"})
+
+    def test_revocation_same_key_different_target_conflicts(self) -> None:
+        self.assertEqual(self.rotate()[0], 201)
+        self.assertEqual(self.revoke(1)[0], 200)
+        # 同键异版本。
+        status, body = self.post_json(
+            f"/v1/machines/{self.machine_id}/keys/2/revocation",
+            {"signature": key_revocation_signature(self.NEW_SEED, self.machine_id, 1)},
+            "revoke-1",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_revocation_invalid_requests(self) -> None:
+        # 体非法 / 查询参数 / 缺头均为 400。
+        for body, key in (
+            (b"{}", "r-bad-1"),
+            (json.dumps({"signature": "0" * 127}).encode(), "r-bad-2"),
+            (json.dumps({"signature": "Z" * 128}).encode(), "r-bad-3"),
+            (json.dumps({"signature": 123}).encode(), "r-bad-4"),
+            (json.dumps({"signature": "0" * 128, "extra": 1}).encode(), "r-bad-5"),
+        ):
+            status, response = self.post_json(
+                f"/v1/machines/{self.machine_id}/keys/1/revocation", body, key
+            )
+            self.assertEqual(status, 400, body)
+            self.assertEqual(json.loads(response), {"error": "invalid_request"})
+        status, response = self.post_json(
+            f"/v1/machines/{self.machine_id}/keys/1/revocation?x=1",
+            {"signature": "0" * 128},
+            "r-bad-query",
+        )
+        self.assertEqual(status, 400)
+        status, _ = self.post_json(
+            f"/v1/machines/{self.machine_id}/keys/1/revocation",
+            {"signature": "0" * 128},
+            None,
+        )
+        self.assertEqual(status, 400)
+
+    def activate_sla(self) -> None:
+        current = int(time.time())
+        self.start = current - 3600
+        self.end = current + 3600
+        capability = {
+            "expectedVersion": 0,
+            "name": "pump-01",
+            "protocol": "mqtt",
+            "region": "cn",
+            "unit": "call",
+            "capacity": 10,
+        }
+        status, _ = self.post_json(
+            f"/v1/machines/{self.machine_id}/capabilities", capability, "cap-1"
+        )
+        self.assertEqual(status, 201)
+        status, _ = self.post_json(
+            "/v1/sla-templates",
+            {
+                "id": "tpl-1",
+                "machineId": self.machine_id,
+                "capabilityVersion": 1,
+                "priceMicros": 1000,
+                "maxLatencyMs": 50,
+            },
+            "tpl-1",
+        )
+        self.assertEqual(status, 201)
+        status, _ = self.post_json(
+            "/v1/slas",
+            {
+                "id": "sla-1",
+                "templateId": "tpl-1",
+                "consumerId": self.consumer_id,
+                "start": self.start,
+                "end": self.end,
+            },
+            "sla-1",
+        )
+        self.assertEqual(status, 201)
+        for key, party, actor in (
+            ("conf-p", "producer", self.machine_id),
+            ("conf-c", "consumer", self.consumer_id),
+        ):
+            status, _ = self.post_json(
+                "/v1/slas/sla-1/confirmations",
+                {"party": party, "actorId": actor},
+                key,
+            )
+            self.assertEqual(status, 200)
+
+    def telemetry(
+        self,
+        seed: bytes,
+        key_version: int,
+        timestamp: int,
+        event_id: str,
+        idempotency_key: str,
+    ) -> tuple[int, bytes]:
+        digest = hashlib.sha256(
+            f"sla-1\n{event_id}\n{timestamp}\n12\n{self.machine_id}".encode()
+        ).hexdigest()
+        signature = telemetry_signature(
+            seed, "sla-1", event_id, timestamp, 12, digest,
+            self.machine_id, key_version,
+        )
+        return self.post_json(
+            "/v1/slas/sla-1/telemetry",
+            {
+                "eventId": event_id,
+                "timestamp": timestamp,
+                "latencyMs": 12,
+                "digest": digest,
+                "keyVersion": key_version,
+                "signature": signature,
+            },
+            idempotency_key,
+        )
+
+    def test_telemetry_key_version_windows_and_revocation(self) -> None:
+        self.activate_sla()
+        # 轮换前：版本一（零时激活）事件有效。
+        now_ms = int(time.time() * 1000)
+        status, body = self.telemetry(
+            self.PRODUCER_SEED, 1, now_ms, "evt-before", "tel-before"
+        )
+        self.assertEqual((status, body), (201, b'{"eventId":"evt-before"}'))
+        # 轮换：记录版本二激活时刻。
+        status, rotated = self.rotate(key="rotate-for-telemetry")
+        self.assertEqual(status, 201)
+        activated_at = json.loads(rotated)["activatedAt"]
+        # 旧版本事件在其激活区间（< activatedAt）内仍有效。
+        status, body = self.telemetry(
+            self.PRODUCER_SEED, 1, activated_at - 1, "evt-v1-old", "tel-v1-old"
+        )
+        self.assertEqual(status, 201, body)
+        # 恰为下一版本激活时刻：旧版本窗外，签名虽有效仍 invalid_signature。
+        status, body = self.telemetry(
+            self.PRODUCER_SEED, 1, activated_at, "evt-v1-edge", "tel-v1-edge"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "invalid_signature"})
+        # 新版本自激活时刻起生效（边界含下界）。
+        status, body = self.telemetry(
+            self.NEW_SEED, 2, activated_at, "evt-v2-edge", "tel-v2-edge"
+        )
+        self.assertEqual((status, body), (201, b'{"eventId":"evt-v2-edge"}'))
+        # 旧密钥签新版本消息 / 新密钥签旧版本消息：验签失败。
+        status, body = self.telemetry(
+            self.PRODUCER_SEED, 2, activated_at + 5, "evt-mix-a", "tel-mix-a"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "invalid_signature"})
+        # 未知密钥版本：invalid_signature。
+        status, body = self.telemetry(
+            self.NEW_SEED, 9, activated_at + 5, "evt-mix-b", "tel-mix-b"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "invalid_signature"})
+        # 吊销版本一：窗外之外，窗内（历史时刻）事件同样被拒。
+        self.assertEqual(self.revoke(1, key="revoke-v1")[0], 200)
+        status, body = self.telemetry(
+            self.PRODUCER_SEED, 1, activated_at - 1, "evt-v1-revoked", "tel-v1-rev"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "invalid_signature"})
+        # 版本二不受影响。
+        status, body = self.telemetry(
+            self.NEW_SEED, 2, activated_at + 10, "evt-v2-ok", "tel-v2-ok"
+        )
+        self.assertEqual(status, 201)
+
+    def test_telemetry_version_failure_leaves_no_trace_or_seq(self) -> None:
+        self.activate_sla()
+        status, body = self.rotate(key="rotate-for-telemetry")
+        self.assertEqual(status, 201)
+        activated_at = json.loads(body)["activatedAt"]
+        # 失败（窗外）不占幂等键、不写事件、不推进 commit_seq。
+        fail_status, _ = self.telemetry(
+            self.PRODUCER_SEED, 1, activated_at, "evt-x", "tel-x"
+        )
+        self.assertEqual(fail_status, 409)
+        status, body = self.telemetry(
+            self.NEW_SEED, 2, activated_at, "evt-x", "tel-x"
+        )
+        self.assertEqual(status, 201)
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            seq = connection.execute(
+                "SELECT commit_seq FROM sla_telemetry_events"
+                " WHERE sla_id = 'sla-1' AND event_id = 'evt-x'"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(seq, 1)
+
+
+class MachineKeysMigrationTests(unittest.TestCase):
+    """密钥历史升级前的旧库：machines 已存在但无 machine_keys 历史。"""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.database_path = str(Path(self.temporary.name) / "service.db")
+        self._build_old_database()
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = self.database_path
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def _build_old_database(self) -> None:
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute(
+                "CREATE TABLE schema_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            connection.execute("INSERT INTO schema_metadata VALUES ('schema_version', '1')")
+            connection.execute(
+                "CREATE TABLE machines (id TEXT PRIMARY KEY, public_key TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO machines VALUES (?, ?)",
+                (machine_id(PUBLIC_KEY_A), PUBLIC_KEY_A),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temporary.cleanup()
+
+    def url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}{path}"
+
+    def post_json(self, path: str, payload: object, key: str) -> tuple[int, bytes]:
+        request = Request(
+            self.url(path),
+            data=json.dumps(payload).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", key)
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def test_old_machines_backfilled_with_version_one(self) -> None:
+        # 任意请求触发服务端连接并执行一次性迁移。
+        with urlopen(self.url("/health"), timeout=5):
+            pass
+        connection = sqlite3.connect(self.database_path)
+        connection.row_factory = sqlite3.Row
+        try:
+            rows = connection.execute(
+                "SELECT machine_id, version, public_key, activated_at_ms, revoked"
+                " FROM machine_keys ORDER BY machine_id"
+            ).fetchall()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(
+                (
+                    rows[0]["machine_id"],
+                    rows[0]["version"],
+                    rows[0]["public_key"],
+                    rows[0]["activated_at_ms"],
+                    rows[0]["revoked"],
+                ),
+                (machine_id(PUBLIC_KEY_A), 1, PUBLIC_KEY_A, 0, 0),
+            )
+            marker = connection.execute(
+                "SELECT 1 FROM schema_metadata WHERE key = 'machine_keys_backfilled'"
+            ).fetchone()
+            self.assertIsNotNone(marker)
+        finally:
+            connection.close()
+        # 重启不重复补写。
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = self.database_path
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        connection = sqlite3.connect(self.database_path)
+        try:
+            count = connection.execute("SELECT COUNT(*) FROM machine_keys").fetchone()[0]
+            self.assertEqual(count, 1)
+        finally:
+            connection.close()
+
+    def test_rotation_works_from_backfilled_history(self) -> None:
+        new_seed = b"\x02" * 32
+        new_public = _ed25519_public_key(new_seed).hex()
+        machine = machine_id(PUBLIC_KEY_A)
+        current_signature, new_signature = key_rotation_signatures(
+            PRODUCER_SEED, new_seed, machine, 1, new_public
+        )
+        status, body = self.post_json(
+            f"/v1/machines/{machine}/keys",
+            {
+                "expectedVersion": 1,
+                "publicKey": new_public,
+                "currentSignature": current_signature,
+                "newSignature": new_signature,
+            },
+            "rotate-1",
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(body)["version"], 2)
+
+    def test_new_registration_after_migration_creates_version_one(self) -> None:
+        new_public = _ed25519_public_key(b"\x07" * 32).hex()
+        status, _ = self.post_json(
+            "/v1/machines", {"publicKey": new_public}, "register-new"
+        )
+        self.assertEqual(status, 201)
+        connection = sqlite3.connect(self.database_path)
+        connection.row_factory = sqlite3.Row
+        try:
+            row = connection.execute(
+                "SELECT version, activated_at_ms, revoked FROM machine_keys"
+                " WHERE machine_id = ?",
+                (machine_id(new_public),),
+            ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(
+                (row["version"], row["activated_at_ms"], row["revoked"]), (1, 0, 0)
+            )
+        finally:
+            connection.close()
 
 
 if __name__ == "__main__":
