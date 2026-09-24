@@ -24,6 +24,8 @@ SLA_EVALUATIONS_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/evaluations")
 SLA_SETTLEMENTS_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/settlements")
 ACCOUNT_LEDGER_PATH_PATTERN = re.compile(r"/v1/accounts/([^/]+)/ledger")
 FUNDS_PATH_PATTERN = re.compile(r"/v1/funds/([^/]+)")
+DISPUTE_PATH_PATTERN = re.compile(r"/v1/disputes/([^/]+)")
+DISPUTE_EVENTS_PATH_PATTERN = re.compile(r"/v1/disputes/([^/]+)/events")
 DISPUTE_RESOLUTION_PATH_PATTERN = re.compile(r"/v1/disputes/([^/]+)/resolution")
 CAPABILITY_FIELDS = {"expectedVersion", "name", "protocol", "region", "unit", "capacity"}
 SLA_TEMPLATE_FIELDS = {
@@ -51,6 +53,7 @@ TELEMETRY_QUERY_PARAMS = {"from", "to", "limit", "cursor"}
 EVALUATION_QUERY_PARAMS = {"limit", "cursor"}
 SETTLEMENT_QUERY_PARAMS = {"limit", "cursor"}
 LEDGER_QUERY_PARAMS = {"limit", "cursor"}
+DISPUTE_EVENTS_QUERY_PARAMS = {"limit", "cursor"}
 TELEMETRY_TIME_MAX = 2147483648000
 TELEMETRY_DEFAULT_LIMIT = 50
 TELEMETRY_MAX_LIMIT = 100
@@ -122,6 +125,14 @@ class Handler(BaseHTTPRequestHandler):
         ledger_match = ACCOUNT_LEDGER_PATH_PATTERN.fullmatch(target.path)
         if ledger_match is not None:
             self._get_ledger(ledger_match.group(1), target.query)
+            return
+        dispute_events_match = DISPUTE_EVENTS_PATH_PATTERN.fullmatch(target.path)
+        if dispute_events_match is not None:
+            self._get_dispute_events(dispute_events_match.group(1), target.query)
+            return
+        dispute_match = DISPUTE_PATH_PATTERN.fullmatch(target.path)
+        if dispute_match is not None:
+            self._get_dispute(dispute_match.group(1), target.query)
             return
         sla_match = SLA_PATH_PATTERN.fullmatch(target.path)
         if sla_match is not None:
@@ -641,6 +652,107 @@ class Handler(BaseHTTPRequestHandler):
         self._json(
             HTTPStatus.OK,
             {"entries": entries, "nextCursor": next_cursor},
+        )
+
+    def _get_dispute(self, dispute_id: str, query: str) -> None:
+        # 任何查询参数（含重复/无值）均在争议查询之前判为非法。
+        if parse_qsl(query, keep_blank_values=True):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        with closing(connect(self.server.database_path)) as database:
+            record = database.execute(
+                "SELECT id, settlement_seq, payer_id, payee_id, amount_micros, state"
+                " FROM disputes WHERE id = ?",
+                (dispute_id,),
+            ).fetchone()
+        if record is None:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        self._json(
+            HTTPStatus.OK,
+            {
+                "id": record["id"],
+                "settlementSeq": record["settlement_seq"],
+                "payerId": record["payer_id"],
+                "payeeId": record["payee_id"],
+                "amount": record["amount_micros"],
+                "state": record["state"],
+            },
+        )
+
+    def _get_dispute_events(self, dispute_id: str, query: str) -> None:
+        parsed = self._parse_evaluation_query(query, DISPUTE_EVENTS_QUERY_PARAMS)
+        if parsed is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        limit, cursor = parsed
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN")
+            try:
+                record = database.execute(
+                    "SELECT 1 FROM disputes WHERE id = ?", (dispute_id,)
+                ).fetchone()
+                if record is None:
+                    database.execute("ROLLBACK")
+                    self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                    return
+                max_record = database.execute(
+                    "SELECT MAX(event_seq) AS current_max FROM dispute_events"
+                ).fetchone()
+                current_max = max_record["current_max"]
+                if current_max is None:
+                    current_max = 0
+                if cursor is None:
+                    cut = current_max
+                    last_seq = 0
+                else:
+                    cut, last_seq = cursor
+                    if cut > current_max:
+                        database.execute("ROLLBACK")
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                        )
+                        return
+                    anchor = database.execute(
+                        "SELECT 1 FROM dispute_events"
+                        " WHERE dispute_id = ? AND event_seq = ? AND event_seq <= ?",
+                        (dispute_id, last_seq, cut),
+                    ).fetchone()
+                    if anchor is None:
+                        database.execute("ROLLBACK")
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                        )
+                        return
+                rows = database.execute(
+                    "SELECT event_seq, type, created_at_ms"
+                    " FROM dispute_events"
+                    " WHERE dispute_id = ? AND event_seq <= ? AND event_seq > ?"
+                    " ORDER BY event_seq ASC"
+                    " LIMIT ?",
+                    (dispute_id, cut, last_seq, limit + 1),
+                ).fetchall()
+                database.execute("ROLLBACK")
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+        has_next = len(rows) > limit
+        page = rows[:limit]
+        events = [
+            {
+                "eventSeq": row["event_seq"],
+                "type": row["type"],
+                "createdAt": row["created_at_ms"],
+            }
+            for row in page
+        ]
+        if has_next:
+            next_cursor = f"{cut}:{page[-1]['event_seq']}"
+        else:
+            next_cursor = None
+        self._json(
+            HTTPStatus.OK,
+            {"events": events, "nextCursor": next_cursor},
         )
 
     def do_POST(self) -> None:  # noqa: N802
@@ -1488,6 +1600,30 @@ class Handler(BaseHTTPRequestHandler):
             ),
         )
 
+    @staticmethod
+    def _next_dispute_event_seq(database: Any) -> int:
+        # 全库共享一条持久递增事件序号：取写锁后取最大序号 + 1（空表 1）。
+        record = database.execute(
+            "SELECT COALESCE(MAX(event_seq), 0) + 1 AS next_seq"
+            " FROM dispute_events"
+        ).fetchone()
+        return record["next_seq"]
+
+    @staticmethod
+    def _record_dispute_event(
+        database: Any,
+        event_seq: int,
+        dispute_id: str,
+        event_type: str,
+        created_at_ms: int,
+    ) -> None:
+        database.execute(
+            "INSERT INTO dispute_events"
+            "(event_seq, dispute_id, type, created_at_ms)"
+            " VALUES (?, ?, ?, ?)",
+            (event_seq, dispute_id, event_type, created_at_ms),
+        )
+
     def _apply_deposit(
         self, idempotency_key: str, machine_id: str, fields: dict[str, Any]
     ) -> tuple[HTTPStatus, dict[str, Any]]:
@@ -1670,13 +1806,14 @@ class Handler(BaseHTTPRequestHandler):
                     if payee_balance + amount > AMOUNT_CAP_MICROS:
                         database.execute("ROLLBACK")
                         return HTTPStatus.CONFLICT, {"error": "amount_overflow"}
-                    # 可用余额为总余额扣除全部 open 争议冻结后的非负值。
+                    # 可用余额为总余额扣除全部 open 争议冻结后与零的较大值；
+                    # 旧库冻结超额时按零判断，结算不透支。
                     frozen_record = database.execute(
                         "SELECT COALESCE(SUM(amount_micros), 0) AS frozen"
                         " FROM disputes WHERE payee_id = ? AND state = 'open'",
                         (payer_id,),
                     ).fetchone()
-                    payer_available = payer_balance - frozen_record["frozen"]
+                    payer_available = max(payer_balance - frozen_record["frozen"], 0)
                     if payer_available < amount:
                         database.execute("ROLLBACK")
                         return HTTPStatus.CONFLICT, {"error": "insufficient_funds"}
@@ -1825,6 +1962,12 @@ class Handler(BaseHTTPRequestHandler):
                         amount,
                     ),
                 )
+                # 生命周期 opened 事件与争议、幂等结果同事务原子提交。
+                event_seq = self._next_dispute_event_seq(database)
+                created_at_ms = int(datetime.now(UTC).timestamp() * 1000)
+                self._record_dispute_event(
+                    database, event_seq, fields["id"], "opened", created_at_ms
+                )
                 payload = {"id": fields["id"], "open": True, "amount": amount}
                 database.execute(
                     "INSERT INTO dispute_idempotency_records"
@@ -1931,6 +2074,11 @@ class Handler(BaseHTTPRequestHandler):
                 database.execute(
                     "UPDATE disputes SET state = ? WHERE id = ?",
                     (new_state, dispute_id),
+                )
+                # 生命周期裁决事件与状态、余额、分录、幂等结果同事务原子提交。
+                event_seq = self._next_dispute_event_seq(database)
+                self._record_dispute_event(
+                    database, event_seq, dispute_id, new_state, created_at_ms
                 )
                 database.execute(
                     "INSERT INTO dispute_resolution_idempotency_records"
