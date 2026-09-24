@@ -147,6 +147,30 @@ CREATE TABLE IF NOT EXISTS settlement_idempotency_records (
     status INTEGER NOT NULL,
     response_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS disputes (
+    id TEXT PRIMARY KEY,
+    settlement_seq INTEGER NOT NULL UNIQUE,
+    claimant_id TEXT NOT NULL,
+    payer_id TEXT NOT NULL,
+    payee_id TEXT NOT NULL,
+    amount_micros INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    resolved_at_ms INTEGER
+);
+CREATE TABLE IF NOT EXISTS dispute_idempotency_records (
+    key TEXT PRIMARY KEY,
+    request_json TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    response_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS dispute_resolution_idempotency_records (
+    key TEXT PRIMARY KEY,
+    dispute_id TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    response_json TEXT NOT NULL
+);
 """
 
 TELEMETRY_SEQ_MARKER = "telemetry_commit_seq_renumbered"
@@ -299,6 +323,10 @@ def connect(path: str) -> sqlite3.Connection:
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_ledger_entries_account_seq"
         " ON ledger_entries(account_id, entry_seq)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_disputes_payee_state"
+        " ON disputes(payee_id, state)"
     )
     return connection
 
