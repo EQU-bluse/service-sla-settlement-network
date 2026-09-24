@@ -86,6 +86,7 @@ CREATE TABLE IF NOT EXISTS sla_telemetry_events (
     latency_ms INTEGER NOT NULL,
     digest TEXT NOT NULL,
     commit_seq INTEGER NOT NULL,
+    signature TEXT,
     PRIMARY KEY (sla_id, event_id)
 );
 CREATE TABLE IF NOT EXISTS sla_telemetry_idempotency_records (
@@ -215,6 +216,7 @@ ON dispute_evidence_proofs(evidence_seq, proof_seq);
 
 TELEMETRY_SEQ_MARKER = "telemetry_commit_seq_renumbered"
 TELEMETRY_SEQ_INDEX = "idx_sla_telemetry_commit_seq_unique"
+TELEMETRY_SIGNATURE_MARKER = "telemetry_signature_added"
 EVALUATION_SEQ_MARKER = "evaluation_seq_renumbered"
 EVALUATION_SEQ_INDEX = "idx_sla_evaluation_seq_unique"
 DISPUTE_EVENT_MARKER = "dispute_events_backfilled"
@@ -260,6 +262,39 @@ def _renumber_commit_seq(connection: sqlite3.Connection) -> None:
         connection.execute(
             f"CREATE UNIQUE INDEX IF NOT EXISTS {TELEMETRY_SEQ_INDEX}"
             " ON sla_telemetry_events(commit_seq)"
+        )
+        connection.execute("COMMIT")
+    except BaseException:
+        connection.execute("ROLLBACK")
+        raise
+
+
+def _add_telemetry_signature_column(connection: sqlite3.Connection) -> None:
+    # 仅在一次性迁移（含空库首次连接）时取写锁；BEGIN IMMEDIATE 串行并发首启。
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        if (
+            connection.execute(
+                "SELECT 1 FROM schema_metadata WHERE key = ?",
+                (TELEMETRY_SIGNATURE_MARKER,),
+            ).fetchone()
+            is not None
+        ):
+            # 其他连接已完成迁移，直接释放写锁。
+            connection.execute("COMMIT")
+            return
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(sla_telemetry_events)")
+        }
+        if "signature" not in columns:
+            # 旧库补可空签名列：既有事件保持 NULL（无签名），不补造、不重排序号。
+            connection.execute(
+                "ALTER TABLE sla_telemetry_events ADD COLUMN signature TEXT"
+            )
+        connection.execute(
+            "INSERT INTO schema_metadata(key, value) VALUES (?, '1')",
+            (TELEMETRY_SIGNATURE_MARKER,),
         )
         connection.execute("COMMIT")
     except BaseException:
@@ -395,6 +430,14 @@ def connect(path: str) -> sqlite3.Connection:
         "CREATE INDEX IF NOT EXISTS idx_sla_telemetry_commit"
         " ON sla_telemetry_events(sla_id, commit_seq, timestamp_ms, event_id)"
     )
+    if (
+        connection.execute(
+            "SELECT 1 FROM schema_metadata WHERE key = ?",
+            (TELEMETRY_SIGNATURE_MARKER,),
+        ).fetchone()
+        is None
+    ):
+        _add_telemetry_signature_column(connection)
     if (
         connection.execute(
             "SELECT 1 FROM schema_metadata WHERE key = ?",
