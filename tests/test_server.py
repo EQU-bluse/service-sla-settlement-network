@@ -2777,6 +2777,594 @@ class EvaluationMigrationTests(unittest.TestCase):
             self.assertEqual(response.read(), old_snapshot)
 
 
+class FundTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.machine_id = machine_id(PUBLIC_KEY_A)
+        self.other_id = machine_id(PUBLIC_KEY_B)
+        for key, public_key in (("register-1", PUBLIC_KEY_A), ("register-2", PUBLIC_KEY_B)):
+            request = Request(
+                self.url("/v1/machines"),
+                data=json.dumps({"publicKey": public_key}).encode(),
+                method="POST",
+            )
+            request.add_header("Idempotency-Key", key)
+            with urlopen(request, timeout=5) as response:
+                self.assertEqual(response.status, 201)
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temporary.cleanup()
+
+    def url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}{path}"
+
+    def deposit_body(self, amount: object = 1000, reference: object = "ref-1") -> bytes:
+        return json.dumps({"amountMicros": amount, "reference": reference}).encode()
+
+    def post_deposit(
+        self,
+        body: bytes | None = None,
+        machine: str | None = None,
+        idempotency_key: str | None = "fund-1",
+    ) -> tuple[int, bytes, str]:
+        if body is None:
+            body = self.deposit_body()
+        if machine is None:
+            machine = self.machine_id
+        request = Request(self.url(f"/v1/funds/{machine}"), data=body, method="POST")
+        if idempotency_key is not None:
+            request.add_header("Idempotency-Key", idempotency_key)
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read(), response.headers["Content-Type"]
+        except HTTPError as error:
+            return error.code, error.read(), error.headers["Content-Type"]
+
+    def test_deposit_created_with_sequence_and_balance(self) -> None:
+        status, body, content_type = self.post_deposit()
+        self.assertEqual(status, 201)
+        self.assertEqual(content_type, "application/json; charset=utf-8")
+        self.assertEqual(
+            body.decode("utf-8"),
+            json.dumps({"depositSeq": 1, "balance": 1000}, separators=(",", ":")),
+        )
+        self.assertFalse(body.endswith(b"\n"))
+
+    def test_deposit_accumulates_balance_and_sequence(self) -> None:
+        self.assertEqual(self.post_deposit()[0], 201)
+        status, body, _ = self.post_deposit(
+            self.deposit_body(2500, "ref-2"), idempotency_key="fund-2"
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(body), {"depositSeq": 2, "balance": 3500})
+
+    def test_deposit_sequences_are_global_across_machines(self) -> None:
+        self.assertEqual(self.post_deposit()[0], 201)
+        status, body, _ = self.post_deposit(
+            self.deposit_body(10, "ref-2"), machine=self.other_id, idempotency_key="fund-2"
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(body), {"depositSeq": 2, "balance": 10})
+
+    def test_deposit_writes_opposite_clearing_entry(self) -> None:
+        self.assertEqual(self.post_deposit()[0], 201)
+        connection = sqlite3.connect(self.server.database_path)
+        connection.row_factory = sqlite3.Row
+        try:
+            entries = connection.execute(
+                "SELECT account_id, delta_micros, balance_after_micros"
+                " FROM ledger_entries ORDER BY entry_seq ASC"
+            ).fetchall()
+            self.assertEqual(
+                [
+                    (row["account_id"], row["delta_micros"], row["balance_after_micros"])
+                    for row in entries
+                ],
+                [(self.machine_id, 1000, 1000), ("external:clearing", -1000, -1000)],
+            )
+        finally:
+            connection.close()
+
+    def test_replay_returns_first_response_bytes(self) -> None:
+        _, first, _ = self.post_deposit()
+        status, body, _ = self.post_deposit()
+        self.assertEqual(status, 201)
+        self.assertEqual(body, first)
+
+    def test_same_key_different_request_conflicts(self) -> None:
+        self.assertEqual(self.post_deposit()[0], 201)
+        status, body, _ = self.post_deposit(self.deposit_body(2000, "ref-1"))
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+        status, body, _ = self.post_deposit(machine=self.other_id)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_unknown_machine_is_404(self) -> None:
+        status, body, _ = self.post_deposit(machine="ab" * 32)
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+
+    def test_missing_or_invalid_idempotency_key(self) -> None:
+        status, body, _ = self.post_deposit(idempotency_key=None)
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        status, body, _ = self.post_deposit(idempotency_key="bad key!")
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+
+    def test_invalid_bodies(self) -> None:
+        bodies = [
+            b"{}",
+            b'{"amountMicros":1000}',
+            b'{"reference":"ref-1"}',
+            b'{"amountMicros":1000,"reference":"ref-1","extra":1}',
+            b'{"amountMicros":0,"reference":"ref-1"}',
+            b'{"amountMicros":-5,"reference":"ref-1"}',
+            b'{"amountMicros":9000000000000001,"reference":"ref-1"}',
+            b'{"amountMicros":true,"reference":"ref-1"}',
+            b'{"amountMicros":"1000","reference":"ref-1"}',
+            b'{"amountMicros":1000,"reference":"BAD_REF"}',
+            b'{"amountMicros":1000,"reference":""}',
+            b'{"amountMicros":1000,"reference":1}',
+            b'{"amountMicros":1000,"amountMicros":1000,"reference":"ref-1"}',
+            b"not-json",
+        ]
+        for index, body in enumerate(bodies):
+            with self.subTest(index=index):
+                status, payload, _ = self.post_deposit(body, idempotency_key=f"bad-{index}")
+                self.assertEqual(status, 400)
+                self.assertEqual(json.loads(payload), {"error": "invalid_request"})
+
+    def test_boundary_amount_accepted(self) -> None:
+        status, body, _ = self.post_deposit(self.deposit_body(9000000000000000, "ref-1"))
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(body), {"depositSeq": 1, "balance": 9000000000000000})
+
+    def test_failed_request_leaves_no_idempotency_record(self) -> None:
+        status, _, _ = self.post_deposit(machine="ab" * 32)
+        self.assertEqual(status, 404)
+        status, body, _ = self.post_deposit()
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(body)["depositSeq"], 1)
+
+    def test_replay_survives_restart(self) -> None:
+        _, first, _ = self.post_deposit()
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        status, body, _ = self.post_deposit()
+        self.assertEqual(status, 201)
+        self.assertEqual(body, first)
+
+    def test_concurrent_same_key_single_deposit(self) -> None:
+        results: list[tuple[int, bytes]] = []
+        lock = threading.Lock()
+
+        def deposit() -> None:
+            outcome = self.post_deposit()
+            with lock:
+                results.append((outcome[0], outcome[1]))
+
+        threads = [threading.Thread(target=deposit) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual([status for status, _ in results], [201] * 8)
+        self.assertEqual(len({body for _, body in results}), 1)
+        status, body, _ = self.post_deposit(
+            self.deposit_body(1, "ref-2"), idempotency_key="fund-2"
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(body), {"depositSeq": 2, "balance": 1001})
+
+
+class SettlementTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.machine_id = machine_id(PUBLIC_KEY_A)
+        self.consumer_id = machine_id(PUBLIC_KEY_B)
+        for key, public_key in (("register-1", PUBLIC_KEY_A), ("register-2", PUBLIC_KEY_B)):
+            request = Request(
+                self.url("/v1/machines"),
+                data=json.dumps({"publicKey": public_key}).encode(),
+                method="POST",
+            )
+            request.add_header("Idempotency-Key", key)
+            with urlopen(request, timeout=5) as response:
+                self.assertEqual(response.status, 201)
+        request = Request(
+            self.url(f"/v1/machines/{self.machine_id}/capabilities"),
+            data=json.dumps(
+                {
+                    "expectedVersion": 0,
+                    "name": "pump-01",
+                    "protocol": "mqtt",
+                    "region": "cn",
+                    "unit": "call",
+                    "capacity": 10,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "cap-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        request = Request(
+            self.url("/v1/sla-templates"),
+            data=json.dumps(
+                {
+                    "id": "tpl-1",
+                    "machineId": self.machine_id,
+                    "capabilityVersion": 1,
+                    "priceMicros": 1000,
+                    "maxLatencyMs": 50,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "tpl-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        current = int(time.time())
+        self.start = current - 10
+        self.end = current + 3600
+        self.create_sla("sla-1", "sla-create-1")
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temporary.cleanup()
+
+    def url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}{path}"
+
+    def create_sla(self, sla_id: str, key: str) -> None:
+        request = Request(
+            self.url("/v1/slas"),
+            data=json.dumps(
+                {
+                    "id": sla_id,
+                    "templateId": "tpl-1",
+                    "consumerId": self.consumer_id,
+                    "start": self.start,
+                    "end": self.end,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", key)
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+
+    def activate(self, sla_id: str = "sla-1") -> None:
+        for index, (party, actor) in enumerate(
+            (
+                ("producer", self.machine_id),
+                ("consumer", self.consumer_id),
+            )
+        ):
+            request = Request(
+                self.url(f"/v1/slas/{sla_id}/confirmations"),
+                data=json.dumps({"party": party, "actorId": actor}).encode(),
+                method="POST",
+            )
+            request.add_header("Idempotency-Key", f"conf-{sla_id}-{index}")
+            with urlopen(request, timeout=5) as response:
+                self.assertEqual(response.status, 200)
+
+    def add_event(self, index: int, timestamp: int, latency_ms: int) -> None:
+        event_id = f"evt-{index:03d}"
+        message = (
+            f"sla-1\n{event_id}\n{timestamp}\n{latency_ms}\n{self.machine_id}"
+        )
+        body = json.dumps(
+            {
+                "eventId": event_id,
+                "timestamp": timestamp,
+                "latencyMs": latency_ms,
+                "digest": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+            }
+        ).encode()
+        request = Request(self.url("/v1/slas/sla-1/telemetry"), data=body, method="POST")
+        request.add_header("Idempotency-Key", f"tel-{index}")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+
+    def evaluate(self, key: str = "eval-1") -> int:
+        body = json.dumps({"from": self.start * 1000, "to": self.end * 1000}).encode()
+        request = Request(self.url("/v1/slas/sla-1/evaluations"), data=body, method="POST")
+        request.add_header("Idempotency-Key", key)
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+            return json.loads(response.read())["evaluationSeq"]
+
+    def deposit(self, machine: str, amount: int, key: str) -> None:
+        request = Request(
+            self.url(f"/v1/funds/{machine}"),
+            data=json.dumps({"amountMicros": amount, "reference": "ref-1"}).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", key)
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+
+    def post_settlement(
+        self,
+        body: bytes | None = None,
+        idempotency_key: str | None = "settle-1",
+    ) -> tuple[int, bytes, str]:
+        if body is None:
+            body = json.dumps({"slaId": "sla-1", "evaluationSeq": 1}).encode()
+        request = Request(self.url("/v1/settlements"), data=body, method="POST")
+        if idempotency_key is not None:
+            request.add_header("Idempotency-Key", idempotency_key)
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read(), response.headers["Content-Type"]
+        except HTTPError as error:
+            return error.code, error.read(), error.headers["Content-Type"]
+
+    def balance(self, account_id: str) -> int:
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            row = connection.execute(
+                "SELECT balance_micros FROM ledger_accounts WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+            return row[0] if row is not None else 0
+        finally:
+            connection.close()
+
+    def test_fulfilled_charges_consumer_to_producer(self) -> None:
+        self.activate()
+        self.add_event(1, self.start * 1000 + 1, 10)
+        self.add_event(2, self.start * 1000 + 2, 20)
+        evaluation_seq = self.evaluate()
+        self.deposit(self.consumer_id, 5000, "fund-1")
+        before = int(time.time() * 1000)
+        status, body, content_type = self.post_settlement(
+            json.dumps({"slaId": "sla-1", "evaluationSeq": evaluation_seq}).encode()
+        )
+        after = int(time.time() * 1000)
+        self.assertEqual(status, 201)
+        self.assertEqual(content_type, "application/json; charset=utf-8")
+        payload = json.loads(body)
+        self.assertEqual(
+            list(payload),
+            ["settlementSeq", "evaluationSeq", "result", "amount", "createdAt"],
+        )
+        self.assertEqual(payload["settlementSeq"], 1)
+        self.assertEqual(payload["evaluationSeq"], evaluation_seq)
+        self.assertEqual(payload["result"], "charged")
+        self.assertEqual(payload["amount"], 2000)
+        self.assertTrue(before <= payload["createdAt"] <= after)
+        self.assertFalse(body.endswith(b"\n"))
+        self.assertEqual(self.balance(self.consumer_id), 3000)
+        self.assertEqual(self.balance(self.machine_id), 2000)
+
+    def test_breached_compensates_producer_to_consumer(self) -> None:
+        self.activate()
+        self.add_event(1, self.start * 1000 + 1, 10)
+        self.add_event(2, self.start * 1000 + 2, 60)
+        self.add_event(3, self.start * 1000 + 3, 70)
+        evaluation_seq = self.evaluate()
+        self.deposit(self.machine_id, 5000, "fund-1")
+        status, body, _ = self.post_settlement(
+            json.dumps({"slaId": "sla-1", "evaluationSeq": evaluation_seq}).encode()
+        )
+        self.assertEqual(status, 201)
+        payload = json.loads(body)
+        self.assertEqual(payload["result"], "compensated")
+        self.assertEqual(payload["amount"], 2000)
+        self.assertEqual(self.balance(self.machine_id), 3000)
+        self.assertEqual(self.balance(self.consumer_id), 2000)
+
+    def test_insufficient_creates_zero_pending_without_entries(self) -> None:
+        self.activate()
+        evaluation_seq = self.evaluate()
+        status, body, _ = self.post_settlement(
+            json.dumps({"slaId": "sla-1", "evaluationSeq": evaluation_seq}).encode()
+        )
+        self.assertEqual(status, 201)
+        payload = json.loads(body)
+        self.assertEqual(payload["result"], "pending")
+        self.assertEqual(payload["amount"], 0)
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            entries = connection.execute(
+                "SELECT COUNT(*) FROM ledger_entries"
+            ).fetchone()[0]
+            self.assertEqual(entries, 0)
+        finally:
+            connection.close()
+
+    def test_replay_returns_first_response_bytes(self) -> None:
+        self.activate()
+        evaluation_seq = self.evaluate()
+        body = json.dumps({"slaId": "sla-1", "evaluationSeq": evaluation_seq}).encode()
+        _, first, _ = self.post_settlement(body)
+        status, replay, _ = self.post_settlement(body)
+        self.assertEqual(status, 201)
+        self.assertEqual(replay, first)
+
+    def test_same_key_different_request_conflicts(self) -> None:
+        self.activate()
+        evaluation_seq = self.evaluate()
+        body = json.dumps({"slaId": "sla-1", "evaluationSeq": evaluation_seq}).encode()
+        self.assertEqual(self.post_settlement(body)[0], 201)
+        status, payload, _ = self.post_settlement(
+            json.dumps({"slaId": "sla-1", "evaluationSeq": evaluation_seq + 1}).encode()
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "conflict"})
+
+    def test_different_key_same_evaluation_is_settlement_exists(self) -> None:
+        self.activate()
+        evaluation_seq = self.evaluate()
+        body = json.dumps({"slaId": "sla-1", "evaluationSeq": evaluation_seq}).encode()
+        self.assertEqual(self.post_settlement(body)[0], 201)
+        status, payload, _ = self.post_settlement(body, idempotency_key="settle-2")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "settlement_exists"})
+
+    def test_missing_sla_or_evaluation_is_404(self) -> None:
+        self.activate()
+        evaluation_seq = self.evaluate()
+        status, payload, _ = self.post_settlement(
+            json.dumps({"slaId": "sla-9", "evaluationSeq": evaluation_seq}).encode()
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(payload), {"error": "not_found"})
+        status, payload, _ = self.post_settlement(
+            json.dumps({"slaId": "sla-1", "evaluationSeq": evaluation_seq + 100}).encode()
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(payload), {"error": "not_found"})
+
+    def test_pending_sla_conflicts(self) -> None:
+        self.activate()
+        evaluation_seq = self.evaluate()
+        self.create_sla("sla-2", "sla-create-2")
+        status, payload, _ = self.post_settlement(
+            json.dumps({"slaId": "sla-2", "evaluationSeq": evaluation_seq}).encode()
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "conflict"})
+
+    def test_evaluation_of_other_sla_conflicts(self) -> None:
+        self.activate()
+        evaluation_seq = self.evaluate()
+        self.create_sla("sla-2", "sla-create-2")
+        self.activate("sla-2")
+        status, payload, _ = self.post_settlement(
+            json.dumps({"slaId": "sla-2", "evaluationSeq": evaluation_seq}).encode()
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "conflict"})
+
+    def test_insufficient_funds_has_no_side_effects(self) -> None:
+        self.activate()
+        self.add_event(1, self.start * 1000 + 1, 10)
+        evaluation_seq = self.evaluate()
+        self.deposit(self.consumer_id, 500, "fund-1")
+        status, payload, _ = self.post_settlement(
+            json.dumps({"slaId": "sla-1", "evaluationSeq": evaluation_seq}).encode()
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "insufficient_funds"})
+        self.assertEqual(self.balance(self.consumer_id), 500)
+        self.assertEqual(self.balance(self.machine_id), 0)
+        # 失败不留幂等记录：同键补足余额后可重试。
+        self.deposit(self.consumer_id, 500, "fund-2")
+        status, body, _ = self.post_settlement(
+            json.dumps({"slaId": "sla-1", "evaluationSeq": evaluation_seq}).encode()
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(body)["amount"], 1000)
+
+    def test_amount_overflow_on_payee_balance(self) -> None:
+        self.activate()
+        self.add_event(1, self.start * 1000 + 1, 10)
+        evaluation_seq = self.evaluate()
+        self.deposit(self.consumer_id, 9000000000000000, "fund-1")
+        self.deposit(self.machine_id, 9000000000000000, "fund-2")
+        status, payload, _ = self.post_settlement(
+            json.dumps({"slaId": "sla-1", "evaluationSeq": evaluation_seq}).encode()
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "amount_overflow"})
+        self.assertEqual(self.balance(self.consumer_id), 9000000000000000)
+        self.assertEqual(self.balance(self.machine_id), 9000000000000000)
+
+    def test_invalid_bodies(self) -> None:
+        bodies = [
+            b"{}",
+            b'{"slaId":"sla-1"}',
+            b'{"evaluationSeq":1}',
+            b'{"slaId":"sla-1","evaluationSeq":1,"extra":1}',
+            b'{"slaId":"BAD","evaluationSeq":1}',
+            b'{"slaId":1,"evaluationSeq":1}',
+            b'{"slaId":"sla-1","evaluationSeq":0}',
+            b'{"slaId":"sla-1","evaluationSeq":-1}',
+            b'{"slaId":"sla-1","evaluationSeq":true}',
+            b'{"slaId":"sla-1","evaluationSeq":"1"}',
+            b"not-json",
+        ]
+        for index, body in enumerate(bodies):
+            with self.subTest(index=index):
+                status, payload, _ = self.post_settlement(
+                    body, idempotency_key=f"bad-{index}"
+                )
+                self.assertEqual(status, 400)
+                self.assertEqual(json.loads(payload), {"error": "invalid_request"})
+
+    def test_missing_or_invalid_idempotency_key(self) -> None:
+        status, payload, _ = self.post_settlement(idempotency_key=None)
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(payload), {"error": "invalid_request"})
+        status, payload, _ = self.post_settlement(idempotency_key="bad key!")
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(payload), {"error": "invalid_request"})
+
+    def test_settlement_sequences_are_global(self) -> None:
+        self.activate()
+        self.add_event(1, self.start * 1000 + 1, 10)
+        first_seq = self.evaluate("eval-1")
+        self.create_sla("sla-2", "sla-create-2")
+        self.activate("sla-2")
+        body = json.dumps({"from": self.start * 1000, "to": self.end * 1000}).encode()
+        request = Request(self.url("/v1/slas/sla-2/evaluations"), data=body, method="POST")
+        request.add_header("Idempotency-Key", "eval-2")
+        with urlopen(request, timeout=5) as response:
+            second_seq = json.loads(response.read())["evaluationSeq"]
+        self.deposit(self.consumer_id, 5000, "fund-1")
+        status, payload, _ = self.post_settlement(
+            json.dumps({"slaId": "sla-1", "evaluationSeq": first_seq}).encode()
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(payload)["settlementSeq"], 1)
+        status, payload, _ = self.post_settlement(
+            json.dumps({"slaId": "sla-2", "evaluationSeq": second_seq}).encode(),
+            idempotency_key="settle-2",
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(payload)["settlementSeq"], 2)
+
+    def test_replay_survives_restart(self) -> None:
+        self.activate()
+        evaluation_seq = self.evaluate()
+        body = json.dumps({"slaId": "sla-1", "evaluationSeq": evaluation_seq}).encode()
+        _, first, _ = self.post_settlement(body)
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        status, replay, _ = self.post_settlement(body)
+        self.assertEqual(status, 201)
+        self.assertEqual(replay, first)
+
+
 if __name__ == "__main__":
     unittest.main()
 

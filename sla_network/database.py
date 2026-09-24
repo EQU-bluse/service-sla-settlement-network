@@ -104,6 +104,49 @@ CREATE TABLE IF NOT EXISTS sla_evaluation_idempotency_records (
     evaluation_seq INTEGER NOT NULL DEFAULT 0,
     created_at_ms INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS ledger_accounts (
+    account_id TEXT PRIMARY KEY,
+    balance_micros INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ledger_entries (
+    entry_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    reference_seq INTEGER NOT NULL,
+    account_id TEXT NOT NULL,
+    delta_micros INTEGER NOT NULL,
+    balance_after_micros INTEGER NOT NULL,
+    created_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS fund_deposits (
+    deposit_seq INTEGER PRIMARY KEY,
+    machine_id TEXT NOT NULL,
+    amount_micros INTEGER NOT NULL,
+    reference TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS fund_idempotency_records (
+    key TEXT PRIMARY KEY,
+    machine_id TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    response_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS settlements (
+    settlement_seq INTEGER PRIMARY KEY,
+    sla_id TEXT NOT NULL,
+    evaluation_seq INTEGER NOT NULL UNIQUE,
+    result TEXT NOT NULL,
+    amount_micros INTEGER NOT NULL,
+    payer_id TEXT,
+    payee_id TEXT,
+    created_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS settlement_idempotency_records (
+    key TEXT PRIMARY KEY,
+    request_json TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    response_json TEXT NOT NULL
+);
 """
 
 TELEMETRY_SEQ_MARKER = "telemetry_commit_seq_renumbered"
