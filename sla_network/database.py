@@ -292,5 +292,13 @@ def connect(path: str) -> sqlite3.Connection:
         "CREATE INDEX IF NOT EXISTS idx_sla_evaluation_seq"
         " ON sla_evaluation_idempotency_records(sla_id, evaluation_seq)"
     )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_settlements_sla_seq"
+        " ON settlements(sla_id, settlement_seq)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ledger_entries_account_seq"
+        " ON ledger_entries(account_id, entry_seq)"
+    )
     return connection
 

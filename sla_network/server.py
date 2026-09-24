@@ -21,6 +21,8 @@ SLA_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)")
 SLA_CONFIRMATIONS_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/confirmations")
 SLA_TELEMETRY_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/telemetry")
 SLA_EVALUATIONS_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/evaluations")
+SLA_SETTLEMENTS_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/settlements")
+ACCOUNT_LEDGER_PATH_PATTERN = re.compile(r"/v1/accounts/([^/]+)/ledger")
 FUNDS_PATH_PATTERN = re.compile(r"/v1/funds/([^/]+)")
 CAPABILITY_FIELDS = {"expectedVersion", "name", "protocol", "region", "unit", "capacity"}
 SLA_TEMPLATE_FIELDS = {
@@ -42,6 +44,8 @@ INT64_MAX = 9_223_372_036_854_775_807
 CLEARING_ACCOUNT_ID = "external:clearing"
 TELEMETRY_QUERY_PARAMS = {"from", "to", "limit", "cursor"}
 EVALUATION_QUERY_PARAMS = {"limit", "cursor"}
+SETTLEMENT_QUERY_PARAMS = {"limit", "cursor"}
+LEDGER_QUERY_PARAMS = {"limit", "cursor"}
 TELEMETRY_TIME_MAX = 2147483648000
 TELEMETRY_DEFAULT_LIMIT = 50
 TELEMETRY_MAX_LIMIT = 100
@@ -105,6 +109,14 @@ class Handler(BaseHTTPRequestHandler):
         evaluations_match = SLA_EVALUATIONS_PATH_PATTERN.fullmatch(target.path)
         if evaluations_match is not None:
             self._get_evaluations(evaluations_match.group(1), target.query)
+            return
+        settlements_match = SLA_SETTLEMENTS_PATH_PATTERN.fullmatch(target.path)
+        if settlements_match is not None:
+            self._get_settlements(settlements_match.group(1), target.query)
+            return
+        ledger_match = ACCOUNT_LEDGER_PATH_PATTERN.fullmatch(target.path)
+        if ledger_match is not None:
+            self._get_ledger(ledger_match.group(1), target.query)
             return
         sla_match = SLA_PATH_PATTERN.fullmatch(target.path)
         if sla_match is not None:
@@ -317,12 +329,12 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def _parse_evaluation_query(
-        self, query: str
+        self, query: str, allowed_params: set[str] = EVALUATION_QUERY_PARAMS
     ) -> tuple[int, tuple[int, int] | None] | None:
         parameters: dict[str, list[str]] = {}
         for key, value in parse_qsl(query, keep_blank_values=True):
             parameters.setdefault(key, []).append(value)
-        if not set(parameters) <= EVALUATION_QUERY_PARAMS:
+        if not set(parameters) <= allowed_params:
             return None
         if any(len(values) != 1 for values in parameters.values()):
             return None
@@ -433,6 +445,196 @@ class Handler(BaseHTTPRequestHandler):
         self._json(
             HTTPStatus.OK,
             {"evaluations": evaluations, "nextCursor": next_cursor},
+        )
+
+    def _get_settlements(self, sla_id: str, query: str) -> None:
+        parsed = self._parse_evaluation_query(query, SETTLEMENT_QUERY_PARAMS)
+        if parsed is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        limit, cursor = parsed
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN")
+            try:
+                record = database.execute(
+                    "SELECT 1 FROM slas WHERE id = ?", (sla_id,)
+                ).fetchone()
+                if record is None:
+                    database.execute("ROLLBACK")
+                    self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                    return
+                max_record = database.execute(
+                    "SELECT MAX(settlement_seq) AS current_max FROM settlements"
+                ).fetchone()
+                current_max = max_record["current_max"]
+                if current_max is None:
+                    current_max = 0
+                if cursor is None:
+                    cut = current_max
+                    last_seq = 0
+                else:
+                    cut, last_seq = cursor
+                    if cut > current_max:
+                        database.execute("ROLLBACK")
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                        )
+                        return
+                    anchor = database.execute(
+                        "SELECT 1 FROM settlements"
+                        " WHERE sla_id = ? AND settlement_seq = ? AND settlement_seq <= ?",
+                        (sla_id, last_seq, cut),
+                    ).fetchone()
+                    if anchor is None:
+                        database.execute("ROLLBACK")
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                        )
+                        return
+                rows = database.execute(
+                    "SELECT settlement_seq, evaluation_seq, result, amount_micros,"
+                    " payer_id, payee_id, created_at_ms"
+                    " FROM settlements"
+                    " WHERE sla_id = ? AND settlement_seq <= ? AND settlement_seq > ?"
+                    " ORDER BY settlement_seq ASC"
+                    " LIMIT ?",
+                    (sla_id, cut, last_seq, limit + 1),
+                ).fetchall()
+                database.execute("ROLLBACK")
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+        has_next = len(rows) > limit
+        page = rows[:limit]
+        settlements = [
+            {
+                "settlementSeq": row["settlement_seq"],
+                "evaluationSeq": row["evaluation_seq"],
+                "result": row["result"],
+                "amount": row["amount_micros"],
+                "payerId": row["payer_id"],
+                "payeeId": row["payee_id"],
+                "createdAt": row["created_at_ms"],
+            }
+            for row in page
+        ]
+        if has_next:
+            next_cursor = f"{cut}:{page[-1]['settlement_seq']}"
+        else:
+            next_cursor = None
+        self._json(
+            HTTPStatus.OK,
+            {"settlements": settlements, "nextCursor": next_cursor},
+        )
+
+    def _get_ledger(self, account_id: str, query: str) -> None:
+        parsed = self._parse_evaluation_query(query, LEDGER_QUERY_PARAMS)
+        if parsed is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        limit, cursor = parsed
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN")
+            try:
+                if account_id == CLEARING_ACCOUNT_ID:
+                    account_valid = True
+                else:
+                    account_valid = (
+                        database.execute(
+                            "SELECT 1 FROM machines WHERE id = ?", (account_id,)
+                        ).fetchone()
+                        is not None
+                    )
+                if not account_valid:
+                    database.execute("ROLLBACK")
+                    self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                    return
+                max_record = database.execute(
+                    "SELECT MAX(entry_seq) AS current_max FROM ledger_entries"
+                ).fetchone()
+                current_max = max_record["current_max"]
+                if current_max is None:
+                    current_max = 0
+                if cursor is None:
+                    cut = current_max
+                    last_seq = 0
+                else:
+                    cut, last_seq = cursor
+                    if cut > current_max:
+                        database.execute("ROLLBACK")
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                        )
+                        return
+                    anchor = database.execute(
+                        "SELECT 1 FROM ledger_entries"
+                        " WHERE account_id = ? AND entry_seq = ? AND entry_seq <= ?",
+                        (account_id, last_seq, cut),
+                    ).fetchone()
+                    if anchor is None:
+                        database.execute("ROLLBACK")
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                        )
+                        return
+                rows = database.execute(
+                    "SELECT e.entry_seq AS entry_seq, e.kind AS kind,"
+                    " e.reference_seq AS reference_seq, e.delta_micros AS delta_micros,"
+                    " e.balance_after_micros AS balance_after_micros,"
+                    " e.created_at_ms AS created_at_ms,"
+                    " d.reference AS deposit_reference,"
+                    " s.sla_id AS sla_id,"
+                    " s.evaluation_seq AS settlement_evaluation_seq"
+                    " FROM ledger_entries AS e"
+                    " LEFT JOIN fund_deposits AS d"
+                    " ON e.kind = 'deposit' AND e.reference_seq = d.deposit_seq"
+                    " LEFT JOIN settlements AS s"
+                    " ON e.kind = 'settlement' AND e.reference_seq = s.settlement_seq"
+                    " WHERE e.account_id = ? AND e.entry_seq <= ? AND e.entry_seq > ?"
+                    " ORDER BY e.entry_seq ASC"
+                    " LIMIT ?",
+                    (account_id, cut, last_seq, limit + 1),
+                ).fetchall()
+                database.execute("ROLLBACK")
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+        has_next = len(rows) > limit
+        page = rows[:limit]
+        entries: list[dict[str, Any]] = []
+        for row in page:
+            if row["kind"] == "deposit":
+                entry = {
+                    "entrySeq": row["entry_seq"],
+                    "kind": "deposit",
+                    "referenceSeq": row["reference_seq"],
+                    "reference": row["deposit_reference"],
+                    "slaId": None,
+                    "evaluationSeq": None,
+                    "delta": row["delta_micros"],
+                    "balanceAfter": row["balance_after_micros"],
+                    "createdAt": row["created_at_ms"],
+                }
+            else:
+                entry = {
+                    "entrySeq": row["entry_seq"],
+                    "kind": "settlement",
+                    "referenceSeq": row["reference_seq"],
+                    "reference": None,
+                    "slaId": row["sla_id"],
+                    "evaluationSeq": row["settlement_evaluation_seq"],
+                    "delta": row["delta_micros"],
+                    "balanceAfter": row["balance_after_micros"],
+                    "createdAt": row["created_at_ms"],
+                }
+            entries.append(entry)
+        if has_next:
+            next_cursor = f"{cut}:{page[-1]['entry_seq']}"
+        else:
+            next_cursor = None
+        self._json(
+            HTTPStatus.OK,
+            {"entries": entries, "nextCursor": next_cursor},
         )
 
     def do_POST(self) -> None:  # noqa: N802
