@@ -92,6 +92,13 @@ SLA_AUTH_NONCE_PATTERN = re.compile(r"[A-Za-z0-9-]{16,64}")
 SLA_AUTH_SIGNATURE_PATTERN = re.compile(r"[0-9a-f]{128}")
 SLA_AUTH_SKEW_MS = 300_000
 SLA_AUTH_NONCE_RETENTION_MS = 600_000
+# SLA-Delegation 一次性代理头：复用 SLA-Auth 五段格式，首段为委托标识、
+# 版本段固定为 0、签名域为 delegation-auth-v1，由代理公钥验签。
+SLA_DELEGATION_HEADER = "SLA-Delegation"
+SLA_DELEGATION_CONTEXT = "delegation-auth-v1"
+DELEGATION_PATH_PATTERN = re.compile(r"/v1/delegations/([^/]+)/revocation")
+DELEGATION_FIELDS = {"id", "delegatePublicKey", "expiresAt"}
+DELEGATION_MAX_TTL_MS = 86_400_000
 
 
 class SlaAuth(NamedTuple):
@@ -1146,6 +1153,15 @@ class Handler(BaseHTTPRequestHandler):
         if urlsplit(self.path).path == "/v1/evidence-proofs":
             self._create_evidence_proof()
             return
+        if urlsplit(self.path).path == "/v1/delegations":
+            self._create_delegation()
+            return
+        delegation_revocation_match = DELEGATION_PATH_PATTERN.fullmatch(
+            urlsplit(self.path).path
+        )
+        if delegation_revocation_match is not None:
+            self._revoke_delegation(delegation_revocation_match.group(1))
+            return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
     def _register(self) -> None:
@@ -1270,6 +1286,94 @@ class Handler(BaseHTTPRequestHandler):
                 message,
                 auth.signature_bytes,
             )
+        if not signature_valid:
+            raise AuthRejected(HTTPStatus.UNAUTHORIZED, "invalid_authentication")
+
+    def _parse_sla_delegation(self) -> SlaAuth | None:
+        # 代理头必须存在、单值且五段结构合法；首段为委托标识，版本段固定为 0。
+        values = self.headers.get_all(SLA_DELEGATION_HEADER)
+        if values is None or len(values) != 1:
+            return None
+        parts = values[0].split(";")
+        if len(parts) != 5:
+            return None
+        delegation_id, version_text, request_time_text, nonce, signature = parts
+        if TEMPLATE_ID_PATTERN.fullmatch(delegation_id) is None:
+            return None
+        if version_text != "0":
+            return None
+        if DECIMAL_PATTERN.fullmatch(request_time_text) is None:
+            return None
+        request_time_ms = int(request_time_text)
+        if SLA_AUTH_NONCE_PATTERN.fullmatch(nonce) is None:
+            return None
+        if SLA_AUTH_SIGNATURE_PATTERN.fullmatch(signature) is None:
+            return None
+        return SlaAuth(
+            delegation_id,
+            0,
+            request_time_ms,
+            nonce,
+            signature,
+            bytes.fromhex(signature),
+        )
+
+    def _verify_delegation_auth(
+        self,
+        database: Any,
+        auth: SlaAuth,
+        expected_machine: str,
+        path: str,
+        body_digest: str,
+    ) -> None:
+        # 次序：委托存在、签发机器与路径机器一致、时间窗口，
+        # 再判过期/已用/已撤销/签发版本失效与代理公钥严格验签。
+        delegation = database.execute(
+            "SELECT issuer_machine_id, delegate_public_key, expires_at_ms,"
+            " issued_key_version, revoked, consumed"
+            " FROM machine_delegations WHERE id = ?",
+            (auth.machine_id,),
+        ).fetchone()
+        if delegation is None:
+            raise AuthRejected(HTTPStatus.UNAUTHORIZED, "invalid_authentication")
+        if delegation["issuer_machine_id"] != expected_machine:
+            raise AuthRejected(HTTPStatus.FORBIDDEN, "forbidden")
+        now_ms = int(datetime.now(UTC).timestamp() * 1000)
+        if abs(auth.request_time_ms - now_ms) > SLA_AUTH_SKEW_MS:
+            raise AuthRejected(HTTPStatus.UNAUTHORIZED, "stale_request")
+        signature_valid = False
+        if (
+            not delegation["revoked"]
+            and not delegation["consumed"]
+            and now_ms < delegation["expires_at_ms"]
+        ):
+            # 签发时记录的密钥版本须仍为签发机器当前最新且未吊销的版本。
+            issued_key = database.execute(
+                "SELECT revoked FROM machine_keys"
+                " WHERE machine_id = ? AND version = ?",
+                (delegation["issuer_machine_id"], delegation["issued_key_version"]),
+            ).fetchone()
+            latest = database.execute(
+                "SELECT MAX(version) AS latest FROM machine_keys"
+                " WHERE machine_id = ?",
+                (delegation["issuer_machine_id"],),
+            ).fetchone()
+            if (
+                issued_key is not None
+                and not issued_key["revoked"]
+                and latest is not None
+                and latest["latest"] == delegation["issued_key_version"]
+            ):
+                message = (
+                    f"{SLA_DELEGATION_CONTEXT}\n{self.command}\n{path}\n{body_digest}\n"
+                    f"{auth.request_time_ms}\n{auth.nonce}\n{auth.key_version}\n"
+                    f"{auth.machine_id}"
+                ).encode("utf-8")
+                signature_valid = ed25519_verify(
+                    bytes.fromhex(delegation["delegate_public_key"]),
+                    message,
+                    auth.signature_bytes,
+                )
         if not signature_valid:
             raise AuthRejected(HTTPStatus.UNAUTHORIZED, "invalid_authentication")
 
@@ -1408,13 +1512,22 @@ class Handler(BaseHTTPRequestHandler):
             self._json(legacy[0], legacy[1])
             return
         # 非旧记录重放：认证结构必须合法，且先于资源与业务检查。
-        auth = self._parse_sla_auth()
+        # 可用单值 SLA-Delegation 替代 SLA-Auth，两者并存即非法。
+        sla_auth_values = self.headers.get_all(SLA_AUTH_HEADER)
+        delegation_values = self.headers.get_all(SLA_DELEGATION_HEADER)
+        if sla_auth_values and delegation_values:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        delegation = bool(delegation_values)
+        auth = (
+            self._parse_sla_delegation() if delegation else self._parse_sla_auth()
+        )
         if auth is None:
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
         body_digest = hashlib.sha256(raw_body).hexdigest()
         status, payload = self._apply_capability(
-            idempotency_key, machine_id, fields, auth, body_digest
+            idempotency_key, machine_id, fields, auth, body_digest, delegation
         )
         self._json(status, payload)
 
@@ -1447,6 +1560,7 @@ class Handler(BaseHTTPRequestHandler):
         fields: dict[str, Any],
         auth: SlaAuth,
         body_digest: str,
+        delegation: bool,
     ) -> tuple[HTTPStatus, dict[str, Any]]:
         request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
         standard_path = urlsplit(self.path).path
@@ -1477,10 +1591,16 @@ class Handler(BaseHTTPRequestHandler):
                     database.execute("ROLLBACK")
                     return HTTPStatus.NOT_FOUND, {"error": "not_found"}
                 try:
-                    # 资源存在后依次校验签名者、时间、密钥与签名、随机数。
-                    self._verify_request_auth(
-                        database, auth, machine_id, standard_path, body_digest
-                    )
+                    # 资源存在后依次校验签名者、时间、密钥与签名、随机数；
+                    # 代理凭证改按委托记录与代理公钥校验。
+                    if delegation:
+                        self._verify_delegation_auth(
+                            database, auth, machine_id, standard_path, body_digest
+                        )
+                    else:
+                        self._verify_request_auth(
+                            database, auth, machine_id, standard_path, body_digest
+                        )
                     self._check_request_nonce(database, auth)
                 except AuthRejected as rejected:
                     database.execute("ROLLBACK")
@@ -1534,9 +1654,278 @@ class Handler(BaseHTTPRequestHandler):
                     ),
                 )
                 # 只有首次业务成功才原子写入随机数；任何失败均不推进任何状态。
+                if delegation:
+                    # 代理凭证一次性：消费标记与业务变更、幂等结果、随机数同事务提交；
+                    # 失败或同键重放均不消费凭证。
+                    database.execute(
+                        "UPDATE machine_delegations SET consumed = 1 WHERE id = ?",
+                        (auth.machine_id,),
+                    )
                 self._consume_request_nonce(database, auth)
                 database.execute("COMMIT")
                 return status, payload
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+
+    def _create_delegation(self) -> None:
+        idempotency_key = self.headers.get("Idempotency-Key")
+        if (
+            idempotency_key is None
+            or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None
+        ):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 签发入口不接受任何查询参数：参数校验先于体校验。
+        if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        raw_body = self._read_raw_body()
+        fields = (
+            None
+            if raw_body is None
+            else self._read_delegation_object(raw_body)
+        )
+        if fields is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        auth = self._parse_sla_auth()
+        if auth is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        body_digest = hashlib.sha256(raw_body).hexdigest()
+        status, payload = self._apply_delegation(
+            idempotency_key, fields, auth, body_digest
+        )
+        self._json(status, payload)
+
+    def _read_delegation_object(self, body: bytes) -> dict[str, Any] | None:
+        parsed = self._read_json_object(body)
+        if parsed is None or set(parsed) != DELEGATION_FIELDS:
+            return None
+        delegation_id = parsed["id"]
+        if (
+            not isinstance(delegation_id, str)
+            or TEMPLATE_ID_PATTERN.fullmatch(delegation_id) is None
+        ):
+            return None
+        delegate_public_key = parsed["delegatePublicKey"]
+        if (
+            not isinstance(delegate_public_key, str)
+            or PUBLIC_KEY_PATTERN.fullmatch(delegate_public_key) is None
+        ):
+            return None
+        expires_at = parsed["expiresAt"]
+        if not isinstance(expires_at, int) or isinstance(expires_at, bool):
+            return None
+        # 到期时刻须在服务当前 UTC 毫秒之后且不超过二十四小时。
+        now_ms = int(datetime.now(UTC).timestamp() * 1000)
+        if not now_ms < expires_at <= now_ms + DELEGATION_MAX_TTL_MS:
+            return None
+        return parsed
+
+    def _apply_delegation(
+        self,
+        idempotency_key: str,
+        fields: dict[str, Any],
+        auth: SlaAuth,
+        body_digest: str,
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+        standard_path = urlsplit(self.path).path
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                record = database.execute(
+                    "SELECT delegation_id, request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature"
+                    " FROM delegation_idempotency_records WHERE key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    if (
+                        record["delegation_id"] == fields["id"]
+                        and record["request_json"] == request_json
+                        and self._auth_record_matches(record, auth)
+                    ):
+                        return HTTPStatus(record["status"]), json.loads(
+                            record["response_json"]
+                        )
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                try:
+                    # 签发者即认证机器：依次校验时间、密钥与签名、随机数。
+                    self._verify_request_auth(
+                        database, auth, auth.machine_id, standard_path, body_digest
+                    )
+                    self._check_request_nonce(database, auth)
+                except AuthRejected as rejected:
+                    database.execute("ROLLBACK")
+                    return rejected.status, {"error": rejected.error}
+                existing = database.execute(
+                    "SELECT 1 FROM machine_delegations WHERE id = ?",
+                    (fields["id"],),
+                ).fetchone()
+                if existing is not None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                created_at_ms = int(datetime.now(UTC).timestamp() * 1000)
+                # 原子保存签发密钥版本：代理使用时该版本须仍为最新有效版本。
+                database.execute(
+                    "INSERT INTO machine_delegations"
+                    "(id, issuer_machine_id, delegate_public_key, expires_at_ms,"
+                    " issued_key_version, revoked, consumed, created_at_ms)"
+                    " VALUES (?, ?, ?, ?, ?, 0, 0, ?)",
+                    (
+                        fields["id"],
+                        auth.machine_id,
+                        fields["delegatePublicKey"],
+                        fields["expiresAt"],
+                        auth.key_version,
+                        created_at_ms,
+                    ),
+                )
+                payload = {"id": fields["id"], "expiresAt": fields["expiresAt"]}
+                database.execute(
+                    "INSERT INTO delegation_idempotency_records"
+                    "(key, delegation_id, request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        fields["id"],
+                        request_json,
+                        int(HTTPStatus.CREATED),
+                        json.dumps(payload, separators=(",", ":")),
+                        auth.machine_id,
+                        auth.key_version,
+                        auth.request_time_ms,
+                        auth.nonce,
+                        auth.signature,
+                    ),
+                )
+                # 只有首次成功才原子写入随机数、委托与幂等结果；失败无副作用。
+                self._consume_request_nonce(database, auth)
+                database.execute("COMMIT")
+                return HTTPStatus.CREATED, payload
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+
+    def _revoke_delegation(self, delegation_id: str) -> None:
+        idempotency_key = self.headers.get("Idempotency-Key")
+        if (
+            idempotency_key is None
+            or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None
+        ):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 撤销入口不接受任何查询参数。
+        if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 请求体须为空对象。
+        raw_body = self._read_raw_body()
+        parsed = (
+            None if raw_body is None else self._read_json_object(raw_body)
+        )
+        if parsed is None or parsed != {}:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        auth = self._parse_sla_auth()
+        if auth is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        body_digest = hashlib.sha256(raw_body).hexdigest()
+        status, payload = self._apply_delegation_revocation(
+            idempotency_key, delegation_id, auth, body_digest
+        )
+        self._json(status, payload)
+
+    def _apply_delegation_revocation(
+        self,
+        idempotency_key: str,
+        delegation_id: str,
+        auth: SlaAuth,
+        body_digest: str,
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        request_json = "{}"
+        standard_path = urlsplit(self.path).path
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                record = database.execute(
+                    "SELECT delegation_id, request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature"
+                    " FROM delegation_revocation_idempotency_records WHERE key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    if (
+                        record["delegation_id"] == delegation_id
+                        and record["request_json"] == request_json
+                        and self._auth_record_matches(record, auth)
+                    ):
+                        return HTTPStatus(record["status"]), json.loads(
+                            record["response_json"]
+                        )
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                delegation = database.execute(
+                    "SELECT issuer_machine_id, revoked"
+                    " FROM machine_delegations WHERE id = ?",
+                    (delegation_id,),
+                ).fetchone()
+                if delegation is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                try:
+                    # 仅签发者可撤销：签名者须等于签发机器，再验时间、密钥、签名、随机数。
+                    self._verify_request_auth(
+                        database,
+                        auth,
+                        delegation["issuer_machine_id"],
+                        standard_path,
+                        body_digest,
+                    )
+                    self._check_request_nonce(database, auth)
+                except AuthRejected as rejected:
+                    database.execute("ROLLBACK")
+                    return rejected.status, {"error": rejected.error}
+                if delegation["revoked"]:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                database.execute(
+                    "UPDATE machine_delegations SET revoked = 1 WHERE id = ?",
+                    (delegation_id,),
+                )
+                payload = {"id": delegation_id, "revoked": True}
+                database.execute(
+                    "INSERT INTO delegation_revocation_idempotency_records"
+                    "(key, delegation_id, request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        delegation_id,
+                        request_json,
+                        int(HTTPStatus.OK),
+                        json.dumps(payload, separators=(",", ":")),
+                        auth.machine_id,
+                        auth.key_version,
+                        auth.request_time_ms,
+                        auth.nonce,
+                        auth.signature,
+                    ),
+                )
+                # 撤销与幂等结果、随机数在同一事务原子提交；失败无副作用。
+                self._consume_request_nonce(database, auth)
+                database.execute("COMMIT")
+                return HTTPStatus.OK, payload
             except BaseException:
                 database.execute("ROLLBACK")
                 raise

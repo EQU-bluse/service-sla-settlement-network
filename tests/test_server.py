@@ -296,6 +296,103 @@ def add_sla_auth(request: Request, server: ApiServer) -> None:
     )
 
 
+class _SlaDelegationRegistry:
+    # 与 _SlaAuthRegistry 同理：同键同请求的重试、并发与重启后重放必须
+    # 逐字节复用同一组代理五段；异键分配不同随机数。
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._counter = 0
+        self._headers: dict[tuple[object, ...], str] = {}
+
+    def header(
+        self,
+        scope: str,
+        idempotency_key: str | None,
+        seed: bytes,
+        delegation_id: str,
+        method: str,
+        path: str,
+        body: bytes,
+        request_time_ms: int | None = None,
+        nonce: str | None = None,
+    ) -> str:
+        use_cache = request_time_ms is None and nonce is None
+        cache_key = (scope, idempotency_key, seed, delegation_id, method, path, body)
+        if use_cache:
+            with self._lock:
+                cached = self._headers.get(cache_key)
+                if cached is None:
+                    cached = self._build(
+                        seed,
+                        delegation_id,
+                        method,
+                        path,
+                        body,
+                        int(time.time() * 1000),
+                        self._next_nonce_locked(),
+                    )
+                    self._headers[cache_key] = cached
+                return cached
+        if request_time_ms is None:
+            request_time_ms = int(time.time() * 1000)
+        if nonce is None:
+            with self._lock:
+                nonce = self._next_nonce_locked()
+        return self._build(
+            seed, delegation_id, method, path, body, request_time_ms, nonce
+        )
+
+    def _next_nonce_locked(self) -> str:
+        self._counter += 1
+        return f"nonce-d-{self._counter:020d}"
+
+    @staticmethod
+    def _build(
+        seed: bytes,
+        delegation_id: str,
+        method: str,
+        path: str,
+        body: bytes,
+        request_time_ms: int,
+        nonce: str,
+    ) -> str:
+        body_digest = hashlib.sha256(body).hexdigest()
+        message = (
+            f"delegation-auth-v1\n{method}\n{path}\n{body_digest}\n"
+            f"{request_time_ms}\n{nonce}\n0\n{delegation_id}"
+        ).encode("utf-8")
+        signature = _ed25519_sign(seed, message).hex()
+        return f"{delegation_id};0;{request_time_ms};{nonce};{signature}"
+
+
+_SLA_DELEGATION_REGISTRY = _SlaDelegationRegistry()
+
+
+def make_sla_delegation(
+    server: ApiServer,
+    idempotency_key: str | None,
+    seed: bytes,
+    delegation_id: str,
+    method: str,
+    path: str,
+    body: bytes,
+    *,
+    request_time_ms: int | None = None,
+    nonce: str | None = None,
+) -> str:
+    return _SLA_DELEGATION_REGISTRY.header(
+        server.database_path,
+        idempotency_key,
+        seed,
+        delegation_id,
+        method,
+        path,
+        body,
+        request_time_ms,
+        nonce,
+    )
+
+
 class ServerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -8099,3 +8196,506 @@ class SlaAuthTests(unittest.TestCase):
         )
         self.assertEqual((status, json.loads(payload)),
                          (409, {"error": "conflict"}))
+
+
+DELEGATE_SEED = b"\x09" * 32
+DELEGATE_PUBLIC = _ed25519_public_key(DELEGATE_SEED).hex()
+
+
+class DelegationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.producer = machine_id(PUBLIC_KEY_A)
+        self.consumer = machine_id(PUBLIC_KEY_B)
+        # 默认到期时刻在同一用例内固定：重放必须复用逐字节相同的请求体。
+        self.expires_at = int(time.time() * 1000) + 3_600_000
+        for key, public_key in (("reg-a", PUBLIC_KEY_A), ("reg-b", PUBLIC_KEY_B)):
+            self.assertEqual(self.post(
+                "/v1/machines", json.dumps({"publicKey": public_key}).encode(), key
+            )[0], 201)
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temporary.cleanup()
+
+    def url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}{path}"
+
+    def restart(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def post(
+        self,
+        path: str,
+        body: bytes,
+        key: str | None,
+        *,
+        seed: bytes | None = None,
+        actor: str | None = None,
+        key_version: int = 1,
+        auth: str | bool | None = None,
+        delegation: tuple[bytes, str] | str | None = None,
+        request_time_ms: int | None = None,
+        nonce: str | None = None,
+    ) -> tuple[int, bytes]:
+        request = Request(self.url(path), data=body, method="POST")
+        if key is not None:
+            request.add_header("Idempotency-Key", key)
+        if delegation is not None:
+            if isinstance(delegation, str):
+                request.add_header("SLA-Delegation", delegation)
+            else:
+                delegate_seed, delegation_id = delegation
+                request.add_header(
+                    "SLA-Delegation",
+                    make_sla_delegation(
+                        self.server, key, delegate_seed, delegation_id,
+                        "POST", path, body,
+                        request_time_ms=request_time_ms, nonce=nonce,
+                    ),
+                )
+        else:
+            if auth is None and seed is not None:
+                auth = True
+            if auth is True:
+                request.add_header(
+                    "SLA-Auth",
+                    make_sla_auth(
+                        self.server, key, seed, actor, "POST", path, body,
+                        key_version, request_time_ms=request_time_ms, nonce=nonce,
+                    ),
+                )
+            elif isinstance(auth, str):
+                request.add_header("SLA-Auth", auth)
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def delegation_body(
+        self,
+        delegation_id: str = "del-1",
+        public_key: str = DELEGATE_PUBLIC,
+        expires_at: int | None = None,
+        **overrides: object,
+    ) -> bytes:
+        if expires_at is None:
+            expires_at = self.expires_at
+        fields: dict[str, object] = {
+            "id": delegation_id,
+            "delegatePublicKey": public_key,
+            "expiresAt": expires_at,
+        }
+        fields.update(overrides)
+        return json.dumps(fields).encode()
+
+    def issue(
+        self, delegation_id: str = "del-1", key: str = "issue-1", **overrides: object
+    ) -> tuple[int, bytes]:
+        return self.post(
+            "/v1/delegations",
+            self.delegation_body(delegation_id, **overrides),
+            key,
+            seed=PRODUCER_SEED,
+            actor=self.producer,
+        )
+
+    def cap_body(self, expected: int = 0, capacity: int = 10) -> bytes:
+        return json.dumps({
+            "expectedVersion": expected, "name": "pump-01", "protocol": "mqtt",
+            "region": "cn", "unit": "call", "capacity": capacity,
+        }).encode()
+
+    @property
+    def cap_path(self) -> str:
+        return f"/v1/machines/{self.producer}/capabilities"
+
+    def use_delegation(
+        self,
+        body: bytes,
+        key: str,
+        delegation_id: str = "del-1",
+        *,
+        path: str | None = None,
+        seed: bytes = DELEGATE_SEED,
+        request_time_ms: int | None = None,
+        nonce: str | None = None,
+    ) -> tuple[int, bytes]:
+        return self.post(
+            path if path is not None else self.cap_path,
+            body,
+            key,
+            delegation=(seed, delegation_id),
+            request_time_ms=request_time_ms,
+            nonce=nonce,
+        )
+
+    def test_issue_created_and_replay(self) -> None:
+        body = self.delegation_body()
+        status, payload = self.issue()
+        expected = json.dumps(
+            {"id": "del-1", "expiresAt": json.loads(body)["expiresAt"]},
+            separators=(",", ":"),
+        ).encode()
+        self.assertEqual((status, payload), (201, expected))
+        # 同键同请求重放首次响应字节。
+        for _ in range(2):
+            self.assertEqual(self.issue(), (201, expected))
+
+    def test_issue_replay_survives_restart(self) -> None:
+        status, payload = self.issue()
+        self.assertEqual(status, 201)
+        self.restart()
+        self.assertEqual(self.issue(), (status, payload))
+
+    def test_issue_same_key_different_body_conflicts(self) -> None:
+        self.assertEqual(self.issue()[0], 201)
+        status, payload = self.post(
+            "/v1/delegations",
+            self.delegation_body("del-2"),
+            "issue-1",
+            seed=PRODUCER_SEED,
+            actor=self.producer,
+        )
+        self.assertEqual((status, json.loads(payload)), (409, {"error": "conflict"}))
+
+    def test_issue_same_key_different_auth_conflicts(self) -> None:
+        body = self.delegation_body()
+        self.assertEqual(self.issue()[0], 201)
+        status, payload = self.post(
+            "/v1/delegations", body, "issue-1", seed=PRODUCER_SEED,
+            actor=self.producer, nonce="nonce-issue-different-1",
+        )
+        self.assertEqual((status, json.loads(payload)), (409, {"error": "conflict"}))
+
+    def test_issue_duplicate_id_conflicts(self) -> None:
+        self.assertEqual(self.issue()[0], 201)
+        status, payload = self.issue(key="issue-2")
+        self.assertEqual((status, json.loads(payload)), (409, {"error": "conflict"}))
+
+    def test_issue_invalid_bodies(self) -> None:
+        now = int(time.time() * 1000)
+        cases = [
+            b"",
+            b"{not json",
+            b"null",
+            b"{}",
+            b"[]",
+            self.delegation_body(id=""),
+            self.delegation_body(id="Bad"),
+            self.delegation_body(id="a" * 65),
+            self.delegation_body(public_key="aa"),
+            self.delegation_body(public_key="A" * 64),
+            self.delegation_body(expires_at=now - 1),
+            self.delegation_body(expires_at=now),
+            self.delegation_body(expires_at=now + 86_400_000 + 60_000),
+            self.delegation_body(expires_at=True),
+            self.delegation_body(expires_at="soon"),
+            json.dumps({"id": "del-1", "delegatePublicKey": DELEGATE_PUBLIC}).encode(),
+            json.dumps({
+                "id": "del-1", "delegatePublicKey": DELEGATE_PUBLIC,
+                "expiresAt": now + 1000, "extra": 1,
+            }).encode(),
+            b'{"id":"del-1","id":"del-1","delegatePublicKey":"' + DELEGATE_PUBLIC.encode() + b'","expiresAt":' + str(now + 1000).encode() + b'}',
+        ]
+        for index, body in enumerate(cases):
+            status, payload = self.post(
+                "/v1/delegations", body, f"bad-{index}",
+                seed=PRODUCER_SEED, actor=self.producer,
+            )
+            self.assertEqual(
+                (status, json.loads(payload)),
+                (400, {"error": "invalid_request"}),
+                body,
+            )
+
+    def test_issue_query_params_and_header_errors(self) -> None:
+        body = self.delegation_body()
+        status, payload = self.post(
+            "/v1/delegations?x=1", body, "q-1",
+            seed=PRODUCER_SEED, actor=self.producer,
+        )
+        self.assertEqual((status, json.loads(payload)), (400, {"error": "invalid_request"}))
+        # 缺幂等头、缺认证头均为 400。
+        status, payload = self.post("/v1/delegations", body, None,
+                                    seed=PRODUCER_SEED, actor=self.producer)
+        self.assertEqual((status, json.loads(payload)), (400, {"error": "invalid_request"}))
+        status, payload = self.post("/v1/delegations", body, "no-auth")
+        self.assertEqual((status, json.loads(payload)), (400, {"error": "invalid_request"}))
+
+    def test_issue_unknown_machine_is_401(self) -> None:
+        ghost = machine_id(PUBLIC_KEY_C)
+        status, payload = self.post(
+            "/v1/delegations", self.delegation_body(), "ghost-1",
+            seed=PUBLIC_KEY_SEED_C, actor=ghost,
+        )
+        self.assertEqual(
+            (status, json.loads(payload)), (401, {"error": "invalid_authentication"})
+        )
+
+    def test_delegate_declares_capability(self) -> None:
+        self.assertEqual(self.issue()[0], 201)
+        status, payload = self.use_delegation(self.cap_body(), "cap-1")
+        self.assertEqual((status, payload), (201, b'{"version":1}'))
+
+    def test_delegate_replay_same_key_then_consumed(self) -> None:
+        self.assertEqual(self.issue()[0], 201)
+        body = self.cap_body()
+        self.assertEqual(self.use_delegation(body, "cap-1"), (201, b'{"version":1}'))
+        # 同键重放首次响应，不重复消费。
+        self.assertEqual(self.use_delegation(body, "cap-1"), (201, b'{"version":1}'))
+        # 异键再用：凭证已消费。
+        status, payload = self.use_delegation(self.cap_body(1, 20), "cap-2")
+        self.assertEqual(
+            (status, json.loads(payload)), (401, {"error": "invalid_authentication"})
+        )
+
+    def test_delegate_same_key_different_auth_conflicts(self) -> None:
+        self.assertEqual(self.issue()[0], 201)
+        body = self.cap_body()
+        self.assertEqual(self.use_delegation(body, "cap-1"), (201, b'{"version":1}'))
+        status, payload = self.use_delegation(
+            body, "cap-1", nonce="nonce-delegate-other-01"
+        )
+        self.assertEqual((status, json.loads(payload)), (409, {"error": "conflict"}))
+
+    def test_both_auth_headers_is_400(self) -> None:
+        self.assertEqual(self.issue()[0], 201)
+        body = self.cap_body()
+        request = Request(self.url(self.cap_path), data=body, method="POST")
+        request.add_header("Idempotency-Key", "both-1")
+        request.add_header(
+            "SLA-Auth",
+            make_sla_auth(
+                self.server, "both-1", PRODUCER_SEED, self.producer,
+                "POST", self.cap_path, body, 1,
+            ),
+        )
+        request.add_header(
+            "SLA-Delegation",
+            make_sla_delegation(
+                self.server, "both-1", DELEGATE_SEED, "del-1",
+                "POST", self.cap_path, body,
+            ),
+        )
+        with self.assertRaises(HTTPError) as captured:
+            urlopen(request, timeout=5)
+        self.assertEqual(captured.exception.code, 400)
+        self.assertEqual(json.load(captured.exception), {"error": "invalid_request"})
+
+    def test_delegation_malformed_headers_are_400(self) -> None:
+        now = int(time.time() * 1000)
+        body = self.cap_body()
+        for index, raw in enumerate((
+            "x",
+            "a;b;c;d",
+            f"del-1;1;{now};nonce-0123456789ab;{'a' * 128}",
+            f"del-1;00;{now};nonce-0123456789ab;{'a' * 128}",
+            f"del-1;0;{now};short;{'a' * 128}",
+            f"del-1;0;{now};nonce-0123456789ab;{'A' * 128}",
+            f"Bad_id;0;{now};nonce-0123456789ab;{'a' * 128}",
+        )):
+            status, payload = self.post(
+                self.cap_path, body, f"malformed-{index}",
+                delegation=raw,
+            )
+            self.assertEqual(
+                (status, json.loads(payload)),
+                (400, {"error": "invalid_request"}),
+                raw,
+            )
+
+    def test_unknown_delegation_is_401(self) -> None:
+        status, payload = self.use_delegation(
+            self.cap_body(), "cap-1", "del-ghost"
+        )
+        self.assertEqual(
+            (status, json.loads(payload)), (401, {"error": "invalid_authentication"})
+        )
+
+    def test_expired_delegation_is_401(self) -> None:
+        now = int(time.time() * 1000)
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            connection.execute(
+                "INSERT INTO machine_delegations"
+                "(id, issuer_machine_id, delegate_public_key, expires_at_ms,"
+                " issued_key_version, revoked, consumed, created_at_ms)"
+                " VALUES (?, ?, ?, ?, 1, 0, 0, ?)",
+                ("del-expired", self.producer, DELEGATE_PUBLIC, now - 1, now - 1000),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        status, payload = self.use_delegation(
+            self.cap_body(), "cap-1", "del-expired"
+        )
+        self.assertEqual(
+            (status, json.loads(payload)), (401, {"error": "invalid_authentication"})
+        )
+
+    def test_revoked_delegation_is_401(self) -> None:
+        self.assertEqual(self.issue()[0], 201)
+        self.assertEqual(self.revoke()[0], 200)
+        status, payload = self.use_delegation(self.cap_body(), "cap-1")
+        self.assertEqual(
+            (status, json.loads(payload)), (401, {"error": "invalid_authentication"})
+        )
+
+    def test_issuer_key_rotation_invalidates_delegation(self) -> None:
+        self.assertEqual(self.issue()[0], 201)
+        new_seed = b"\x0a" * 32
+        new_public = _ed25519_public_key(new_seed).hex()
+        current_sig, new_sig = key_rotation_signatures(
+            PRODUCER_SEED, new_seed, self.producer, 1, new_public
+        )
+        rotation = json.dumps({
+            "expectedVersion": 1, "publicKey": new_public,
+            "currentSignature": current_sig, "newSignature": new_sig,
+        }).encode()
+        self.assertEqual(
+            self.post(f"/v1/machines/{self.producer}/keys", rotation, "rotate-1")[0],
+            201,
+        )
+        status, payload = self.use_delegation(self.cap_body(), "cap-1")
+        self.assertEqual(
+            (status, json.loads(payload)), (401, {"error": "invalid_authentication"})
+        )
+
+    def test_wrong_delegate_signature_is_401(self) -> None:
+        self.assertEqual(self.issue()[0], 201)
+        status, payload = self.use_delegation(
+            self.cap_body(), "cap-1", seed=PUBLIC_KEY_SEED_C
+        )
+        self.assertEqual(
+            (status, json.loads(payload)), (401, {"error": "invalid_authentication"})
+        )
+
+    def test_stale_delegation_request_is_401(self) -> None:
+        self.assertEqual(self.issue()[0], 201)
+        status, payload = self.use_delegation(
+            self.cap_body(), "cap-1",
+            request_time_ms=int(time.time() * 1000) - 400_000,
+        )
+        self.assertEqual(
+            (status, json.loads(payload)), (401, {"error": "stale_request"})
+        )
+
+    def test_path_machine_mismatch_is_403(self) -> None:
+        self.assertEqual(self.issue()[0], 201)
+        status, payload = self.use_delegation(
+            self.cap_body(), "cap-1",
+            path=f"/v1/machines/{self.consumer}/capabilities",
+        )
+        self.assertEqual((status, json.loads(payload)), (403, {"error": "forbidden"}))
+
+    def test_failed_use_consumes_nothing(self) -> None:
+        # 先用机器自身认证声明版本一。
+        self.assertEqual(self.post(
+            self.cap_path, self.cap_body(), "cap-0",
+            seed=PRODUCER_SEED, actor=self.producer,
+        ), (201, b'{"version":1}'))
+        self.assertEqual(self.issue()[0], 201)
+        # 版本竞争失败：不消费凭证也不消费随机数。
+        nonce = "nonce-delegate-reuse-01"
+        status, payload = self.use_delegation(
+            self.cap_body(0, 20), "cap-1", nonce=nonce
+        )
+        self.assertEqual((status, json.loads(payload)), (409, {"error": "conflict"}))
+        # 同一随机数、修正版本后成功。
+        status, payload = self.use_delegation(
+            self.cap_body(1, 20), "cap-2", nonce=nonce
+        )
+        self.assertEqual((status, payload), (200, b'{"version":2}'))
+
+    def test_concurrent_delegate_use_single_winner(self) -> None:
+        self.assertEqual(self.issue()[0], 201)
+        results: list[int] = []
+        lock = threading.Lock()
+
+        def use(index: int) -> None:
+            status, _ = self.use_delegation(self.cap_body(), f"cap-race-{index}")
+            with lock:
+                results.append(status)
+
+        threads = [threading.Thread(target=use, args=(index,)) for index in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual(sorted(results), [201] + [401] * 7)
+
+    def revoke(
+        self, delegation_id: str = "del-1", key: str = "revoke-1", **kwargs: object
+    ) -> tuple[int, bytes]:
+        kwargs.setdefault("seed", PRODUCER_SEED)
+        kwargs.setdefault("actor", self.producer)
+        return self.post(
+            f"/v1/delegations/{delegation_id}/revocation", b"{}", key, **kwargs
+        )
+
+    def test_revoke_created_and_replay(self) -> None:
+        self.assertEqual(self.issue()[0], 201)
+        status, payload = self.revoke()
+        self.assertEqual((status, payload), (200, b'{"id":"del-1","revoked":true}'))
+        # 同键重放首次响应字节。
+        self.assertEqual(self.revoke(), (200, b'{"id":"del-1","revoked":true}'))
+
+    def test_revoke_replay_survives_restart(self) -> None:
+        self.assertEqual(self.issue()[0], 201)
+        status, payload = self.revoke()
+        self.assertEqual(status, 200)
+        self.restart()
+        self.assertEqual(self.revoke(), (status, payload))
+
+    def test_revoke_repeat_with_different_key_conflicts(self) -> None:
+        self.assertEqual(self.issue()[0], 201)
+        self.assertEqual(self.revoke()[0], 200)
+        status, payload = self.revoke(key="revoke-2")
+        self.assertEqual((status, json.loads(payload)), (409, {"error": "conflict"}))
+
+    def test_revoke_missing_is_404(self) -> None:
+        status, payload = self.revoke("del-ghost")
+        self.assertEqual((status, json.loads(payload)), (404, {"error": "not_found"}))
+
+    def test_revoke_non_issuer_is_403(self) -> None:
+        self.assertEqual(self.issue()[0], 201)
+        status, payload = self.revoke(seed=PUBLIC_KEY_SEED_B, actor=self.consumer)
+        self.assertEqual((status, json.loads(payload)), (403, {"error": "forbidden"}))
+
+    def test_revoke_same_key_different_auth_conflicts(self) -> None:
+        self.assertEqual(self.issue()[0], 201)
+        self.assertEqual(self.revoke()[0], 200)
+        status, payload = self.revoke(nonce="nonce-revoke-other-0001")
+        self.assertEqual((status, json.loads(payload)), (409, {"error": "conflict"}))
+
+    def test_revoke_invalid_body_and_query(self) -> None:
+        self.assertEqual(self.issue()[0], 201)
+        for index, body in enumerate((b"", b"null", b"[]", b'{"x":1}')):
+            status, payload = self.post(
+                "/v1/delegations/del-1/revocation", body, f"rb-{index}",
+                seed=PRODUCER_SEED, actor=self.producer,
+            )
+            self.assertEqual(
+                (status, json.loads(payload)),
+                (400, {"error": "invalid_request"}),
+                body,
+            )
+        status, payload = self.post(
+            "/v1/delegations/del-1/revocation?x=1", b"{}", "rq-1",
+            seed=PRODUCER_SEED, actor=self.producer,
+        )
+        self.assertEqual((status, json.loads(payload)), (400, {"error": "invalid_request"}))
