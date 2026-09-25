@@ -35,6 +35,10 @@ DISPUTE_EVENTS_PATH_PATTERN = re.compile(r"/v1/disputes/([^/]+)/events")
 DISPUTE_EVIDENCE_PATH_PATTERN = re.compile(r"/v1/disputes/([^/]+)/evidence")
 DISPUTE_RESOLUTION_PATH_PATTERN = re.compile(r"/v1/disputes/([^/]+)/resolution")
 EVIDENCE_PROOFS_PATH_PATTERN = re.compile(r"/v1/evidence/([^/]+)/proofs")
+MACHINE_DELEGATIONS_PATH_PATTERN = re.compile(
+    r"/v1/machines/([^/]+)/delegations"
+)
+DELEGATION_EVENTS_PATH_PATTERN = re.compile(r"/v1/delegations/([^/]+)/events")
 CAPABILITY_FIELDS = {"expectedVersion", "name", "protocol", "region", "unit", "capacity"}
 SLA_TEMPLATE_FIELDS = {
     "id",
@@ -76,6 +80,8 @@ LEDGER_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTE_EVENTS_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTE_EVIDENCE_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTES_QUERY_PARAMS = {"accountId", "state", "limit", "cursor"}
+MACHINE_DELEGATIONS_QUERY_PARAMS = {"limit", "cursor"}
+DELEGATION_EVENTS_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTE_SNAPSHOT_STATES = {"open", "released", "refunded"}
 TELEMETRY_TIME_MAX = 2147483648000
 TELEMETRY_DEFAULT_LIMIT = 50
@@ -201,6 +207,20 @@ class Handler(BaseHTTPRequestHandler):
         if evidence_proofs_match is not None:
             self._get_evidence_proofs(
                 evidence_proofs_match.group(1), target.query
+            )
+            return
+        machine_delegations_match = MACHINE_DELEGATIONS_PATH_PATTERN.fullmatch(
+            target.path
+        )
+        if machine_delegations_match is not None:
+            self._get_machine_delegations(
+                machine_delegations_match.group(1), target.query, target.path
+            )
+            return
+        delegation_events_match = DELEGATION_EVENTS_PATH_PATTERN.fullmatch(target.path)
+        if delegation_events_match is not None:
+            self._get_delegation_events(
+                delegation_events_match.group(1), target.query, target.path
             )
             return
         dispute_match = DISPUTE_PATH_PATTERN.fullmatch(target.path)
@@ -1092,6 +1112,232 @@ class Handler(BaseHTTPRequestHandler):
             {"disputes": disputes, "nextCursor": next_cursor},
         )
 
+    def _read_delegation_read_auth(
+        self,
+    ) -> tuple[SlaAuth, str] | tuple[HTTPStatus, str]:
+        # 读入口无请求正文且仅接受单一 SLA-Auth 头：结构判定先于一切资源查询。
+        # 仍读取并排空请求体，但正文摘要按空字节计算。
+        self._read_raw_body()
+        auth = self._parse_sla_auth()
+        if auth is None:
+            return HTTPStatus.BAD_REQUEST, "invalid_request"
+        return auth, hashlib.sha256(b"").hexdigest()
+
+    def _get_machine_delegations(self, machine_id: str, query: str, path: str) -> None:
+        parsed = self._parse_evaluation_query(query, MACHINE_DELEGATIONS_QUERY_PARAMS)
+        if parsed is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        limit, cursor = parsed
+        # 判定次序：查询参数、认证结构，随后在事务内判资源、签发身份、
+        # 认证有效性、随机数与游标关联。
+        authorized = self._read_delegation_read_auth()
+        if isinstance(authorized[0], HTTPStatus):
+            self._json(authorized[0], {"error": authorized[1]})
+            return
+        auth, body_digest = authorized
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                machine = database.execute(
+                    "SELECT id FROM machines WHERE id = ?", (machine_id,)
+                ).fetchone()
+                if machine is None:
+                    database.execute("ROLLBACK")
+                    self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                    return
+                try:
+                    # 路径机器只能查看自己签发的凭证：身份一致后再验时间、密钥、签名。
+                    self._verify_request_auth(
+                        database, auth, machine_id, path, body_digest
+                    )
+                    self._check_request_nonce(database, auth)
+                except AuthRejected as rejected:
+                    database.execute("ROLLBACK")
+                    self._json(rejected.status, {"error": rejected.error})
+                    return
+                # 两类首页共用读事务起点的全库最大委托事件序号冻结快照。
+                max_record = database.execute(
+                    "SELECT MAX(event_seq) AS current_max FROM delegation_events"
+                ).fetchone()
+                current_max = max_record["current_max"]
+                if current_max is None:
+                    current_max = 0
+                if cursor is None:
+                    cut = current_max
+                    last_seq = 0
+                else:
+                    cut, last_seq = cursor
+                    if cut > current_max:
+                        database.execute("ROLLBACK")
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                        )
+                        return
+                    # 锚点须是目标机器签发的 issued 事件且不大于 cut。
+                    anchor = database.execute(
+                        "SELECT 1 FROM delegation_events AS e"
+                        " JOIN machine_delegations AS d ON d.id = e.delegation_id"
+                        " WHERE d.issuer_machine_id = ? AND e.type = 'issued'"
+                        " AND e.event_seq = ? AND e.event_seq <= ?",
+                        (machine_id, last_seq, cut),
+                    ).fetchone()
+                    if anchor is None:
+                        database.execute("ROLLBACK")
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                        )
+                        return
+                # 委托按签发事件序号升序；消费/撤销标记取 cut 以内是否存在对应事件，
+                # 而非当前标记，使旧游标快照隔离并发消费与撤销。
+                rows = database.execute(
+                    "SELECT i.event_seq AS issued_seq, d.id AS id,"
+                    " d.delegate_public_key AS delegate_public_key,"
+                    " d.expires_at_ms AS expires_at_ms,"
+                    " d.issued_key_version AS issued_key_version,"
+                    " EXISTS (SELECT 1 FROM delegation_events AS c"
+                    " WHERE c.delegation_id = d.id AND c.type = 'consumed'"
+                    " AND c.event_seq <= ?) AS consumed_in_cut,"
+                    " EXISTS (SELECT 1 FROM delegation_events AS r"
+                    " WHERE r.delegation_id = d.id AND r.type = 'revoked'"
+                    " AND r.event_seq <= ?) AS revoked_in_cut"
+                    " FROM machine_delegations AS d"
+                    " JOIN delegation_events AS i"
+                    " ON i.delegation_id = d.id AND i.type = 'issued'"
+                    " WHERE d.issuer_machine_id = ? AND i.event_seq <= ?"
+                    " AND i.event_seq > ?"
+                    " ORDER BY i.event_seq ASC"
+                    " LIMIT ?",
+                    (cut, cut, machine_id, cut, last_seq, limit + 1),
+                ).fetchall()
+                # 仅成功读取才在同一事务消费随机数；任何失败均不消费。
+                self._consume_request_nonce(database, auth)
+                database.execute("COMMIT")
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+        has_next = len(rows) > limit
+        page = rows[:limit]
+        delegations = [
+            {
+                "id": row["id"],
+                "delegatePublicKey": row["delegate_public_key"],
+                "expiresAt": row["expires_at_ms"],
+                "issuedKeyVersion": row["issued_key_version"],
+                "consumed": bool(row["consumed_in_cut"]),
+                "revoked": bool(row["revoked_in_cut"]),
+            }
+            for row in page
+        ]
+        if has_next:
+            next_cursor = f"{cut}:{page[-1]['issued_seq']}"
+        else:
+            next_cursor = None
+        self._json(
+            HTTPStatus.OK,
+            {"delegations": delegations, "nextCursor": next_cursor},
+        )
+
+    def _get_delegation_events(self, delegation_id: str, query: str, path: str) -> None:
+        parsed = self._parse_evaluation_query(query, DELEGATION_EVENTS_QUERY_PARAMS)
+        if parsed is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        limit, cursor = parsed
+        # 判定次序：查询参数、认证结构，随后在事务内判资源、签发身份、
+        # 认证有效性、随机数与游标关联。
+        authorized = self._read_delegation_read_auth()
+        if isinstance(authorized[0], HTTPStatus):
+            self._json(authorized[0], {"error": authorized[1]})
+            return
+        auth, body_digest = authorized
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                delegation = database.execute(
+                    "SELECT issuer_machine_id FROM machine_delegations WHERE id = ?",
+                    (delegation_id,),
+                ).fetchone()
+                if delegation is None:
+                    database.execute("ROLLBACK")
+                    self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                    return
+                try:
+                    # 仅签发机器可读取其凭证事件：身份一致后再验时间、密钥、签名。
+                    self._verify_request_auth(
+                        database,
+                        auth,
+                        delegation["issuer_machine_id"],
+                        path,
+                        body_digest,
+                    )
+                    self._check_request_nonce(database, auth)
+                except AuthRejected as rejected:
+                    database.execute("ROLLBACK")
+                    self._json(rejected.status, {"error": rejected.error})
+                    return
+                # 首页 cut 取读事务起点的全库最大委托事件序号（空库为 0）。
+                max_record = database.execute(
+                    "SELECT MAX(event_seq) AS current_max FROM delegation_events"
+                ).fetchone()
+                current_max = max_record["current_max"]
+                if current_max is None:
+                    current_max = 0
+                if cursor is None:
+                    cut = current_max
+                    last_seq = 0
+                else:
+                    cut, last_seq = cursor
+                    if cut > current_max:
+                        database.execute("ROLLBACK")
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                        )
+                        return
+                    anchor = database.execute(
+                        "SELECT 1 FROM delegation_events"
+                        " WHERE delegation_id = ? AND event_seq = ?"
+                        " AND event_seq <= ?",
+                        (delegation_id, last_seq, cut),
+                    ).fetchone()
+                    if anchor is None:
+                        database.execute("ROLLBACK")
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                        )
+                        return
+                rows = database.execute(
+                    "SELECT event_seq, type, created_at_ms FROM delegation_events"
+                    " WHERE delegation_id = ? AND event_seq <= ? AND event_seq > ?"
+                    " ORDER BY event_seq ASC"
+                    " LIMIT ?",
+                    (delegation_id, cut, last_seq, limit + 1),
+                ).fetchall()
+                # 仅成功读取才在同一事务消费随机数；任何失败均不消费。
+                self._consume_request_nonce(database, auth)
+                database.execute("COMMIT")
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+        has_next = len(rows) > limit
+        page = rows[:limit]
+        events = [
+            {
+                "eventSeq": row["event_seq"],
+                "type": row["type"],
+                "createdAt": row["created_at_ms"],
+            }
+            for row in page
+        ]
+        if has_next:
+            next_cursor = f"{cut}:{page[-1]['event_seq']}"
+        else:
+            next_cursor = None
+        self._json(
+            HTTPStatus.OK,
+            {"events": events, "nextCursor": next_cursor},
+        )
+
     def do_POST(self) -> None:  # noqa: N802
         if self.path == "/v1/machines":
             self._register()
@@ -1434,6 +1680,23 @@ class Handler(BaseHTTPRequestHandler):
             (auth.machine_id, auth.nonce, auth.request_time_ms),
         )
 
+    @staticmethod
+    def _append_delegation_event(
+        database: Any, delegation_id: str, event_type: str, created_at_ms: int
+    ) -> None:
+        # 委托生命周期事件复用全库唯一持久递增序号；仅随成功业务事务提交，
+        # 失败、同键重放与并发败者不到达此处，不追加事件、不推进序号。
+        next_record = database.execute(
+            "SELECT COALESCE(MAX(event_seq), 0) + 1 AS next_seq"
+            " FROM delegation_events"
+        ).fetchone()
+        database.execute(
+            "INSERT INTO delegation_events"
+            "(event_seq, delegation_id, type, created_at_ms)"
+            " VALUES (?, ?, ?, ?)",
+            (next_record["next_seq"], delegation_id, event_type, created_at_ms),
+        )
+
     def _read_request_object(self) -> dict[str, Any] | None:
         parsed = self._read_json_object()
         if parsed is None or set(parsed) != {"publicKey"}:
@@ -1656,10 +1919,16 @@ class Handler(BaseHTTPRequestHandler):
                 # 只有首次业务成功才原子写入随机数；任何失败均不推进任何状态。
                 if delegation:
                     # 代理凭证一次性：消费标记与业务变更、幂等结果、随机数同事务提交；
-                    # 失败或同键重放均不消费凭证。
+                    # 失败或同键重放均不消费凭证，成功消费在同事务追加 consumed 事件。
                     database.execute(
                         "UPDATE machine_delegations SET consumed = 1 WHERE id = ?",
                         (auth.machine_id,),
+                    )
+                    self._append_delegation_event(
+                        database,
+                        auth.machine_id,
+                        "consumed",
+                        int(datetime.now(UTC).timestamp() * 1000),
                     )
                 self._consume_request_nonce(database, auth)
                 database.execute("COMMIT")
@@ -1786,6 +2055,10 @@ class Handler(BaseHTTPRequestHandler):
                         created_at_ms,
                     ),
                 )
+                # issued 事件在同一业务事务追加，时间取事务 UTC 毫秒。
+                self._append_delegation_event(
+                    database, fields["id"], "issued", created_at_ms
+                )
                 payload = {"id": fields["id"], "expiresAt": fields["expiresAt"]}
                 database.execute(
                     "INSERT INTO delegation_idempotency_records"
@@ -1898,9 +2171,14 @@ class Handler(BaseHTTPRequestHandler):
                 if delegation["revoked"]:
                     database.execute("ROLLBACK")
                     return HTTPStatus.CONFLICT, {"error": "conflict"}
+                revoked_at_ms = int(datetime.now(UTC).timestamp() * 1000)
                 database.execute(
                     "UPDATE machine_delegations SET revoked = 1 WHERE id = ?",
                     (delegation_id,),
+                )
+                # 首次撤销在同一业务事务追加 revoked 事件；重复撤销不到达此处。
+                self._append_delegation_event(
+                    database, delegation_id, "revoked", revoked_at_ms
                 )
                 payload = {"id": delegation_id, "revoked": True}
                 database.execute(

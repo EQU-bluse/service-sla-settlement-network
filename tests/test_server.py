@@ -8285,6 +8285,50 @@ class DelegationTests(unittest.TestCase):
         except HTTPError as error:
             return error.code, error.read()
 
+    def get(
+        self,
+        path: str,
+        key: str,
+        *,
+        seed: bytes = PRODUCER_SEED,
+        actor: str | None = None,
+        auth: str | bool = True,
+        request_time_ms: int | None = None,
+        nonce: str | None = None,
+    ) -> tuple[int, bytes]:
+        # 读入口无请求正文：签名域摘要按空字节计算，标准路径取问号前部分。
+        request = Request(self.url(path), method="GET")
+        if auth is True:
+            request.add_header(
+                "SLA-Auth",
+                make_sla_auth(
+                    self.server,
+                    key,
+                    seed,
+                    actor if actor is not None else self.producer,
+                    "GET",
+                    urlsplit(path).path,
+                    b"",
+                    1,
+                    request_time_ms=request_time_ms,
+                    nonce=nonce,
+                ),
+            )
+        elif isinstance(auth, str):
+            request.add_header("SLA-Auth", auth)
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    @property
+    def delegations_path(self) -> str:
+        return f"/v1/machines/{self.producer}/delegations"
+
+    def events_path(self, delegation_id: str = "del-1") -> str:
+        return f"/v1/delegations/{delegation_id}/events"
+
     def delegation_body(
         self,
         delegation_id: str = "del-1",
@@ -8699,3 +8743,446 @@ class DelegationTests(unittest.TestCase):
             seed=PRODUCER_SEED, actor=self.producer,
         )
         self.assertEqual((status, json.loads(payload)), (400, {"error": "invalid_request"}))
+
+    def test_issue_appends_single_issued_event(self) -> None:
+        self.assertEqual(self.issue()[0], 201)
+        status, payload = self.get(self.events_path(), "evt-1")
+        self.assertEqual(status, 200)
+        events = json.loads(payload)["events"]
+        self.assertEqual([event["type"] for event in events], ["issued"])
+        self.assertGreaterEqual(events[0]["eventSeq"], 1)
+        self.assertGreaterEqual(events[0]["createdAt"], 0)
+        # 同键重放不追加事件、不推进序号。
+        self.assertEqual(self.issue()[0], 201)
+        status, payload = self.get(self.events_path(), "evt-2")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(json.loads(payload)["events"]), 1)
+
+    def test_lifecycle_events_carry_global_increasing_seq(self) -> None:
+        self.assertEqual(self.issue("del-1")[0], 201)
+        self.assertEqual(self.issue("del-2", key="issue-2")[0], 201)
+        self.assertEqual(self.use_delegation(self.cap_body(), "cap-1")[0], 201)
+        # 同键重放消费不重复追加 consumed。
+        self.assertEqual(self.use_delegation(self.cap_body(), "cap-1")[0], 201)
+        self.assertEqual(self.revoke("del-2")[0], 200)
+        self.assertEqual(self.revoke("del-2")[0], 200)
+        status, payload = self.get(self.events_path("del-1"), "evt-d1")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [(e["eventSeq"], e["type"]) for e in json.loads(payload)["events"]],
+            [(1, "issued"), (3, "consumed")],
+        )
+        status, payload = self.get(self.events_path("del-2"), "evt-d2")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [(e["eventSeq"], e["type"]) for e in json.loads(payload)["events"]],
+            [(2, "issued"), (4, "revoked")],
+        )
+
+    def test_list_delegations_shape_order_and_flags(self) -> None:
+        self.assertEqual(self.issue("del-1")[0], 201)
+        self.assertEqual(self.issue("del-2", key="issue-2")[0], 201)
+        self.assertEqual(self.use_delegation(self.cap_body(), "cap-1")[0], 201)
+        self.assertEqual(self.revoke("del-2")[0], 200)
+        status, payload = self.get(self.delegations_path, "list-1")
+        self.assertEqual(status, 200)
+        data = json.loads(payload)
+        self.assertIsNone(data["nextCursor"])
+        self.assertEqual(
+            data["delegations"],
+            [
+                {
+                    "id": "del-1",
+                    "delegatePublicKey": DELEGATE_PUBLIC,
+                    "expiresAt": self.expires_at,
+                    "issuedKeyVersion": 1,
+                    "consumed": True,
+                    "revoked": False,
+                },
+                {
+                    "id": "del-2",
+                    "delegatePublicKey": DELEGATE_PUBLIC,
+                    "expiresAt": self.expires_at,
+                    "issuedKeyVersion": 1,
+                    "consumed": False,
+                    "revoked": True,
+                },
+            ],
+        )
+        # 只返回路径机器自己签发的凭证：另一台机器首页为空。
+        status, payload = self.get(
+            f"/v1/machines/{self.consumer}/delegations", "list-2",
+            seed=PUBLIC_KEY_SEED_B, actor=self.consumer,
+        )
+        self.assertEqual(
+            (status, json.loads(payload)),
+            (200, {"delegations": [], "nextCursor": None}),
+        )
+
+    def test_list_delegations_pagination_and_snapshot(self) -> None:
+        self.assertEqual(self.issue("del-1")[0], 201)
+        self.assertEqual(self.issue("del-2", key="issue-2")[0], 201)
+        # 首页以读事务起点的 cut 冻结快照。
+        status, payload = self.get(self.delegations_path + "?limit=1", "page-1")
+        self.assertEqual(status, 200)
+        first = json.loads(payload)
+        self.assertEqual([d["id"] for d in first["delegations"]], ["del-1"])
+        self.assertEqual(first["nextCursor"], "2:1")
+        # cut 之后撤销 del-2，不得进入旧快照。
+        self.assertEqual(self.revoke("del-2")[0], 200)
+        status, payload = self.get(
+            self.delegations_path + f"?cursor={first['nextCursor']}", "page-2"
+        )
+        self.assertEqual(status, 200)
+        second = json.loads(payload)
+        self.assertEqual([d["id"] for d in second["delegations"]], ["del-2"])
+        self.assertFalse(second["delegations"][0]["revoked"])
+        self.assertIsNone(second["nextCursor"])
+        # 全新首页取新 cut，反映撤销。
+        status, payload = self.get(self.delegations_path, "page-3")
+        self.assertEqual(status, 200)
+        latest = {d["id"]: d for d in json.loads(payload)["delegations"]}
+        self.assertTrue(latest["del-2"]["revoked"])
+
+    def test_events_pagination_snapshot_and_restart(self) -> None:
+        self.assertEqual(self.issue("del-1")[0], 201)
+        self.assertEqual(self.issue("del-2", key="issue-2")[0], 201)
+        self.assertEqual(self.use_delegation(self.cap_body(), "cap-1")[0], 201)
+        # 首页 cut=3：del-1 有 issued(1) 与 consumed(3) 两个事件。
+        status, payload = self.get(self.events_path() + "?limit=1", "ev-page-1")
+        self.assertEqual(status, 200)
+        first = json.loads(payload)
+        self.assertEqual(
+            [(e["eventSeq"], e["type"]) for e in first["events"]], [(1, "issued")]
+        )
+        self.assertEqual(first["nextCursor"], "3:1")
+        # 旧 cut 之后撤销 del-1，不进入旧快照的续页。
+        self.assertEqual(self.revoke()[0], 200)
+        self.restart()
+        status, payload = self.get(
+            self.events_path() + f"?cursor={first['nextCursor']}", "ev-page-2"
+        )
+        self.assertEqual(status, 200)
+        second = json.loads(payload)
+        self.assertEqual(
+            [(e["eventSeq"], e["type"]) for e in second["events"]],
+            [(3, "consumed")],
+        )
+        self.assertIsNone(second["nextCursor"])
+        # 全新首页取新 cut，反映撤销。
+        status, payload = self.get(self.events_path(), "ev-page-3")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [e["type"] for e in json.loads(payload)["events"]],
+            ["issued", "consumed", "revoked"],
+        )
+
+    def test_read_query_param_errors_precede_auth(self) -> None:
+        self.assertEqual(self.issue()[0], 201)
+        for index, query in enumerate((
+            "limit=0", "limit=101", "limit=-1", "limit=01", "limit=x",
+            "limit=1&limit=2", "unknown=1", "cursor=x", "cursor=1",
+            "cursor=1:0", "cursor=1:01",
+        )):
+            status, payload = self.get(
+                f"{self.delegations_path}?{query}", f"bad-q-{index}", auth=False
+            )
+            self.assertEqual(
+                (status, json.loads(payload)),
+                (400, {"error": "invalid_request"}),
+                query,
+            )
+
+    def test_read_auth_structure_errors_are_400(self) -> None:
+        self.assertEqual(self.issue()[0], 201)
+        status, _ = self.get(self.delegations_path, "no-header", auth=False)
+        self.assertEqual(status, 400)
+        now = int(time.time() * 1000)
+        for index, raw in enumerate((
+            "x",
+            f"{self.producer};1;{now};nonce-0123456789ab",
+            f"{self.producer};0;{now};nonce-0123456789ab;{'a' * 128}",
+            f"{self.producer};1;{now};short;{'a' * 128}",
+            f"{self.producer};1;{now};nonce-0123456789ab;{'A' * 128}",
+        )):
+            status, payload = self.get(
+                self.delegations_path, f"bad-h-{index}", auth=raw
+            )
+            self.assertEqual(
+                (status, json.loads(payload)),
+                (400, {"error": "invalid_request"}),
+                raw,
+            )
+
+    def test_read_missing_resources_are_404(self) -> None:
+        ghost = machine_id(PUBLIC_KEY_C)
+        status, payload = self.get(
+            f"/v1/machines/{ghost}/delegations", "ghost-m"
+        )
+        self.assertEqual((status, json.loads(payload)), (404, {"error": "not_found"}))
+        status, payload = self.get(self.events_path("del-ghost"), "ghost-d")
+        self.assertEqual((status, json.loads(payload)), (404, {"error": "not_found"}))
+
+    def test_read_non_issuer_is_403(self) -> None:
+        self.assertEqual(self.issue()[0], 201)
+        status, payload = self.get(
+            self.delegations_path, "other-m",
+            seed=PUBLIC_KEY_SEED_B, actor=self.consumer,
+        )
+        self.assertEqual((status, json.loads(payload)), (403, {"error": "forbidden"}))
+        status, payload = self.get(
+            self.events_path(), "other-d",
+            seed=PUBLIC_KEY_SEED_B, actor=self.consumer,
+        )
+        self.assertEqual((status, json.loads(payload)), (403, {"error": "forbidden"}))
+
+    def test_read_stale_and_bad_signature_are_401(self) -> None:
+        self.assertEqual(self.issue()[0], 201)
+        status, payload = self.get(
+            self.events_path(), "stale-1",
+            request_time_ms=int(time.time() * 1000) - 400_000,
+            nonce="nonce-read-stale-001",
+        )
+        self.assertEqual((status, json.loads(payload)), (401, {"error": "stale_request"}))
+        status, payload = self.get(
+            self.events_path(), "bad-sig-1",
+            seed=PUBLIC_KEY_SEED_C, nonce="nonce-read-badsig-01",
+        )
+        self.assertEqual(
+            (status, json.loads(payload)),
+            (401, {"error": "invalid_authentication"}),
+        )
+
+    def test_failed_read_does_not_consume_nonce(self) -> None:
+        self.assertEqual(self.issue()[0], 201)
+        # 时间窗口失败不消费随机数：同一随机数在新鲜请求中成功。
+        nonce = "nonce-read-fail-reuse-1"
+        status, _ = self.get(
+            self.events_path(), "fail-1",
+            request_time_ms=int(time.time() * 1000) - 400_000, nonce=nonce,
+        )
+        self.assertEqual(status, 401)
+        status, _ = self.get(self.events_path(), "fail-2", nonce=nonce)
+        self.assertEqual(status, 200)
+        # 资源不存在（认证校验之前）同样不消费。
+        nonce = "nonce-read-404-reuse-01"
+        status, _ = self.get(
+            self.events_path("del-ghost"), "fail-3", nonce=nonce
+        )
+        self.assertEqual(status, 404)
+        status, _ = self.get(self.events_path(), "fail-4", nonce=nonce)
+        self.assertEqual(status, 200)
+
+    def test_successful_read_consumes_nonce(self) -> None:
+        self.assertEqual(self.issue()[0], 201)
+        self.assertEqual(self.get(self.events_path(), "once-1")[0], 200)
+        # 同键逐字节重试携带相同随机数：仅首次成功读取消费。
+        status, payload = self.get(self.events_path(), "once-1")
+        self.assertEqual((status, json.loads(payload)), (409, {"error": "replay_detected"}))
+
+    def test_read_cursor_anchor_mismatches_are_400(self) -> None:
+        self.assertEqual(self.issue("del-1")[0], 201)
+        self.assertEqual(self.issue("del-2", key="issue-2")[0], 201)
+        self.assertEqual(self.use_delegation(self.cap_body(), "cap-1")[0], 201)
+        self.assertEqual(self.revoke("del-2")[0], 200)
+        # 超前 cut。
+        status, payload = self.get(
+            self.delegations_path + "?cursor=9999:1", "cur-1"
+        )
+        self.assertEqual((status, json.loads(payload)), (400, {"error": "invalid_request"}))
+        # 锚点属于目标机器但不是 issued 事件（del-1 的 consumed 序号 3）。
+        status, payload = self.get(
+            self.delegations_path + "?cursor=4:3", "cur-2"
+        )
+        self.assertEqual((status, json.loads(payload)), (400, {"error": "invalid_request"}))
+        # 锚点属于其他凭证（del-2 的 issued 序号用于 del-1 事件）。
+        status, payload = self.get(
+            self.events_path("del-1") + "?cursor=4:2", "cur-3"
+        )
+        self.assertEqual((status, json.loads(payload)), (400, {"error": "invalid_request"}))
+        # 锚点属于该凭证但不是游标快照内事件（lastSeq 大于 cut）。
+        status, payload = self.get(
+            self.events_path("del-1") + "?cursor=1:3", "cur-4"
+        )
+        self.assertEqual((status, json.loads(payload)), (400, {"error": "invalid_request"}))
+
+    def test_concurrent_consume_appends_single_event(self) -> None:
+        self.assertEqual(self.issue()[0], 201)
+        results: list[int] = []
+        lock = threading.Lock()
+
+        def use(index: int) -> None:
+            status, _ = self.use_delegation(self.cap_body(), f"race-{index}")
+            with lock:
+                results.append(status)
+
+        threads = [threading.Thread(target=use, args=(i,)) for i in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual(sorted(results), [201] + [401] * 7)
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM delegation_events"
+                " WHERE delegation_id = 'del-1' AND type = 'consumed'"
+            ).fetchone()[0]
+            self.assertEqual(count, 1)
+        finally:
+            connection.close()
+
+
+class DelegationEventMigrationTests(unittest.TestCase):
+    """旧库：委托已存在并带消费/撤销标记，但无委托生命周期事件。"""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.database_path = str(Path(self.temporary.name) / "service.db")
+        self._build_old_database()
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = self.database_path
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.producer = machine_id(PUBLIC_KEY_A)
+
+    def _build_old_database(self) -> None:
+        # 先以当前全量结构建库并写入旧委托，再删除事件表与一次性标记，
+        # 模拟“有委托、无生命周期事件”的升级前数据库。
+        from sla_network.database import connect as db_connect
+
+        producer = machine_id(PUBLIC_KEY_A)
+        now = int(time.time() * 1000)
+        connection = db_connect(self.database_path)
+        connection.execute(
+            "INSERT INTO machines(id, public_key) VALUES (?, ?)",
+            (producer, PUBLIC_KEY_A),
+        )
+        connection.execute(
+            "INSERT INTO machine_keys"
+            "(machine_id, version, public_key, activated_at_ms, revoked)"
+            " VALUES (?, 1, ?, 0, 0)",
+            (producer, PUBLIC_KEY_A),
+        )
+        # (id, revoked, consumed, created_at_ms)
+        rows = (
+            ("d-old-1", 1, 1, now - 3000),
+            ("d-old-2", 0, 1, now - 2000),
+            ("d-old-3", 0, 0, now - 1000),
+        )
+        for delegation_id, revoked, consumed, created_at_ms in rows:
+            connection.execute(
+                "INSERT INTO machine_delegations"
+                "(id, issuer_machine_id, delegate_public_key, expires_at_ms,"
+                " issued_key_version, revoked, consumed, created_at_ms)"
+                " VALUES (?, ?, ?, 9999999999999, 1, ?, ?, ?)",
+                (delegation_id, producer, DELEGATE_PUBLIC, revoked, consumed,
+                 created_at_ms),
+            )
+        connection.commit()
+        connection.close()
+        raw = sqlite3.connect(self.database_path)
+        try:
+            raw.execute("DROP TABLE delegation_events")
+            raw.execute(
+                "DELETE FROM schema_metadata"
+                " WHERE key = 'delegation_events_backfilled'"
+            )
+            raw.commit()
+        finally:
+            raw.close()
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temporary.cleanup()
+
+    def url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}{path}"
+
+    def restart(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = self.database_path
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def get_json(self, path: str, key: str) -> tuple[int, object]:
+        request = Request(self.url(path), method="GET")
+        request.add_header(
+            "SLA-Auth",
+            make_sla_auth(
+                self.server, key, PRODUCER_SEED, self.producer,
+                "GET", urlsplit(path).path, b"", 1,
+            ),
+        )
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read())
+        except HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    def test_old_delegations_backfilled_once_by_rowid(self) -> None:
+        expected = {
+            "d-old-1": [(1, "issued"), (2, "consumed"), (3, "revoked")],
+            "d-old-2": [(4, "issued"), (5, "consumed")],
+            "d-old-3": [(6, "issued")],
+        }
+        for delegation_id, events in expected.items():
+            status, payload = self.get_json(
+                f"/v1/delegations/{delegation_id}/events", f"evt-{delegation_id}"
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                [(e["eventSeq"], e["type"]) for e in payload["events"]],
+                events,
+            )
+            self.assertTrue(all(e["createdAt"] == 0 for e in payload["events"]))
+            self.assertIsNone(payload["nextCursor"])
+        status, payload = self.get_json(
+            f"/v1/machines/{self.producer}/delegations", "list-1"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [(d["id"], d["consumed"], d["revoked"]) for d in payload["delegations"]],
+            [("d-old-1", True, True), ("d-old-2", True, False), ("d-old-3", False, False)],
+        )
+
+    def test_backfill_runs_once_and_new_events_continue_seq(self) -> None:
+        status, payload = self.get_json("/v1/delegations/d-old-3/events", "seed-1")
+        self.assertEqual(status, 200)
+        self.restart()
+        connection = sqlite3.connect(self.database_path)
+        try:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM delegation_events").fetchone()[0],
+                6,
+            )
+        finally:
+            connection.close()
+        expires_at = int(time.time() * 1000) + 3_600_000
+        body = json.dumps({
+            "id": "d-new-1", "delegatePublicKey": DELEGATE_PUBLIC,
+            "expiresAt": expires_at,
+        }).encode()
+        request = Request(self.url("/v1/delegations"), data=body, method="POST")
+        request.add_header("Idempotency-Key", "issue-new")
+        request.add_header(
+            "SLA-Auth",
+            make_sla_auth(
+                self.server, "issue-new", PRODUCER_SEED, self.producer,
+                "POST", "/v1/delegations", body, 1,
+            ),
+        )
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        status, payload = self.get_json("/v1/delegations/d-new-1/events", "new-evt")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [(e["eventSeq"], e["type"]) for e in payload["events"]],
+            [(7, "issued")],
+        )
+        self.assertGreater(payload["events"][0]["createdAt"], 0)
