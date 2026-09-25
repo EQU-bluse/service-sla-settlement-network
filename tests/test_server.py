@@ -4,7 +4,10 @@ import concurrent.futures
 import hashlib
 import json
 import re
+import socket
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -70,6 +73,9 @@ PUBLIC_KEY_C = _ed25519_public_key(PUBLIC_KEY_SEED_C).hex()
 # 代理凭证固定使用与三台机器不同的 Ed25519 密钥对。
 DELEGATE_SEED = b"\x09" * 32
 DELEGATE_PUBLIC = _ed25519_public_key(DELEGATE_SEED).hex()
+# 仲裁机器固定使用与三台机器及代理不同的 Ed25519 密钥对。
+ARBITRATOR_SEED = b"\x07" * 32
+ARBITRATOR_PUBLIC = _ed25519_public_key(ARBITRATOR_SEED).hex()
 
 
 def telemetry_signature(
@@ -9704,6 +9710,789 @@ class EscalationTests(_EvidenceScenario, unittest.TestCase):
             [item["escalationSeq"] for item in json.loads(fresh)["escalations"]],
             [1],
         )
+
+
+class ArbitrationTests(_EvidenceScenario, unittest.TestCase):
+    # 终局仲裁：已配置仲裁机器对 escalated 争议整笔划拨清算资金，
+    # release 交还原收款方、refund 退还原付款方；读取沿用升级审计入口。
+    def setUp(self) -> None:
+        super().setUp()
+        # 第四台机器作为已配置仲裁机器（非争议双方）。
+        self.arbitrator_id = machine_id(ARBITRATOR_PUBLIC)
+        self.server.arbitrators = frozenset({self.arbitrator_id})
+        status, _ = self.post_json(
+            "/v1/machines", {"publicKey": ARBITRATOR_PUBLIC}, "register-arbitrator"
+        )
+        self.assertEqual(status, 201)
+
+    def restart(self) -> None:
+        super().restart()
+        self.server.arbitrators = frozenset({self.arbitrator_id})
+
+    def create_escalated(self, dispute_id: str = "dispute-1") -> int:
+        # 建立快照与两份分歧提案，回拨第二份创建时间后升级，返回升级序号。
+        status, body = self.post_json(
+            f"/v1/disputes/{dispute_id}/evidence-snapshots",
+            {"actorId": self.consumer_id},
+            f"snap-{dispute_id}",
+        )
+        self.assertEqual(status, 201, body)
+        snapshot_seq = json.loads(body)["snapshotSeq"]
+        status, _ = self.post_json(
+            f"/v1/disputes/{dispute_id}/adjudication-proposals",
+            {
+                "actorId": self.consumer_id,
+                "snapshotSeq": snapshot_seq,
+                "decision": "refund",
+                "reasonDigest": "cd" * 32,
+            },
+            f"prop-c-{dispute_id}",
+        )
+        self.assertEqual(status, 201)
+        status, _ = self.post_json(
+            f"/v1/disputes/{dispute_id}/adjudication-proposals",
+            {
+                "actorId": self.machine_id,
+                "snapshotSeq": snapshot_seq,
+                "decision": "release",
+                "reasonDigest": "de" * 32,
+            },
+            f"prop-p-{dispute_id}",
+        )
+        self.assertEqual(status, 201)
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            connection.execute(
+                "UPDATE dispute_adjudication_proposals"
+                " SET created_at_ms = created_at_ms - ?"
+                " WHERE dispute_id = ?",
+                (90_000_000, dispute_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        status, body = self.post_json(
+            f"/v1/disputes/{dispute_id}/escalations",
+            {"actorId": self.consumer_id},
+            f"esc-{dispute_id}",
+        )
+        self.assertEqual(status, 201, body)
+        return json.loads(body)["escalationSeq"]
+
+    def post_arbitration(
+        self,
+        dispute_id: str = "dispute-1",
+        decision: str = "release",
+        key: str | None = "arb-1",
+    ) -> tuple[int, bytes]:
+        raw = json.dumps({"decision": decision}).encode()
+        return self.post_arbitration_raw(
+            f"/v1/disputes/{dispute_id}/arbitrations", raw, key
+        )
+
+    def post_arbitration_raw(
+        self,
+        path: str,
+        body: bytes,
+        key: str | None,
+        *,
+        seed: bytes = ARBITRATOR_SEED,
+        actor: str | None = None,
+        nonce: str | None = None,
+        request_time_ms: int | None = None,
+        delegation: str | None = None,
+        omit_auth: bool = False,
+    ) -> tuple[int, bytes]:
+        request = Request(self.url(path), data=body, method="POST")
+        if key is not None:
+            request.add_header("Idempotency-Key", key)
+        if delegation is not None:
+            request.add_header("SLA-Delegation", delegation)
+        elif not omit_auth:
+            request.add_header(
+                "SLA-Auth",
+                make_sla_auth(
+                    self.server,
+                    key,
+                    seed,
+                    actor if actor is not None else self.arbitrator_id,
+                    "POST",
+                    urlsplit(path).path,
+                    body,
+                    1,
+                    request_time_ms=request_time_ms,
+                    nonce=nonce,
+                ),
+            )
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def get_arbitrations(
+        self,
+        path: str,
+        *,
+        seed: bytes | None = None,
+        actor: str | None = None,
+        nonce: str | None = None,
+        omit_auth: bool = False,
+    ) -> tuple[int, bytes]:
+        # 仲裁记录审计读取为 GET 且无正文；标准路径不含查询串，摘要按空字节计算。
+        request = Request(self.url(path), data=b"", method="GET")
+        if not omit_auth:
+            if nonce is None:
+                nonce = f"nonce-arb-audit-{time.time_ns()}"
+            request.add_header(
+                "SLA-Auth",
+                make_sla_auth(
+                    self.server,
+                    None,
+                    seed if seed is not None else PUBLIC_KEY_SEED_B,
+                    actor if actor is not None else self.consumer_id,
+                    "GET",
+                    urlsplit(path).path,
+                    b"",
+                    1,
+                    nonce=nonce,
+                ),
+            )
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def arbitrations_path(self, dispute_id: str = "dispute-1") -> str:
+        return f"/v1/disputes/{dispute_id}/arbitrations"
+
+    def set_clearing_balance(self, balance: int) -> None:
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            connection.execute(
+                "UPDATE ledger_accounts SET balance_micros = ?"
+                " WHERE account_id = 'external:clearing'",
+                (balance,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    # ---- 成功路径：资金划拨、状态、事件、账本 ----
+
+    def test_release_moves_funds_from_clearing_to_payee(self) -> None:
+        escalation_seq = self.create_escalated()
+        self.assertEqual(escalation_seq, 1)
+        status, body = self.post_arbitration()
+        self.assertEqual(status, 201, body)
+        payload = json.loads(body)
+        self.assertEqual(
+            list(payload),
+            ["arbitrationSeq", "decision", "amount", "arbitratorId", "createdAt"],
+        )
+        self.assertEqual(payload["arbitrationSeq"], 1)
+        self.assertEqual(payload["decision"], "release")
+        self.assertEqual(payload["amount"], 1000)
+        self.assertEqual(payload["arbitratorId"], self.arbitrator_id)
+        self.assertIsInstance(payload["createdAt"], int)
+        # 争议状态与生命周期事件。
+        status, dispute = self.get_json("/v1/disputes/dispute-1")
+        self.assertEqual(dispute["state"], "released")
+        status, events = self.get_json("/v1/disputes/dispute-1/events")
+        self.assertEqual(
+            [event["type"] for event in events["events"]],
+            ["opened", "escalated", "released"],
+        )
+        # 收款方（机器）入账 1000，外部清算账户等额划出。
+        status, ledger = self.get_json(
+            f"/v1/accounts/{self.machine_id}/ledger"
+        )
+        arbitrations = [
+            entry for entry in ledger["entries"]
+            if entry["kind"] == "dispute_arbitration"
+        ]
+        self.assertEqual(len(arbitrations), 1)
+        entry = arbitrations[0]
+        self.assertEqual(
+            list(entry),
+            [
+                "entrySeq", "kind", "referenceSeq", "reference", "slaId",
+                "evaluationSeq", "delta", "balanceAfter", "createdAt",
+            ],
+        )
+        self.assertEqual(entry["referenceSeq"], 1)
+        self.assertIsNone(entry["reference"])
+        self.assertEqual(entry["slaId"], "sla-1")
+        self.assertEqual(entry["evaluationSeq"], 1)
+        self.assertEqual(entry["delta"], 1000)
+        self.assertEqual(entry["balanceAfter"], 1000)
+        status, clearing = self.get_json(
+            "/v1/accounts/external:clearing/ledger"
+        )
+        clearing_entries = [
+            entry for entry in clearing["entries"]
+            if entry["kind"] == "dispute_arbitration"
+        ]
+        self.assertEqual(len(clearing_entries), 1)
+        self.assertEqual(clearing_entries[0]["delta"], -1000)
+        self.assertEqual(clearing_entries[0]["referenceSeq"], 1)
+        self.assertEqual(clearing_entries[0]["slaId"], "sla-1")
+        self.assertEqual(clearing_entries[0]["evaluationSeq"], 1)
+
+    def test_refund_moves_funds_from_clearing_to_payer(self) -> None:
+        self.create_escalated()
+        status, body = self.post_arbitration(decision="refund")
+        self.assertEqual(status, 201, body)
+        payload = json.loads(body)
+        self.assertEqual(payload["decision"], "refund")
+        self.assertEqual(payload["amount"], 1000)
+        status, dispute = self.get_json("/v1/disputes/dispute-1")
+        self.assertEqual(dispute["state"], "refunded")
+        status, events = self.get_json("/v1/disputes/dispute-1/events")
+        self.assertEqual(
+            [event["type"] for event in events["events"]],
+            ["opened", "escalated", "refunded"],
+        )
+        # 付款方（消费者）入账 1000。
+        status, ledger = self.get_json(
+            f"/v1/accounts/{self.consumer_id}/ledger"
+        )
+        arbitrations = [
+            entry for entry in ledger["entries"]
+            if entry["kind"] == "dispute_arbitration"
+        ]
+        self.assertEqual(len(arbitrations), 1)
+        self.assertEqual(arbitrations[0]["delta"], 1000)
+        self.assertEqual(arbitrations[0]["balanceAfter"], 100000)
+        status, clearing = self.get_json(
+            "/v1/accounts/external:clearing/ledger"
+        )
+        clearing_entries = [
+            entry for entry in clearing["entries"]
+            if entry["kind"] == "dispute_arbitration"
+        ]
+        self.assertEqual(len(clearing_entries), 1)
+        self.assertEqual(clearing_entries[0]["delta"], -1000)
+
+    def test_arbitration_sequences_are_global_across_disputes(self) -> None:
+        self.create_escalated()
+        status, body = self.post_arbitration(key="arb-d1")
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(body)["arbitrationSeq"], 1)
+        self.create_second_dispute()
+        self.create_escalated("dispute-2")
+        status, body = self.post_arbitration("dispute-2", key="arb-d2")
+        self.assertEqual(status, 201, body)
+        self.assertEqual(json.loads(body)["arbitrationSeq"], 2)
+        # 各自争议的仲裁记录只含本争议项。
+        status, first = self.get_arbitrations(self.arbitrations_path())
+        self.assertEqual(
+            [item["arbitrationSeq"] for item in json.loads(first)["arbitrations"]],
+            [1],
+        )
+        status, second = self.get_arbitrations(self.arbitrations_path("dispute-2"))
+        self.assertEqual(
+            [item["arbitrationSeq"] for item in json.loads(second)["arbitrations"]],
+            [2],
+        )
+
+    # ---- 仲裁机器身份 ----
+
+    def test_unconfigured_arbitrator_is_forbidden(self) -> None:
+        self.create_escalated()
+        # 未配置任何仲裁机器：任何认证机器均 403。
+        self.server.arbitrators = frozenset()
+        status, body = self.post_arbitration()
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body), {"error": "forbidden"})
+        # 已登记机器但未配置为仲裁机器同样 403。
+        self.server.arbitrators = frozenset({self.arbitrator_id})
+        status, body = self.post_arbitration_raw(
+            self.arbitrations_path(),
+            json.dumps({"decision": "release"}).encode(),
+            "arb-stranger",
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body), {"error": "forbidden"})
+
+    def test_configured_but_unregistered_machine_is_401(self) -> None:
+        self.create_escalated()
+        ghost_seed = b"\x04" * 32
+        ghost_id = machine_id(_ed25519_public_key(ghost_seed).hex())
+        self.server.arbitrators = frozenset({ghost_id})
+        status, body = self.post_arbitration_raw(
+            self.arbitrations_path(),
+            json.dumps({"decision": "release"}).encode(),
+            "arb-ghost",
+            seed=ghost_seed,
+            actor=ghost_id,
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(body), {"error": "invalid_authentication"})
+
+    # ---- 前置条件错误 ----
+
+    def test_missing_dispute_is_404(self) -> None:
+        status, body = self.post_arbitration(
+            dispute_id="dispute-ghost", key="arb-ghost-404"
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+
+    def test_open_dispute_is_already_resolved(self) -> None:
+        # 争议仍 open（未升级）：不可仲裁。
+        status, body = self.post_arbitration()
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "already_resolved"})
+
+    def test_resolved_dispute_is_already_resolved(self) -> None:
+        status, _ = self.post_json(
+            "/v1/disputes/dispute-1/resolution",
+            {"decision": "release"},
+            "resolve-1",
+        )
+        self.assertEqual(status, 200)
+        status, body = self.post_arbitration()
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "already_resolved"})
+
+    def test_missing_escalation_is_conflict(self) -> None:
+        self.create_escalated()
+        # 防御性分支：争议 escalated 但升级记录缺失（正常流程不可达）。
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            connection.execute(
+                "DELETE FROM dispute_escalations WHERE dispute_id = 'dispute-1'"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        status, body = self.post_arbitration()
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_repeat_arbitration_with_different_key_is_arbitration_exists(
+        self,
+    ) -> None:
+        self.create_escalated()
+        status, first = self.post_arbitration(key="arb-first")
+        self.assertEqual(status, 201)
+        status, body = self.post_arbitration(decision="refund", key="arb-again")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "arbitration_exists"})
+        # 同键重放仍返回首次响应字节。
+        status, replay = self.post_arbitration(key="arb-first")
+        self.assertEqual(status, 201)
+        self.assertEqual(replay, first)
+
+    def test_insufficient_clearing_balance_saves_nothing(self) -> None:
+        self.create_escalated()
+        # 清算账户持有额被提空，仲裁必然不足。
+        self.set_clearing_balance(0)
+        raw = json.dumps({"decision": "release"}).encode()
+        fixed_nonce = "nonce-arb-insufficient-0001"
+        status, body = self.post_arbitration_raw(
+            self.arbitrations_path(), raw, "arb-fail", nonce=fixed_nonce
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "insufficient_funds"})
+        # 仲裁记录、事件、幂等结果均不保存；争议保持 escalated。
+        status, dispute = self.get_json("/v1/disputes/dispute-1")
+        self.assertEqual(dispute["state"], "escalated")
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM dispute_arbitrations"
+            ).fetchone()[0]
+            idem = connection.execute(
+                "SELECT COUNT(*) FROM dispute_arbitration_idempotency_records"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(count, 0)
+        self.assertEqual(idem, 0)
+        status, events = self.get_json("/v1/disputes/dispute-1/events")
+        self.assertEqual(
+            [event["type"] for event in events["events"]],
+            ["opened", "escalated"],
+        )
+        # 失败不消费随机数：同随机数重试仍是余额不足而非 replay_detected。
+        status, body = self.post_arbitration_raw(
+            self.arbitrations_path(), raw, "arb-fail-2", nonce=fixed_nonce
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "insufficient_funds"})
+        # 补足持有额后同键重试成功。
+        self.set_clearing_balance(-100_000)
+        status, body = self.post_arbitration_raw(
+            self.arbitrations_path(), raw, "arb-fail",
+            nonce="nonce-arb-retry-00000001",
+        )
+        self.assertEqual(status, 201, body)
+
+    # ---- 请求校验、认证与幂等 ----
+
+    def test_invalid_requests(self) -> None:
+        self.create_escalated()
+        valid = {"decision": "release"}
+        cases = [
+            b"",
+            b"{not json",
+            json.dumps({}).encode(),
+            json.dumps({**valid, "extra": 1}).encode(),
+            json.dumps({"decision": "RELEASE"}).encode(),
+            json.dumps({"decision": "hold"}).encode(),
+            json.dumps({"decision": 1}).encode(),
+            json.dumps({"decision": None}).encode(),
+        ]
+        for index, bad in enumerate(cases):
+            status, body = self.post_arbitration_raw(
+                self.arbitrations_path(), bad, f"arb-bad-{index}"
+            )
+            self.assertEqual(status, 400, bad)
+            self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        # 缺少幂等头。
+        status, _ = self.post_arbitration_raw(
+            self.arbitrations_path(), json.dumps(valid).encode(), None
+        )
+        self.assertEqual(status, 400)
+        # 查询参数非法先于争议查询。
+        status, _ = self.post_arbitration_raw(
+            self.arbitrations_path() + "?x=1",
+            json.dumps(valid).encode(),
+            "arb-query",
+        )
+        self.assertEqual(status, 400)
+        # 缺少认证头。
+        status, _ = self.post_arbitration_raw(
+            self.arbitrations_path(),
+            json.dumps(valid).encode(),
+            "arb-no-auth",
+            omit_auth=True,
+        )
+        self.assertEqual(status, 400)
+        # 携带代理头同样非法。
+        status, _ = self.post_arbitration_raw(
+            self.arbitrations_path(),
+            json.dumps(valid).encode(),
+            "arb-delegation",
+            delegation="del-1;0;0;nonce-delegation-00000004;" + "ab" * 64,
+        )
+        self.assertEqual(status, 400)
+
+    def test_stale_request_is_401(self) -> None:
+        self.create_escalated()
+        raw = json.dumps({"decision": "release"}).encode()
+        stale = int(time.time() * 1000) - 301_000
+        status, body = self.post_arbitration_raw(
+            self.arbitrations_path(), raw, "arb-stale", request_time_ms=stale
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(body), {"error": "stale_request"})
+
+    def test_nonce_replay_detected(self) -> None:
+        self.create_escalated()
+        raw = json.dumps({"decision": "release"}).encode()
+        fixed = "nonce-arb-fixed-00000000001"
+        status, _ = self.post_arbitration_raw(
+            self.arbitrations_path(), raw, "arb-nonce-1", nonce=fixed
+        )
+        self.assertEqual(status, 201)
+        status, body = self.post_arbitration_raw(
+            self.arbitrations_path(), raw, "arb-nonce-2", nonce=fixed
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "replay_detected"})
+
+    def test_same_key_conflict_and_replay_bytes(self) -> None:
+        self.create_escalated()
+        status, first = self.post_arbitration(key="arb-1")
+        self.assertEqual(status, 201)
+        # 同键重放原字节。
+        status, replay = self.post_arbitration(key="arb-1")
+        self.assertEqual(status, 201)
+        self.assertEqual(replay, first)
+        # 同键异正文冲突，且先于争议查询。
+        status, body = self.post_arbitration(decision="refund", key="arb-1")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+        status, body = self.post_arbitration(
+            dispute_id="dispute-other", key="arb-1"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+        # 同键异认证五段冲突。
+        raw = json.dumps({"decision": "release"}).encode()
+        status, body = self.post_arbitration_raw(
+            self.arbitrations_path(), raw, "arb-1",
+            nonce="nonce-arb-replay-other-001",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_replay_survives_restart(self) -> None:
+        self.create_escalated()
+        status, first = self.post_arbitration(key="arb-1")
+        self.assertEqual(status, 201)
+        self.restart()
+        status, replay = self.post_arbitration(key="arb-1")
+        self.assertEqual(status, 201)
+        self.assertEqual(replay, first)
+        status, body = self.get_arbitrations(self.arbitrations_path())
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            json.loads(body)["arbitrations"][0]["arbitrationSeq"],
+            json.loads(first)["arbitrationSeq"],
+        )
+
+    # ---- 并发 ----
+
+    def test_concurrent_arbitrations_single_winner(self) -> None:
+        self.create_escalated()
+        barrier = threading.Barrier(2)
+        results: list[dict] = []
+        lock = threading.Lock()
+
+        def submit(decision: str, key: str) -> None:
+            barrier.wait()
+            raw = json.dumps({"decision": decision}).encode()
+            status, body = self.post_arbitration_raw(
+                self.arbitrations_path(), raw, key
+            )
+            with lock:
+                results.append({"status": status, "body": json.loads(body)})
+
+        threads = [
+            threading.Thread(target=submit, args=("release", "arb-race-1")),
+            threading.Thread(target=submit, args=("refund", "arb-race-2")),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        statuses = sorted(result["status"] for result in results)
+        self.assertEqual(statuses, [201, 409])
+        loser = [r for r in results if r["status"] == 409][0]
+        self.assertEqual(loser["body"], {"error": "arbitration_exists"})
+        # 资金只移动一次，事件仅一条结果事件。
+        status, clearing = self.get_json(
+            "/v1/accounts/external:clearing/ledger"
+        )
+        moves = [
+            entry for entry in clearing["entries"]
+            if entry["kind"] == "dispute_arbitration"
+        ]
+        self.assertEqual(len(moves), 1)
+        status, events = self.get_json("/v1/disputes/dispute-1/events")
+        self.assertEqual(len(events["events"]), 3)
+
+    def test_concurrent_same_key_replays_first_bytes(self) -> None:
+        self.create_escalated()
+        barrier = threading.Barrier(2)
+        results: list[tuple[int, bytes]] = []
+        lock = threading.Lock()
+
+        def submit() -> None:
+            barrier.wait()
+            status, body = self.post_arbitration(key="arb-same")
+            with lock:
+                results.append((status, body))
+
+        threads = [threading.Thread(target=submit) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual(len(results), 2)
+        self.assertEqual([status for status, _ in results], [201, 201])
+        self.assertEqual(results[0][1], results[1][1])
+
+    # ---- GET 集合 ----
+
+    def test_get_collection_empty(self) -> None:
+        status, body = self.get_arbitrations(self.arbitrations_path())
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            json.loads(body), {"arbitrations": [], "nextCursor": None}
+        )
+
+    def test_get_collection_returns_arbitration(self) -> None:
+        escalation_seq = self.create_escalated()
+        status, created = self.post_arbitration(decision="refund")
+        self.assertEqual(status, 201)
+        created_payload = json.loads(created)
+        status, body = self.get_arbitrations(self.arbitrations_path())
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(list(payload), ["arbitrations", "nextCursor"])
+        self.assertEqual(len(payload["arbitrations"]), 1)
+        item = payload["arbitrations"][0]
+        self.assertEqual(
+            list(item),
+            [
+                "arbitrationSeq", "escalationSeq", "arbitratorId", "decision",
+                "amount", "createdAt",
+            ],
+        )
+        self.assertEqual(item["arbitrationSeq"], 1)
+        self.assertEqual(item["escalationSeq"], escalation_seq)
+        self.assertEqual(item["arbitratorId"], self.arbitrator_id)
+        self.assertEqual(item["decision"], "refund")
+        self.assertEqual(item["amount"], 1000)
+        self.assertEqual(item["createdAt"], created_payload["createdAt"])
+        self.assertIsNone(payload["nextCursor"])
+
+    def test_get_collection_errors_and_nonce_consumption(self) -> None:
+        self.create_escalated()
+        self.assertEqual(self.post_arbitration()[0], 201)
+        for query in (
+            "limit=0", "limit=101", "limit=01", "limit=1&limit=2",
+            "unknown=1", "cursor=1", "cursor=x:1", "cursor=1:y",
+        ):
+            status, body = self.get_arbitrations(
+                self.arbitrations_path() + f"?{query}"
+            )
+            self.assertEqual(status, 400, query)
+            self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        # 参数错误先于争议查询。
+        status, _ = self.get_arbitrations(
+            self.arbitrations_path("dispute-missing") + "?limit=0"
+        )
+        self.assertEqual(status, 400)
+        # 争议不存在 404；非参与方（含仲裁机器自身）403。
+        status, body = self.get_arbitrations(
+            self.arbitrations_path("dispute-missing")
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+        status, body = self.get_arbitrations(
+            self.arbitrations_path(),
+            seed=ARBITRATOR_SEED,
+            actor=self.arbitrator_id,
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body), {"error": "forbidden"})
+        # cut 超前 / 锚点不属于该争议为 400。
+        self.create_second_dispute()
+        self.create_escalated("dispute-2")
+        self.assertEqual(
+            self.post_arbitration("dispute-2", key="arb-d2")[0], 201
+        )
+        status, body = self.get_arbitrations(
+            self.arbitrations_path() + "?cursor=99:1"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        status, body = self.get_arbitrations(
+            self.arbitrations_path() + "?cursor=2:2"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        # 成功读取消费随机数；失败（cut 超前）不消费。
+        fixed = "nonce-arb-get-0000000000001"
+        status, _ = self.get_arbitrations(
+            self.arbitrations_path() + "?cursor=99:1", nonce=fixed
+        )
+        self.assertEqual(status, 400)
+        status, _ = self.get_arbitrations(
+            self.arbitrations_path() + "?cursor=99:1", nonce=fixed
+        )
+        self.assertEqual(status, 400)
+        status, body = self.get_arbitrations(
+            self.arbitrations_path(), nonce=fixed
+        )
+        self.assertEqual(status, 200, body)
+        status, body = self.get_arbitrations(
+            self.arbitrations_path(), nonce=fixed
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "replay_detected"})
+        # 缺少认证头为 400 且先于争议查询；携带代理头同样非法。
+        status, _ = self.get_arbitrations(
+            self.arbitrations_path("dispute-missing"), omit_auth=True
+        )
+        self.assertEqual(status, 400)
+        request = Request(
+            self.url(self.arbitrations_path()), data=b"", method="GET"
+        )
+        request.add_header(
+            "SLA-Delegation", "del-1;0;0;nonce-delegation-00000005;" + "ab" * 64
+        )
+        with self.assertRaises(HTTPError) as context:
+            urlopen(request, timeout=5)
+        self.assertEqual(context.exception.code, 400)
+
+    def test_get_collection_cursor_cut_isolates_later_arbitrations(self) -> None:
+        self.create_escalated()
+        self.assertEqual(self.post_arbitration(key="arb-d1")[0], 201)
+        # 第二争议的仲裁推进全库最大序号；旧 cut=1 的续页不得看到新仲裁。
+        self.create_second_dispute()
+        self.create_escalated("dispute-2")
+        self.assertEqual(
+            self.post_arbitration("dispute-2", key="arb-d2")[0], 201
+        )
+        status, continuation = self.get_arbitrations(
+            self.arbitrations_path() + "?cursor=1:1"
+        )
+        self.assertEqual(status, 200)
+        payload = json.loads(continuation)
+        self.assertEqual(payload["arbitrations"], [])
+        self.assertIsNone(payload["nextCursor"])
+        # 全新首页取新 cut，但 dispute-1 仍只含自己的仲裁。
+        status, fresh = self.get_arbitrations(self.arbitrations_path())
+        self.assertEqual(
+            [item["arbitrationSeq"] for item in json.loads(fresh)["arbitrations"]],
+            [1],
+        )
+
+
+class ArbitratorCliTests(unittest.TestCase):
+    # --arbitrator 启动参数：格式非法退出码 2；合法或省略时服务照常运行。
+    def test_invalid_arbitrator_format_exits_with_code_2(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "-m", "sla_network", "--arbitrator", "not-a-machine"],
+            capture_output=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 2)
+
+    def test_valid_arbitrator_flag_starts_service(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            probe = socket.socket()
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+            probe.close()
+            process = subprocess.Popen(
+                [
+                    sys.executable, "-m", "sla_network",
+                    "--host", "127.0.0.1",
+                    "--port", str(port),
+                    "--database", str(Path(directory) / "service.db"),
+                    "--arbitrator", machine_id(PUBLIC_KEY_C),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                for _ in range(50):
+                    try:
+                        with urlopen(
+                            f"http://127.0.0.1:{port}/health", timeout=1
+                        ) as response:
+                            self.assertEqual(response.status, 200)
+                            break
+                    except OSError:
+                        if process.poll() is not None:
+                            self.fail("service exited before serving")
+                        time.sleep(0.1)
+                else:
+                    self.fail("service did not start")
+            finally:
+                process.terminate()
+                process.wait(timeout=10)
 
 
 class EvidenceSnapshotStorageMigrationTests(unittest.TestCase):

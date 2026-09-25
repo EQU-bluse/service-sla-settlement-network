@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import sqlite3
+from collections.abc import Iterable
 from contextlib import closing
 from datetime import UTC, datetime
 from http import HTTPStatus
@@ -51,6 +52,9 @@ DISPUTE_ADJUDICATION_PROPOSALS_PATH_PATTERN = re.compile(
 DISPUTE_ESCALATIONS_PATH_PATTERN = re.compile(
     r"/v1/disputes/([^/]+)/escalations"
 )
+DISPUTE_ARBITRATIONS_PATH_PATTERN = re.compile(
+    r"/v1/disputes/([^/]+)/arbitrations"
+)
 DISPUTE_RESOLUTION_PATH_PATTERN = re.compile(r"/v1/disputes/([^/]+)/resolution")
 EVIDENCE_PROOFS_PATH_PATTERN = re.compile(r"/v1/evidence/([^/]+)/proofs")
 CAPABILITY_FIELDS = {"expectedVersion", "name", "protocol", "region", "unit", "capacity"}
@@ -77,6 +81,7 @@ EVIDENCE_FIELDS = {"evidenceId", "actorId", "observedAt", "digest"}
 EVIDENCE_SNAPSHOT_FIELDS = {"actorId"}
 ADJUDICATION_PROPOSAL_FIELDS = {"actorId", "snapshotSeq", "decision", "reasonDigest"}
 ESCALATION_FIELDS = {"actorId"}
+ARBITRATION_FIELDS = {"decision"}
 EVIDENCE_PROOF_FIELDS = {"evidenceSeq", "actorId", "signature"}
 KEY_ROTATION_FIELDS = {
     "expectedVersion",
@@ -99,6 +104,7 @@ DISPUTE_EVIDENCE_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTE_EVIDENCE_SNAPSHOTS_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTE_ADJUDICATION_PROPOSALS_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTE_ESCALATIONS_QUERY_PARAMS = {"limit", "cursor"}
+DISPUTE_ARBITRATIONS_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTES_QUERY_PARAMS = {"accountId", "state", "limit", "cursor"}
 MACHINE_DELEGATIONS_QUERY_PARAMS = {"limit", "cursor"}
 DELEGATION_EVENTS_QUERY_PARAMS = {"limit", "cursor"}
@@ -180,6 +186,8 @@ class AuthRejected(Exception):
 
 class ApiServer(ThreadingHTTPServer):
     database_path: str
+    # 启动时 --arbitrator 配置的终局仲裁机器集合；缺省为空（仲裁写入口不可达）。
+    arbitrators: frozenset = frozenset()
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -313,6 +321,10 @@ class Handler(BaseHTTPRequestHandler):
         escalations_match = DISPUTE_ESCALATIONS_PATH_PATTERN.fullmatch(target.path)
         if escalations_match is not None:
             self._get_escalations(escalations_match.group(1), target.query)
+            return
+        arbitrations_match = DISPUTE_ARBITRATIONS_PATH_PATTERN.fullmatch(target.path)
+        if arbitrations_match is not None:
+            self._get_arbitrations(arbitrations_match.group(1), target.query)
             return
         dispute_match = DISPUTE_PATH_PATTERN.fullmatch(target.path)
         if dispute_match is not None:
@@ -792,11 +804,17 @@ class Handler(BaseHTTPRequestHandler):
                     " ON e.kind = 'dispute_escalation'"
                     " AND e.reference_seq = x.escalation_seq"
                     " LEFT JOIN disputes AS ed ON ed.id = x.dispute_id"
+                    " LEFT JOIN dispute_arbitrations AS a"
+                    " ON e.kind = 'dispute_arbitration'"
+                    " AND e.reference_seq = a.arbitration_seq"
+                    " LEFT JOIN disputes AS ad ON ad.id = a.dispute_id"
                     " LEFT JOIN settlements AS s"
                     " ON (e.kind IN ('settlement', 'dispute_refund')"
                     " AND e.reference_seq = s.settlement_seq)"
                     " OR (e.kind = 'dispute_escalation'"
                     " AND s.settlement_seq = ed.settlement_seq)"
+                    " OR (e.kind = 'dispute_arbitration'"
+                    " AND s.settlement_seq = ad.settlement_seq)"
                     " WHERE e.account_id = ? AND e.entry_seq <= ? AND e.entry_seq > ?"
                     " ORDER BY e.entry_seq ASC"
                     " LIMIT ?",
@@ -1593,6 +1611,12 @@ class Handler(BaseHTTPRequestHandler):
         )
         if escalations_match is not None:
             self._create_escalation(escalations_match.group(1))
+            return
+        arbitrations_match = DISPUTE_ARBITRATIONS_PATH_PATTERN.fullmatch(
+            urlsplit(self.path).path
+        )
+        if arbitrations_match is not None:
+            self._create_arbitration(arbitrations_match.group(1))
             return
         resolution_match = DISPUTE_RESOLUTION_PATH_PATTERN.fullmatch(self.path)
         if resolution_match is not None:
@@ -5021,6 +5045,329 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._json(status, payload)
 
+    def _create_arbitration(self, dispute_id: str) -> None:
+        idempotency_key = self.headers.get("Idempotency-Key")
+        if (
+            idempotency_key is None
+            or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None
+        ):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 仲裁不接受任何查询参数：参数校验先于体校验与争议查询。
+        if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        raw_body = self._read_raw_body()
+        fields = (
+            None
+            if raw_body is None
+            else self._read_arbitration_object(raw_body)
+        )
+        if fields is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 仅支持单一 SLA-Auth：头缺失、重复、结构非法或携带代理头均为非法请求，
+        # 且先于争议查询。
+        if self.headers.get_all(SLA_DELEGATION_HEADER):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        auth = self._parse_sla_auth()
+        if auth is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        body_digest = hashlib.sha256(raw_body).hexdigest()
+        status, payload = self._apply_arbitration(
+            idempotency_key, dispute_id, fields, auth, body_digest
+        )
+        self._json(status, payload)
+
+    def _read_arbitration_object(self, body: bytes) -> dict[str, Any] | None:
+        parsed = self._read_json_object(body)
+        if parsed is None or set(parsed) != ARBITRATION_FIELDS:
+            return None
+        decision = parsed["decision"]
+        if not isinstance(decision, str) or decision not in DISPUTE_DECISIONS:
+            return None
+        return parsed
+
+    def _apply_arbitration(
+        self,
+        idempotency_key: str,
+        dispute_id: str,
+        fields: dict[str, Any],
+        auth: SlaAuth,
+        body_digest: str,
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+        standard_path = urlsplit(self.path).path
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                # 幂等判定先于资源查询：同键更换路径、正文或认证五段均冲突。
+                record = database.execute(
+                    "SELECT dispute_id, request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature"
+                    " FROM dispute_arbitration_idempotency_records"
+                    " WHERE key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    if (
+                        record["dispute_id"] == dispute_id
+                        and record["request_json"] == request_json
+                        and self._auth_record_matches(record, auth)
+                    ):
+                        return HTTPStatus(record["status"]), json.loads(
+                            record["response_json"]
+                        )
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                dispute = database.execute(
+                    "SELECT settlement_seq, payer_id, payee_id,"
+                    " amount_micros, state"
+                    " FROM disputes WHERE id = ?",
+                    (dispute_id,),
+                ).fetchone()
+                if dispute is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                # 认证机器须为启动时配置的仲裁机器；未配置或身份不符均为 403。
+                if auth.machine_id not in self.server.arbitrators:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
+                try:
+                    # 仲裁机器身份已判定，再依次校验时间、密钥、签名、随机数。
+                    self._verify_request_principal(
+                        database, auth, standard_path, body_digest
+                    )
+                    self._check_request_nonce(database, auth)
+                except AuthRejected as rejected:
+                    database.execute("ROLLBACK")
+                    return rejected.status, {"error": rejected.error}
+                # 已有仲裁记录（异键重复仲裁）：成功仲裁与状态变更原子提交，
+                # 故记录存在即已终局；与其他终局入口并发时仅先提交者生效。
+                existing = database.execute(
+                    "SELECT 1 FROM dispute_arbitrations WHERE dispute_id = ?",
+                    (dispute_id,),
+                ).fetchone()
+                if existing is not None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "arbitration_exists"}
+                # 仅 escalated 争议可仲裁；其余状态（含已裁决）为已解决。
+                if dispute["state"] != "escalated":
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "already_resolved"}
+                # 升级记录须存在且属于本争议；缺失或错属为冲突。
+                escalation = database.execute(
+                    "SELECT escalation_seq, first_proposal_seq,"
+                    " second_proposal_seq, first_snapshot_digest,"
+                    " second_snapshot_digest"
+                    " FROM dispute_escalations WHERE dispute_id = ?",
+                    (dispute_id,),
+                ).fetchone()
+                if escalation is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                amount = dispute["amount_micros"]
+                balance_record = database.execute(
+                    "SELECT balance_micros FROM ledger_accounts"
+                    " WHERE account_id = ?",
+                    (CLEARING_ACCOUNT_ID,),
+                ).fetchone()
+                clearing_balance = (
+                    balance_record["balance_micros"]
+                    if balance_record is not None
+                    else 0
+                )
+                # 清算账户以负余额持有系统内资金：持有额不足以覆盖款项时
+                # 仲裁、账本、事件、幂等结果与随机数均不保存。
+                if clearing_balance + amount > 0:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "insufficient_funds"}
+                # 全库唯一持久递增仲裁序号：取写锁后取最大序号 + 1（空表 1）。
+                arbitration_seq = database.execute(
+                    "SELECT COALESCE(MAX(arbitration_seq), 0) + 1 AS next_seq"
+                    " FROM dispute_arbitrations"
+                ).fetchone()["next_seq"]
+                created_at_ms = int(datetime.now(UTC).timestamp() * 1000)
+                decision = fields["decision"]
+                # release 整笔交还原收款方，refund 整笔退还原付款方；
+                # 款项自外部清算账户划出，双方各写一笔 dispute_arbitration
+                # 分录，referenceSeq 取仲裁序号。
+                recipient_id = (
+                    dispute["payee_id"]
+                    if decision == "release"
+                    else dispute["payer_id"]
+                )
+                new_state = "released" if decision == "release" else "refunded"
+                clearing_after = self._adjust_account(
+                    database, CLEARING_ACCOUNT_ID, -amount
+                )
+                recipient_after = self._adjust_account(
+                    database, recipient_id, amount
+                )
+                self._record_entry(
+                    database, "dispute_arbitration", arbitration_seq,
+                    CLEARING_ACCOUNT_ID, -amount, clearing_after, created_at_ms,
+                )
+                self._record_entry(
+                    database, "dispute_arbitration", arbitration_seq,
+                    recipient_id, amount, recipient_after, created_at_ms,
+                )
+                database.execute(
+                    "UPDATE disputes SET state = ? WHERE id = ?",
+                    (new_state, dispute_id),
+                )
+                # 生命周期事件与仲裁、余额、分录及幂等结果同事务原子提交。
+                next_event = database.execute(
+                    "SELECT COALESCE(MAX(event_seq), 0) + 1 AS next_seq"
+                    " FROM dispute_events"
+                ).fetchone()
+                database.execute(
+                    "INSERT INTO dispute_events"
+                    "(event_seq, dispute_id, type, created_at_ms)"
+                    " VALUES (?, ?, ?, ?)",
+                    (next_event["next_seq"], dispute_id, new_state, created_at_ms),
+                )
+                # 冻结升级关联的两份提案序号及对应快照摘要。
+                database.execute(
+                    "INSERT INTO dispute_arbitrations"
+                    "(arbitration_seq, dispute_id, escalation_seq, arbitrator_id,"
+                    " decision, amount_micros, first_proposal_seq,"
+                    " second_proposal_seq, first_snapshot_digest,"
+                    " second_snapshot_digest, created_at_ms)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        arbitration_seq,
+                        dispute_id,
+                        escalation["escalation_seq"],
+                        auth.machine_id,
+                        decision,
+                        amount,
+                        escalation["first_proposal_seq"],
+                        escalation["second_proposal_seq"],
+                        escalation["first_snapshot_digest"],
+                        escalation["second_snapshot_digest"],
+                        created_at_ms,
+                    ),
+                )
+                payload = {
+                    "arbitrationSeq": arbitration_seq,
+                    "decision": decision,
+                    "amount": amount,
+                    "arbitratorId": auth.machine_id,
+                    "createdAt": created_at_ms,
+                }
+                database.execute(
+                    "INSERT INTO dispute_arbitration_idempotency_records"
+                    "(key, dispute_id, request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        dispute_id,
+                        request_json,
+                        int(HTTPStatus.CREATED),
+                        json.dumps(payload, separators=(",", ":")),
+                        auth.machine_id,
+                        auth.key_version,
+                        auth.request_time_ms,
+                        auth.nonce,
+                        auth.signature,
+                    ),
+                )
+                # 仲裁、资金、事件、幂等结果与随机数同一事务原子提交；
+                # 任何失败路径都不到达此处，不消费随机数、不推进序号。
+                self._consume_request_nonce(database, auth)
+                database.execute("COMMIT")
+                return HTTPStatus.CREATED, payload
+            except sqlite3.IntegrityError:
+                # 异键并发仲裁同一争议：唯一约束兜底，至多一项成功。
+                database.execute("ROLLBACK")
+                return HTTPStatus.CONFLICT, {"error": "arbitration_exists"}
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+
+    def _get_arbitrations(self, dispute_id: str, query: str) -> None:
+        # limit、cursor=cut:lastSeq 的格式、缺省值、认证、错误次序与随机数消费
+        # 均沿用升级记录集合读取，仅序号改为 arbitrationSeq。
+        parsed = self._parse_evaluation_query(
+            query, DISPUTE_ARBITRATIONS_QUERY_PARAMS
+        )
+        if parsed is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        limit, cursor = parsed
+        if self.headers.get_all(SLA_DELEGATION_HEADER):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        auth = self._parse_sla_auth()
+        if auth is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+
+        def build(database: Any) -> dict[str, Any] | None:
+            # 首页以读事务起点的全库最大仲裁序号冻结 cut；空库为 0。
+            max_record = database.execute(
+                "SELECT MAX(arbitration_seq) AS current_max"
+                " FROM dispute_arbitrations"
+            ).fetchone()
+            current_max = max_record["current_max"] or 0
+            if cursor is None:
+                cut = current_max
+                last_seq = 0
+            else:
+                cut, last_seq = cursor
+                if cut > current_max:
+                    return None
+                # 锚点须属于目标争议且在当前快照内；属于其他争议或不存在均非法。
+                anchor = database.execute(
+                    "SELECT 1 FROM dispute_arbitrations"
+                    " WHERE dispute_id = ? AND arbitration_seq = ?"
+                    " AND arbitration_seq <= ?",
+                    (dispute_id, last_seq, cut),
+                ).fetchone()
+                if anchor is None:
+                    return None
+            rows = database.execute(
+                "SELECT arbitration_seq, escalation_seq, arbitrator_id, decision,"
+                " amount_micros, created_at_ms"
+                " FROM dispute_arbitrations"
+                " WHERE dispute_id = ? AND arbitration_seq <= ?"
+                " AND arbitration_seq > ?"
+                " ORDER BY arbitration_seq ASC"
+                " LIMIT ?",
+                (dispute_id, cut, last_seq, limit + 1),
+            ).fetchall()
+            has_next = len(rows) > limit
+            page = rows[:limit]
+            arbitrations = [
+                {
+                    "arbitrationSeq": row["arbitration_seq"],
+                    "escalationSeq": row["escalation_seq"],
+                    "arbitratorId": row["arbitrator_id"],
+                    "decision": row["decision"],
+                    "amount": row["amount_micros"],
+                    "createdAt": row["created_at_ms"],
+                }
+                for row in page
+            ]
+            next_cursor = (
+                f"{cut}:{page[-1]['arbitration_seq']}" if has_next else None
+            )
+            return {"arbitrations": arbitrations, "nextCursor": next_cursor}
+
+        status, error, payload = self._read_snapshot_get(
+            dispute_id, auth, build, HTTPStatus.BAD_REQUEST
+        )
+        if payload is None:
+            self._json(status, {"error": error})
+            return
+        self._json(status, payload)
+
     def _create_evidence_proof(self) -> None:
         idempotency_key = self.headers.get("Idempotency-Key")
         if (
@@ -5716,7 +6063,13 @@ class Handler(BaseHTTPRequestHandler):
         return
 
 
-def serve(host: str, port: int, database_path: str) -> None:
+def serve(
+    host: str,
+    port: int,
+    database_path: str,
+    arbitrators: Iterable[str] = (),
+) -> None:
     server = ApiServer((host, port), Handler)
     server.database_path = database_path
+    server.arbitrators = frozenset(arbitrators)
     server.serve_forever()

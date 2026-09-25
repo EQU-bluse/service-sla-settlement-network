@@ -326,6 +326,31 @@ CREATE TABLE IF NOT EXISTS dispute_escalation_idempotency_records (
     auth_nonce TEXT,
     auth_signature TEXT
 );
+CREATE TABLE IF NOT EXISTS dispute_arbitrations (
+    arbitration_seq INTEGER PRIMARY KEY,
+    dispute_id TEXT NOT NULL UNIQUE,
+    escalation_seq INTEGER NOT NULL,
+    arbitrator_id TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    amount_micros INTEGER NOT NULL,
+    first_proposal_seq INTEGER NOT NULL,
+    second_proposal_seq INTEGER NOT NULL,
+    first_snapshot_digest TEXT NOT NULL,
+    second_snapshot_digest TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS dispute_arbitration_idempotency_records (
+    key TEXT PRIMARY KEY,
+    dispute_id TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    response_json TEXT NOT NULL,
+    auth_machine_id TEXT,
+    auth_key_version INTEGER,
+    auth_request_time_ms INTEGER,
+    auth_nonce TEXT,
+    auth_signature TEXT
+);
 CREATE TABLE IF NOT EXISTS machine_delegations (
     id TEXT PRIMARY KEY,
     issuer_machine_id TEXT NOT NULL,
@@ -386,6 +411,8 @@ CREATE INDEX IF NOT EXISTS idx_dispute_adjudication_proposals_dispute_seq
 ON dispute_adjudication_proposals(dispute_id, proposal_seq);
 CREATE INDEX IF NOT EXISTS idx_dispute_escalations_dispute_seq
 ON dispute_escalations(dispute_id, escalation_seq);
+CREATE INDEX IF NOT EXISTS idx_dispute_arbitrations_dispute_seq
+ON dispute_arbitrations(dispute_id, arbitration_seq);
 CREATE INDEX IF NOT EXISTS idx_dispute_evidence_proofs_evidence_seq
 ON dispute_evidence_proofs(evidence_seq, proof_seq);
 CREATE INDEX IF NOT EXISTS idx_auth_nonce_records_machine_time
