@@ -20,6 +20,9 @@ CAPABILITIES_PATH_PATTERN = re.compile(r"/v1/machines/([^/]+)/capabilities")
 MACHINE_DELEGATIONS_PATH_PATTERN = re.compile(
     r"/v1/machines/([^/]+)/delegations"
 )
+MACHINE_DELEGATION_CONSUMPTIONS_PATH_PATTERN = re.compile(
+    r"/v1/machines/([^/]+)/delegation-consumptions"
+)
 MACHINE_KEYS_PATH_PATTERN = re.compile(r"/v1/machines/([^/]+)/keys")
 MACHINE_KEY_REVOCATION_PATH_PATTERN = re.compile(
     r"/v1/machines/([^/]+)/keys/([^/]+)/revocation"
@@ -81,6 +84,7 @@ DISPUTE_EVIDENCE_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTES_QUERY_PARAMS = {"accountId", "state", "limit", "cursor"}
 MACHINE_DELEGATIONS_QUERY_PARAMS = {"limit", "cursor"}
 DELEGATION_EVENTS_QUERY_PARAMS = {"limit", "cursor"}
+DELEGATION_CONSUMPTIONS_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTE_SNAPSHOT_STATES = {"open", "released", "refunded"}
 TELEMETRY_TIME_MAX = 2147483648000
 TELEMETRY_DEFAULT_LIMIT = 50
@@ -103,8 +107,17 @@ SLA_DELEGATION_HEADER = "SLA-Delegation"
 SLA_DELEGATION_CONTEXT = "delegation-auth-v1"
 DELEGATION_PATH_PATTERN = re.compile(r"/v1/delegations/([^/]+)/revocation")
 DELEGATION_EVENTS_PATH_PATTERN = re.compile(r"/v1/delegations/([^/]+)/events")
-DELEGATION_FIELDS = {"id", "delegatePublicKey", "expiresAt"}
+DELEGATION_FIELDS = {
+    "id",
+    "delegatePublicKey",
+    "expiresAt",
+    "operation",
+    "capabilityVersion",
+}
 DELEGATION_MAX_TTL_MS = 86_400_000
+# 最小权限：当前委托仅允许能力写入；路径资源为标准机器能力路径。
+DELEGATION_OPERATION_CAPABILITY_WRITE = "capability.write"
+DELEGATION_OPERATIONS = {DELEGATION_OPERATION_CAPABILITY_WRITE}
 
 
 class SlaAuth(NamedTuple):
@@ -182,6 +195,14 @@ class Handler(BaseHTTPRequestHandler):
         if machine_delegations_match is not None:
             self._get_machine_delegations(
                 machine_delegations_match.group(1), target.query
+            )
+            return
+        delegation_consumptions_match = (
+            MACHINE_DELEGATION_CONSUMPTIONS_PATH_PATTERN.fullmatch(target.path)
+        )
+        if delegation_consumptions_match is not None:
+            self._get_delegation_consumptions(
+                delegation_consumptions_match.group(1), target.query
             )
             return
         delegation_events_match = DELEGATION_EVENTS_PATH_PATTERN.fullmatch(target.path)
@@ -1204,6 +1225,8 @@ class Handler(BaseHTTPRequestHandler):
                 "SELECT d.id AS id, d.delegate_public_key AS delegate_public_key,"
                 " d.expires_at_ms AS expires_at_ms,"
                 " d.issued_key_version AS issued_key_version,"
+                " d.operation AS operation,"
+                " d.capability_version AS capability_version,"
                 " e.event_seq AS issued_seq,"
                 " EXISTS (SELECT 1 FROM delegation_events AS c"
                 " WHERE c.delegation_id = d.id AND c.type = 'consumed'"
@@ -1230,6 +1253,9 @@ class Handler(BaseHTTPRequestHandler):
                     "issuedKeyVersion": row["issued_key_version"],
                     "consumed": bool(row["consumed_in_cut"]),
                     "revoked": bool(row["revoked_in_cut"]),
+                    # 最小权限范围追加在项尾；升级前凭证两项均为 null。
+                    "operation": row["operation"],
+                    "capabilityVersion": row["capability_version"],
                 }
                 for row in page
             ]
@@ -1310,6 +1336,100 @@ class Handler(BaseHTTPRequestHandler):
             ]
             next_cursor = f"{cut}:{page[-1]['event_seq']}" if has_next else None
             return {"events": events, "nextCursor": next_cursor}
+
+        status, error, payload = self._authenticated_audit_transaction(
+            standard_path, auth, resolve_resource, build_snapshot
+        )
+        if payload is None:
+            self._json(status, {"error": error})
+            return
+        self._json(status, payload)
+
+    def _get_delegation_consumptions(self, machine_id: str, query: str) -> None:
+        # 分页参数、认证次序与成功后消费随机数的语义沿用委托集合查询。
+        parsed = self._parse_evaluation_query(
+            query, DELEGATION_CONSUMPTIONS_QUERY_PARAMS
+        )
+        if parsed is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        limit, cursor = parsed
+        # 认证结构先于资源检查；GET 无正文。
+        auth = self._parse_sla_auth()
+        if auth is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        standard_path = urlsplit(self.path).path
+
+        def resolve_resource(database: Any) -> tuple[Any, str]:
+            # 路径机器不存在为 404；存在即返回行，签发身份随后判定为 403。
+            return (
+                database.execute(
+                    "SELECT id FROM machines WHERE id = ?", (machine_id,)
+                ).fetchone(),
+                machine_id,
+            )
+
+        def build_snapshot(database: Any, resource: Any) -> dict[str, Any] | None:
+            # 首页以读事务起点的全库最大委托事件序号冻结快照。
+            max_record = database.execute(
+                "SELECT MAX(event_seq) AS current_max FROM delegation_events"
+            ).fetchone()
+            current_max = max_record["current_max"] or 0
+            if cursor is None:
+                cut = current_max
+                last_seq = 0
+            else:
+                cut, last_seq = cursor
+                if cut > current_max:
+                    return None
+                # 锚点须是目标机器凭证的 consumed 事件且在当前快照内；
+                # 属于其他机器、非 consumed 事件或不存在均为非法游标。
+                anchor = database.execute(
+                    "SELECT 1 FROM delegation_events AS e"
+                    " JOIN machine_delegations AS d ON d.id = e.delegation_id"
+                    " WHERE e.type = 'consumed' AND d.issuer_machine_id = ?"
+                    " AND e.event_seq = ? AND e.event_seq <= ?",
+                    (machine_id, last_seq, cut),
+                ).fetchone()
+                if anchor is None:
+                    return None
+            # 只按序号返回该机器凭证在 cut 以内的 consumed 事件；
+            # 旧 consumed 事件保留原序号，范围与审计列均为 NULL。
+            rows = database.execute(
+                "SELECT e.event_seq AS event_seq,"
+                " e.delegation_id AS delegation_id,"
+                " d.operation AS operation,"
+                " d.capability_version AS capability_version,"
+                " e.resource AS resource,"
+                " e.request_digest AS request_digest,"
+                " e.created_at_ms AS created_at_ms"
+                " FROM delegation_events AS e"
+                " JOIN machine_delegations AS d ON d.id = e.delegation_id"
+                " WHERE e.type = 'consumed' AND d.issuer_machine_id = ?"
+                " AND e.event_seq <= ? AND e.event_seq > ?"
+                " ORDER BY e.event_seq ASC"
+                " LIMIT ?",
+                (machine_id, cut, last_seq, limit + 1),
+            ).fetchall()
+            has_next = len(rows) > limit
+            page = rows[:limit]
+            consumptions = [
+                {
+                    "eventSeq": row["event_seq"],
+                    "delegationId": row["delegation_id"],
+                    "operation": row["operation"],
+                    "capabilityVersion": row["capability_version"],
+                    "resource": row["resource"],
+                    "requestDigest": row["request_digest"],
+                    "createdAt": row["created_at_ms"],
+                }
+                for row in page
+            ]
+            next_cursor = (
+                f"{cut}:{page[-1]['event_seq']}" if has_next else None
+            )
+            return {"consumptions": consumptions, "nextCursor": next_cursor}
 
         status, error, payload = self._authenticated_audit_transaction(
             standard_path, auth, resolve_resource, build_snapshot
@@ -1552,12 +1672,14 @@ class Handler(BaseHTTPRequestHandler):
         expected_machine: str,
         path: str,
         body_digest: str,
+        requested_operation: str,
+        requested_capability_version: int,
     ) -> None:
-        # 次序：委托存在、签发机器与路径机器一致、时间窗口，
+        # 次序：委托存在、范围（路径机器、操作、能力版本），时间窗口，
         # 再判过期/已用/已撤销/签发版本失效与代理公钥严格验签。
         delegation = database.execute(
             "SELECT issuer_machine_id, delegate_public_key, expires_at_ms,"
-            " issued_key_version, revoked, consumed"
+            " issued_key_version, revoked, consumed, operation, capability_version"
             " FROM machine_delegations WHERE id = ?",
             (auth.machine_id,),
         ).fetchone()
@@ -1565,6 +1687,14 @@ class Handler(BaseHTTPRequestHandler):
             raise AuthRejected(HTTPStatus.UNAUTHORIZED, "invalid_authentication")
         if delegation["issuer_machine_id"] != expected_machine:
             raise AuthRejected(HTTPStatus.FORBIDDEN, "forbidden")
+        # 最小权限范围：操作与能力版本须与凭证一致，任一不符为 403，
+        # 且不消费凭证、随机数或事件序号。升级前凭证范围列为 NULL，
+        # 继续按原有无范围语义消费。
+        if delegation["operation"] is not None:
+            if delegation["operation"] != requested_operation:
+                raise AuthRejected(HTTPStatus.FORBIDDEN, "forbidden")
+            if delegation["capability_version"] != requested_capability_version:
+                raise AuthRejected(HTTPStatus.FORBIDDEN, "forbidden")
         now_ms = int(datetime.now(UTC).timestamp() * 1000)
         if abs(auth.request_time_ms - now_ms) > SLA_AUTH_SKEW_MS:
             raise AuthRejected(HTTPStatus.UNAUTHORIZED, "stale_request")
@@ -1663,18 +1793,26 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _append_delegation_event(
-        database: Any, delegation_id: str, event_type: str, created_at_ms: int
+        database: Any,
+        delegation_id: str,
+        event_type: str,
+        created_at_ms: int,
+        resource: str | None = None,
+        request_digest: str | None = None,
     ) -> None:
         # 全库唯一递增事件序号：写事务均以 BEGIN IMMEDIATE 串行，取 MAX+1 安全。
         # 仅首次业务成功到达此处；失败、同键重放与并发败者均不写事件、不推进序号。
+        # consumed 事件同事务保存标准资源路径与原始正文 SHA-256 摘要；
+        # issued/revoked 与迁移补出的旧事件该两项为 NULL。
         max_record = database.execute(
             "SELECT MAX(event_seq) AS current_max FROM delegation_events"
         ).fetchone()
         event_seq = (max_record["current_max"] or 0) + 1
         database.execute(
-            "INSERT INTO delegation_events(event_seq, delegation_id, type, created_at_ms)"
-            " VALUES (?, ?, ?, ?)",
-            (event_seq, delegation_id, event_type, created_at_ms),
+            "INSERT INTO delegation_events"
+            "(event_seq, delegation_id, type, created_at_ms, resource, request_digest)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (event_seq, delegation_id, event_type, created_at_ms, resource, request_digest),
         )
 
     def _read_request_object(self) -> dict[str, Any] | None:
@@ -1838,7 +1976,13 @@ class Handler(BaseHTTPRequestHandler):
                     # 代理凭证改按委托记录与代理公钥校验。
                     if delegation:
                         self._verify_delegation_auth(
-                            database, auth, machine_id, standard_path, body_digest
+                            database,
+                            auth,
+                            machine_id,
+                            standard_path,
+                            body_digest,
+                            DELEGATION_OPERATION_CAPABILITY_WRITE,
+                            fields["expectedVersion"],
                         )
                     else:
                         self._verify_request_auth(
@@ -1904,12 +2048,15 @@ class Handler(BaseHTTPRequestHandler):
                         "UPDATE machine_delegations SET consumed = 1 WHERE id = ?",
                         (auth.machine_id,),
                     )
-                    # 成功消费事件同事务追加；版本竞争等失败路径不到达此处。
+                    # 成功消费事件同事务追加并保存标准路径与原始正文 SHA-256 摘要；
+                    # 版本竞争等失败路径不到达此处，不推进事件序号。
                     self._append_delegation_event(
                         database,
                         auth.machine_id,
                         "consumed",
                         int(datetime.now(UTC).timestamp() * 1000),
+                        standard_path,
+                        body_digest,
                     )
                 self._consume_request_nonce(database, auth)
                 database.execute("COMMIT")
@@ -1937,6 +2084,14 @@ class Handler(BaseHTTPRequestHandler):
             else self._read_delegation_object(raw_body)
         )
         if fields is None:
+            # 升级前签发请求只有三项：新五字段体校验不通过时，先尝试按旧请求
+            # 逐字节重放既有签发幂等记录，再判非法正文。
+            legacy = self._try_legacy_delegation_replay(
+                idempotency_key, raw_body
+            )
+            if legacy is not None:
+                self._json(legacy[0], legacy[1])
+                return
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
         auth = self._parse_sla_auth()
@@ -1948,6 +2103,60 @@ class Handler(BaseHTTPRequestHandler):
             idempotency_key, fields, auth, body_digest
         )
         self._json(status, payload)
+
+    def _read_legacy_delegation_object(self, body: bytes) -> dict[str, Any] | None:
+        # 仅用于识别升级前的三字段签发正文以逐字节重放；不做到期窗口等
+        # 依赖服务当前时刻的校验，重放必须与首次结果一致。
+        parsed = self._read_json_object(body)
+        if parsed is None or set(parsed) != {"id", "delegatePublicKey", "expiresAt"}:
+            return None
+        delegation_id = parsed["id"]
+        if (
+            not isinstance(delegation_id, str)
+            or TEMPLATE_ID_PATTERN.fullmatch(delegation_id) is None
+        ):
+            return None
+        delegate_public_key = parsed["delegatePublicKey"]
+        if (
+            not isinstance(delegate_public_key, str)
+            or PUBLIC_KEY_PATTERN.fullmatch(delegate_public_key) is None
+        ):
+            return None
+        expires_at = parsed["expiresAt"]
+        if not isinstance(expires_at, int) or isinstance(expires_at, bool):
+            return None
+        return parsed
+
+    def _try_legacy_delegation_replay(
+        self, idempotency_key: str, raw_body: bytes | None
+    ) -> tuple[HTTPStatus, dict[str, Any]] | None:
+        if raw_body is None:
+            return None
+        parsed = self._read_legacy_delegation_object(raw_body)
+        if parsed is None:
+            return None
+        request_json = json.dumps(parsed, sort_keys=True, separators=(",", ":"))
+        with closing(connect(self.server.database_path)) as database:
+            record = database.execute(
+                "SELECT status, response_json, auth_machine_id, auth_key_version,"
+                " auth_request_time_ms, auth_nonce, auth_signature"
+                " FROM delegation_idempotency_records"
+                " WHERE key = ? AND delegation_id = ? AND request_json = ?",
+                (idempotency_key, parsed["id"], request_json),
+            ).fetchone()
+        if record is None:
+            return None
+        # 旧签发记录携带认证五段：重放须逐字节复用；认证列为 NULL 的更旧记录
+        # （或重放请求未带可解析认证头）交由常规认证结构判定。
+        auth = self._parse_sla_auth()
+        if record["auth_machine_id"] is None:
+            return HTTPStatus(record["status"]), json.loads(record["response_json"])
+        if auth is not None and self._auth_record_matches(record, auth):
+            return HTTPStatus(record["status"]), json.loads(record["response_json"])
+        # 记录命中但认证五段缺失/不一致：与同键异认证的常规冲突语义一致。
+        if auth is not None:
+            return HTTPStatus.CONFLICT, {"error": "conflict"}
+        return None
 
     def _read_delegation_object(self, body: bytes) -> dict[str, Any] | None:
         parsed = self._read_json_object(body)
@@ -1971,6 +2180,13 @@ class Handler(BaseHTTPRequestHandler):
         # 到期时刻须在服务当前 UTC 毫秒之后且不超过二十四小时。
         now_ms = int(datetime.now(UTC).timestamp() * 1000)
         if not now_ms < expires_at <= now_ms + DELEGATION_MAX_TTL_MS:
+            return None
+        # 最小权限范围：操作当前仅接受 capability.write。
+        operation = parsed["operation"]
+        if not isinstance(operation, str) or operation not in DELEGATION_OPERATIONS:
+            return None
+        # 能力版本为 0..2147483646 的非布尔整数。
+        if not _bounded_int(parsed["capabilityVersion"], 0, 2147483646):
             return None
         return parsed
 
@@ -2021,12 +2237,14 @@ class Handler(BaseHTTPRequestHandler):
                     database.execute("ROLLBACK")
                     return HTTPStatus.CONFLICT, {"error": "conflict"}
                 created_at_ms = int(datetime.now(UTC).timestamp() * 1000)
-                # 原子保存签发密钥版本：代理使用时该版本须仍为最新有效版本。
+                # 原子保存签发密钥版本与最小权限范围：代理使用时该版本须仍为最新
+                # 有效版本，操作与能力版本须与凭证范围一致。
                 database.execute(
                     "INSERT INTO machine_delegations"
                     "(id, issuer_machine_id, delegate_public_key, expires_at_ms,"
-                    " issued_key_version, revoked, consumed, created_at_ms)"
-                    " VALUES (?, ?, ?, ?, ?, 0, 0, ?)",
+                    " issued_key_version, revoked, consumed, created_at_ms,"
+                    " operation, capability_version)"
+                    " VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?)",
                     (
                         fields["id"],
                         auth.machine_id,
@@ -2034,6 +2252,8 @@ class Handler(BaseHTTPRequestHandler):
                         fields["expiresAt"],
                         auth.key_version,
                         created_at_ms,
+                        fields["operation"],
+                        fields["capabilityVersion"],
                     ),
                 )
                 # 签发事件与委托、幂等结果、随机数同事务追加，序号全库唯一递增。

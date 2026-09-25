@@ -8290,6 +8290,8 @@ class DelegationTests(unittest.TestCase):
         delegation_id: str = "del-1",
         public_key: str = DELEGATE_PUBLIC,
         expires_at: int | None = None,
+        operation: str = "capability.write",
+        capability_version: int = 0,
         **overrides: object,
     ) -> bytes:
         if expires_at is None:
@@ -8298,16 +8300,25 @@ class DelegationTests(unittest.TestCase):
             "id": delegation_id,
             "delegatePublicKey": public_key,
             "expiresAt": expires_at,
+            "operation": operation,
+            "capabilityVersion": capability_version,
         }
         fields.update(overrides)
         return json.dumps(fields).encode()
 
     def issue(
-        self, delegation_id: str = "del-1", key: str = "issue-1", **overrides: object
+        self,
+        delegation_id: str = "del-1",
+        key: str = "issue-1",
+        *,
+        capability_version: int = 0,
+        **overrides: object,
     ) -> tuple[int, bytes]:
         return self.post(
             "/v1/delegations",
-            self.delegation_body(delegation_id, **overrides),
+            self.delegation_body(
+                delegation_id, capability_version=capability_version, **overrides
+            ),
             key,
             seed=PRODUCER_SEED,
             actor=self.producer,
@@ -8404,12 +8415,36 @@ class DelegationTests(unittest.TestCase):
             self.delegation_body(expires_at=now + 86_400_000 + 60_000),
             self.delegation_body(expires_at=True),
             self.delegation_body(expires_at="soon"),
+            self.delegation_body(operation="sla.write"),
+            self.delegation_body(operation=""),
+            self.delegation_body(operation=1),
+            self.delegation_body(operation=None),
+            self.delegation_body(capability_version=-1),
+            self.delegation_body(capability_version=2147483647),
+            self.delegation_body(capability_version=True),
+            self.delegation_body(capability_version="0"),
+            self.delegation_body(capability_version=None),
             json.dumps({"id": "del-1", "delegatePublicKey": DELEGATE_PUBLIC}).encode(),
             json.dumps({
                 "id": "del-1", "delegatePublicKey": DELEGATE_PUBLIC,
                 "expiresAt": now + 1000, "extra": 1,
             }).encode(),
-            b'{"id":"del-1","id":"del-1","delegatePublicKey":"' + DELEGATE_PUBLIC.encode() + b'","expiresAt":' + str(now + 1000).encode() + b'}',
+            json.dumps({
+                "id": "del-1", "delegatePublicKey": DELEGATE_PUBLIC,
+                "expiresAt": now + 1000, "operation": "capability.write",
+            }).encode(),
+            json.dumps({
+                "id": "del-1", "delegatePublicKey": DELEGATE_PUBLIC,
+                "expiresAt": now + 1000, "capabilityVersion": 0,
+            }).encode(),
+            json.dumps({
+                "id": "del-1", "delegatePublicKey": DELEGATE_PUBLIC,
+                "expiresAt": now + 1000, "operation": "capability.write",
+                "capabilityVersion": 0, "extra": 1,
+            }).encode(),
+            b'{"id":"del-1","id":"del-1","delegatePublicKey":"' + DELEGATE_PUBLIC.encode() + b'","expiresAt":' + str(now + 1000).encode() + b',"operation":"capability.write","capabilityVersion":0}',
+            b'{"id":"del-1","delegatePublicKey":"' + DELEGATE_PUBLIC.encode() + b'","expiresAt":' + str(now + 1000).encode() + b',"operation":"capability.write","operation":"capability.write","capabilityVersion":0}',
+            b'{"id":"del-1","delegatePublicKey":"' + DELEGATE_PUBLIC.encode() + b'","expiresAt":' + str(now + 1000).encode() + b',"operation":"capability.write","capabilityVersion":0,"capabilityVersion":0}',
         ]
         for index, body in enumerate(cases):
             status, payload = self.post(
@@ -8457,10 +8492,15 @@ class DelegationTests(unittest.TestCase):
         self.assertEqual(self.use_delegation(body, "cap-1"), (201, b'{"version":1}'))
         # 同键重放首次响应，不重复消费。
         self.assertEqual(self.use_delegation(body, "cap-1"), (201, b'{"version":1}'))
-        # 异键再用：凭证已消费。
-        status, payload = self.use_delegation(self.cap_body(1, 20), "cap-2")
+        # 异键再用且范围匹配：凭证已消费。
+        status, payload = self.use_delegation(self.cap_body(0, 20), "cap-2")
         self.assertEqual(
             (status, json.loads(payload)), (401, {"error": "invalid_authentication"})
+        )
+        # 异键且能力版本不符：范围校验先于已消费判定，返回 403。
+        status, payload = self.use_delegation(self.cap_body(1, 20), "cap-3")
+        self.assertEqual(
+            (status, json.loads(payload)), (403, {"error": "forbidden"})
         )
 
     def test_delegate_same_key_different_auth_conflicts(self) -> None:
@@ -8608,14 +8648,15 @@ class DelegationTests(unittest.TestCase):
             self.cap_path, self.cap_body(), "cap-0",
             seed=PRODUCER_SEED, actor=self.producer,
         ), (201, b'{"version":1}'))
-        self.assertEqual(self.issue()[0], 201)
-        # 版本竞争失败：不消费凭证也不消费随机数。
+        # 凭证范围锁定 capability.write、能力版本 1。
+        self.assertEqual(self.issue(capability_version=1)[0], 201)
+        # 能力版本不符（403）：不消费凭证也不消费随机数。
         nonce = "nonce-delegate-reuse-01"
         status, payload = self.use_delegation(
             self.cap_body(0, 20), "cap-1", nonce=nonce
         )
-        self.assertEqual((status, json.loads(payload)), (409, {"error": "conflict"}))
-        # 同一随机数、修正版本后成功。
+        self.assertEqual((status, json.loads(payload)), (403, {"error": "forbidden"}))
+        # 同一随机数、范围匹配后成功。
         status, payload = self.use_delegation(
             self.cap_body(1, 20), "cap-2", nonce=nonce
         )
@@ -8637,6 +8678,369 @@ class DelegationTests(unittest.TestCase):
         for thread in threads:
             thread.join(timeout=10)
         self.assertEqual(sorted(results), [201] + [401] * 7)
+
+    def consumptions_path(self, machine: str | None = None) -> str:
+        return f"/v1/machines/{machine or self.producer}/delegation-consumptions"
+
+    def test_scoped_issue_fields_persisted_and_listed(self) -> None:
+        self.assertEqual(self.issue(capability_version=7)[0], 201)
+        status, payload = self.get_audit(f"/v1/machines/{self.producer}/delegations")
+        self.assertEqual(status, 200)
+        item = json.loads(payload)["delegations"][0]
+        self.assertEqual(
+            (item["operation"], item["capabilityVersion"]),
+            ("capability.write", 7),
+        )
+
+    def test_scope_version_match_succeeds(self) -> None:
+        # 先用机器自身认证声明到版本一，再签发范围版本 1 的凭证。
+        self.assertEqual(self.post(
+            self.cap_path, self.cap_body(), "cap-0",
+            seed=PRODUCER_SEED, actor=self.producer,
+        ), (201, b'{"version":1}'))
+        self.assertEqual(self.issue(capability_version=1)[0], 201)
+        status, payload = self.use_delegation(self.cap_body(1, 20), "cap-1")
+        self.assertEqual((status, payload), (200, b'{"version":2}'))
+
+    def test_scope_version_mismatch_is_403_and_consumes_nothing(self) -> None:
+        self.assertEqual(self.issue(capability_version=3)[0], 201)
+        # 再签发一张范围版本 0 的凭证，成功消费后占用一个事件序号。
+        self.assertEqual(self.issue("del-ok", "issue-ok", capability_version=0)[0], 201)
+        self.assertEqual(
+            self.use_delegation(self.cap_body(), "ok-1", delegation_id="del-ok"),
+            (201, b'{"version":1}'),
+        )
+        nonce = "nonce-scope-mismatch-01"
+        status, payload = self.use_delegation(
+            self.cap_body(), "cap-bad", nonce=nonce
+        )
+        self.assertEqual((status, json.loads(payload)), (403, {"error": "forbidden"}))
+        # 失败不推进事件序号：随后成功消费的 consumed 序号紧接 issued 序号。
+        self.assertEqual(self.issue("del-2", "issue-2", capability_version=1)[0], 201)
+        status, payload = self.use_delegation(
+            self.cap_body(1, 20), "cap-good", delegation_id="del-2", nonce=nonce
+        )
+        self.assertEqual((status, payload), (200, b'{"version":2}'))
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            rows = connection.execute(
+                "SELECT event_seq, type FROM delegation_events ORDER BY event_seq"
+            ).fetchall()
+            self.assertEqual(
+                rows,
+                [
+                    (1, "issued"),    # del-1
+                    (2, "issued"),    # del-ok
+                    (3, "consumed"),  # del-ok 成功消费
+                    (4, "issued"),    # del-2
+                    (5, "consumed"),  # del-2 成功消费；403 未占序号
+                ],
+            )
+            # 范围不符的凭证保持未消费。
+            self.assertEqual(
+                connection.execute(
+                    "SELECT consumed FROM machine_delegations WHERE id = 'del-1'"
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            connection.close()
+
+    def test_scope_operation_mismatch_is_403(self) -> None:
+        self.assertEqual(self.issue()[0], 201)
+        # 将凭证操作改写为不支持的操作：操作须严格等于 capability.write。
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            connection.execute(
+                "UPDATE machine_delegations SET operation = 'sla.write' WHERE id = 'del-1'"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        status, payload = self.use_delegation(self.cap_body(), "cap-1")
+        self.assertEqual((status, json.loads(payload)), (403, {"error": "forbidden"}))
+
+    def test_legacy_credential_without_scope_remains_unscoped(self) -> None:
+        # 旧凭证范围列为 NULL：升级后仍可按无范围语义消费，即便版本不匹配。
+        self.assertEqual(self.post(
+            self.cap_path, self.cap_body(), "cap-0",
+            seed=PRODUCER_SEED, actor=self.producer,
+        ), (201, b'{"version":1}'))
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            connection.execute(
+                "INSERT INTO machine_delegations"
+                "(id, issuer_machine_id, delegate_public_key, expires_at_ms,"
+                " issued_key_version, revoked, consumed, created_at_ms,"
+                " operation, capability_version)"
+                " VALUES (?, ?, ?, ?, 1, 0, 0, ?, NULL, NULL)",
+                ("del-legacy", self.producer, DELEGATE_PUBLIC,
+                 int(time.time() * 1000) + 3_600_000, int(time.time() * 1000)),
+            )
+            connection.execute(
+                "INSERT INTO delegation_events"
+                "(event_seq, delegation_id, type, created_at_ms, resource, request_digest)"
+                " VALUES (1, 'del-legacy', 'issued', ?, NULL, NULL)",
+                (int(time.time() * 1000),),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        # 期望版本 0 与当前版本 1 不符本应 409 竞争，但无范围凭证不校验版本，
+        # 消费进入业务判定并按版本竞争返回 409（而非范围 403）。
+        status, payload = self.use_delegation(
+            self.cap_body(0, 20), "cap-1", delegation_id="del-legacy"
+        )
+        self.assertEqual((status, json.loads(payload)), (409, {"error": "conflict"}))
+        # 凭证未被消费：范围匹配的请求（expectedVersion 仅需通过无范围检查）
+        # 改用版本 1 成功。
+        status, payload = self.use_delegation(
+            self.cap_body(1, 20), "cap-2", delegation_id="del-legacy"
+        )
+        self.assertEqual((status, payload), (200, b'{"version":2}'))
+
+    def test_consumptions_records_resource_and_digest(self) -> None:
+        self.assertEqual(self.issue()[0], 201)
+        body = self.cap_body()
+        self.assertEqual(
+            self.use_delegation(body, "cap-1"), (201, b'{"version":1}')
+        )
+        status, payload = self.get_audit(self.consumptions_path())
+        self.assertEqual(status, 200)
+        parsed = json.loads(payload)
+        self.assertEqual(list(parsed), ["consumptions", "nextCursor"])
+        record = parsed["consumptions"][0]
+        self.assertEqual(
+            list(record),
+            [
+                "eventSeq",
+                "delegationId",
+                "operation",
+                "capabilityVersion",
+                "resource",
+                "requestDigest",
+                "createdAt",
+            ],
+        )
+        self.assertEqual(record["eventSeq"], 2)
+        self.assertEqual(record["delegationId"], "del-1")
+        self.assertEqual(record["operation"], "capability.write")
+        self.assertEqual(record["capabilityVersion"], 0)
+        self.assertEqual(record["resource"], self.cap_path)
+        self.assertEqual(
+            record["requestDigest"], hashlib.sha256(body).hexdigest()
+        )
+        self.assertIsInstance(record["createdAt"], int)
+        self.assertGreater(record["createdAt"], 0)
+        self.assertIsNone(parsed["nextCursor"])
+
+    def test_consumptions_only_successful_consumptions_of_own_credentials(self) -> None:
+        self.assertEqual(self.issue_named("d-a", "ia")[0], 201)
+        self.assertEqual(self.issue_named("d-b", "ib")[0], 201)
+        self.assertEqual(self.revoke("d-b", "rb")[0], 200)
+        self.assertEqual(
+            self.use_delegation(self.cap_body(), "cap-a", delegation_id="d-a"),
+            (201, b'{"version":1}'),
+        )
+        # 消费者为自己签发并消费一张：不得出现在生产者的消费记录中。
+        consumer_issue = json.dumps({
+            "id": "d-consumer",
+            "delegatePublicKey": DELEGATE_PUBLIC,
+            "expiresAt": int(time.time() * 1000) + 3_600_000,
+            "operation": "capability.write",
+            "capabilityVersion": 0,
+        }).encode()
+        self.assertEqual(self.post(
+            "/v1/delegations", consumer_issue, "ic",
+            seed=PUBLIC_KEY_SEED_B, actor=self.consumer,
+        )[0], 201)
+        consumer_cap = json.dumps({
+            "expectedVersion": 0, "name": "p", "protocol": "http",
+            "region": "eu", "unit": "byte", "capacity": 1,
+        }).encode()
+        self.assertEqual(self.post(
+            f"/v1/machines/{self.consumer}/capabilities", consumer_cap, "cc",
+            delegation=(DELEGATE_SEED, "d-consumer"),
+        )[0], 201)
+        status, payload = self.get_audit(self.consumptions_path())
+        self.assertEqual(status, 200)
+        records = json.loads(payload)["consumptions"]
+        # 事件序号：issued=1(d-a),2(d-b), revoked=3, consumed=4(d-a),5(d-consumer),6。
+        self.assertEqual(
+            [(r["delegationId"], r["eventSeq"]) for r in records],
+            [("d-a", 4)],
+        )
+
+    def test_consumptions_empty_page_for_machine_without_consumptions(self) -> None:
+        self.assertEqual(self.issue_named("d-a", "ia")[0], 201)
+        status, payload = self.get_audit(self.consumptions_path())
+        self.assertEqual(
+            (status, json.loads(payload)),
+            (200, {"consumptions": [], "nextCursor": None}),
+        )
+
+    def test_consumptions_pagination_and_snapshot_isolation(self) -> None:
+        for name, key, scope in (
+            ("d-a", "ia", 0),
+            ("d-b", "ib", 1),
+            ("d-c", "ic", 2),
+        ):
+            self.assertEqual(
+                self.issue_named(name, key, capability_version=scope)[0], 201
+            )
+        path = self.consumptions_path()
+        # 全部签发在前：issued=1,2,3；随后 consumed=4(d-a),5(d-b),6(d-c)。
+        self.assertEqual(
+            self.use_delegation(self.cap_body(), "ua", delegation_id="d-a"),
+            (201, b'{"version":1}'),
+        )
+        self.assertEqual(
+            self.use_delegation(
+                self.cap_body(1, 20), "ub", delegation_id="d-b"
+            )[0],
+            200,
+        )
+        status, page = self.get_audit(f"{path}?limit=1")
+        self.assertEqual(status, 200)
+        first = json.loads(page)
+        self.assertEqual(
+            [r["eventSeq"] for r in first["consumptions"]], [4]
+        )
+        cursor = first["nextCursor"]
+        self.assertEqual(cursor, "5:4")
+        # 快照后消费 d-c：不得进入旧 cut 续页。
+        self.assertEqual(
+            self.use_delegation(
+                self.cap_body(2, 30), "uc", delegation_id="d-c"
+            )[0],
+            200,
+        )
+        status, page = self.get_audit(f"{path}?limit=1&cursor={cursor}")
+        self.assertEqual(status, 200)
+        second = json.loads(page)
+        self.assertEqual(
+            [r["eventSeq"] for r in second["consumptions"]], [5]
+        )
+        self.assertIsNone(second["nextCursor"])
+        # 全新首页取新 cut，三条消费齐全。
+        status, page = self.get_audit(path)
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [r["eventSeq"] for r in json.loads(page)["consumptions"]],
+            [4, 5, 6],
+        )
+
+    def test_consumptions_restart_continues_cursor(self) -> None:
+        self.assertEqual(self.issue_named("d-a", "ia")[0], 201)
+        self.assertEqual(self.issue_named("d-b", "ib", capability_version=1)[0], 201)
+        self.assertEqual(
+            self.use_delegation(self.cap_body(), "ua", delegation_id="d-a")[0],
+            201,
+        )
+        self.assertEqual(
+            self.use_delegation(
+                self.cap_body(1, 20), "ub", delegation_id="d-b"
+            )[0],
+            200,
+        )
+        path = self.consumptions_path()
+        status, page = self.get_audit(f"{path}?limit=1")
+        self.assertEqual(status, 200)
+        cursor = json.loads(page)["nextCursor"]
+        self.restart()
+        status, page = self.get_audit(f"{path}?limit=1&cursor={cursor}")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [r["delegationId"] for r in json.loads(page)["consumptions"]],
+            ["d-b"],
+        )
+
+    def test_consumptions_anchor_must_be_consumed_event(self) -> None:
+        self.assertEqual(self.issue_named("d-a", "ia")[0], 201)
+        self.assertEqual(
+            self.use_delegation(self.cap_body(), "ua", delegation_id="d-a")[0],
+            201,
+        )
+        # 事件序号 1 是 issued：锚点非 consumed 事件，非法。
+        status, payload = self.get_audit(f"{self.consumptions_path()}?cursor=2:1")
+        self.assertEqual((status, json.loads(payload)), (400, {"error": "invalid_request"}))
+        # cut=2、锚点 seq=2 合法，续页为空。
+        status, payload = self.get_audit(f"{self.consumptions_path()}?cursor=2:2")
+        self.assertEqual(
+            (status, json.loads(payload)),
+            (200, {"consumptions": [], "nextCursor": None}),
+        )
+        # 超前 cut 非法。
+        status, payload = self.get_audit(f"{self.consumptions_path()}?cursor=999:2")
+        self.assertEqual((status, json.loads(payload)), (400, {"error": "invalid_request"}))
+
+    def test_consumptions_anchor_other_machine_is_400(self) -> None:
+        self.assertEqual(self.issue_named("d-a", "ia")[0], 201)
+        self.assertEqual(
+            self.use_delegation(self.cap_body(), "ua", delegation_id="d-a")[0],
+            201,
+        )
+        # 消费者签发并消费：其 consumed 事件序号随后分配。
+        consumer_issue = json.dumps({
+            "id": "d-consumer",
+            "delegatePublicKey": DELEGATE_PUBLIC,
+            "expiresAt": int(time.time() * 1000) + 3_600_000,
+            "operation": "capability.write",
+            "capabilityVersion": 0,
+        }).encode()
+        self.assertEqual(self.post(
+            "/v1/delegations", consumer_issue, "ic",
+            seed=PUBLIC_KEY_SEED_B, actor=self.consumer,
+        )[0], 201)
+        consumer_cap = json.dumps({
+            "expectedVersion": 0, "name": "p", "protocol": "http",
+            "region": "eu", "unit": "byte", "capacity": 1,
+        }).encode()
+        self.assertEqual(self.post(
+            f"/v1/machines/{self.consumer}/capabilities", consumer_cap, "cc",
+            delegation=(DELEGATE_SEED, "d-consumer"),
+        )[0], 201)
+        # 生产者事件序号：issued=1 consumed=2；消费者：issued=3 consumed=4。
+        status, payload = self.get_audit(f"{self.consumptions_path()}?cursor=4:4")
+        self.assertEqual((status, json.loads(payload)), (400, {"error": "invalid_request"}))
+
+    def test_consumptions_auth_ordering(self) -> None:
+        ghost = machine_id(PUBLIC_KEY_C)
+        # 未知机器为 404。
+        status, payload = self.get_audit(
+            self.consumptions_path(ghost),
+            seed=PUBLIC_KEY_SEED_C, actor=ghost,
+        )
+        self.assertEqual((status, json.loads(payload)), (404, {"error": "not_found"}))
+        # 签名者非路径机器为 403。
+        status, payload = self.get_audit(
+            self.consumptions_path(),
+            seed=PUBLIC_KEY_SEED_B, actor=self.consumer,
+        )
+        self.assertEqual((status, json.loads(payload)), (403, {"error": "forbidden"}))
+        # 参数非法先于资源查询。
+        status, payload = self.get_audit(
+            f"{self.consumptions_path()}?limit=0", omit_auth=True
+        )
+        self.assertEqual((status, json.loads(payload)), (400, {"error": "invalid_request"}))
+        # 缺认证头为 400。
+        status, payload = self.get_audit(self.consumptions_path(), omit_auth=True)
+        self.assertEqual((status, json.loads(payload)), (400, {"error": "invalid_request"}))
+
+    def test_consumptions_nonce_consumed_only_on_success(self) -> None:
+        self.assertEqual(self.issue_named("d-a", "ia")[0], 201)
+        path = self.consumptions_path()
+        nonce = "nonce-cons-success-0001"
+        status, _ = self.get_audit(path, nonce=nonce)
+        self.assertEqual(status, 200)
+        status, payload = self.get_audit(path, nonce=nonce)
+        self.assertEqual((status, json.loads(payload)), (409, {"error": "replay_detected"}))
+        # 非法游标（400）不消费随机数：同一随机数随后以合法游标成功。
+        stale = "nonce-cons-badcursor-0001"
+        status, payload = self.get_audit(f"{path}?cursor=999:1", nonce=stale)
+        self.assertEqual((status, json.loads(payload)), (400, {"error": "invalid_request"}))
+        status, _ = self.get_audit(path, nonce=stale)
+        self.assertEqual(status, 200)
 
     def revoke(
         self, delegation_id: str = "del-1", key: str = "revoke-1", **kwargs: object
@@ -8696,11 +9100,14 @@ class DelegationTests(unittest.TestCase):
         *,
         public_key: str = DELEGATE_PUBLIC,
         ttl_ms: int = 3_600_000,
+        capability_version: int = 0,
     ) -> tuple[int, bytes]:
         body = json.dumps({
             "id": delegation_id,
             "delegatePublicKey": public_key,
             "expiresAt": int(time.time() * 1000) + ttl_ms,
+            "operation": "capability.write",
+            "capabilityVersion": capability_version,
         }).encode()
         return self.post(
             "/v1/delegations", body, key,
@@ -8732,11 +9139,15 @@ class DelegationTests(unittest.TestCase):
                 "issuedKeyVersion",
                 "consumed",
                 "revoked",
+                "operation",
+                "capabilityVersion",
             ],
         )
         self.assertEqual(first["delegatePublicKey"], DELEGATE_PUBLIC)
         self.assertEqual(first["issuedKeyVersion"], 1)
         self.assertIsInstance(first["expiresAt"], int)
+        self.assertEqual(first["operation"], "capability.write")
+        self.assertEqual(first["capabilityVersion"], 0)
 
     def test_list_delegations_consumed_flag(self) -> None:
         self.assertEqual(self.issue()[0], 201)
@@ -8765,6 +9176,8 @@ class DelegationTests(unittest.TestCase):
             "id": "c-1",
             "delegatePublicKey": DELEGATE_PUBLIC,
             "expiresAt": int(time.time() * 1000) + 3_600_000,
+            "operation": "capability.write",
+            "capabilityVersion": 0,
         }).encode()
         status, _ = self.post(
             "/v1/delegations", consumer_body, "ic",
@@ -9064,6 +9477,8 @@ class DelegationTests(unittest.TestCase):
             "id": "del-consumer",
             "delegatePublicKey": DELEGATE_PUBLIC,
             "expiresAt": int(time.time() * 1000) + 3_600_000,
+            "operation": "capability.write",
+            "capabilityVersion": 0,
         }).encode()
         status, _ = self.post(
             "/v1/delegations", consumer_body, "icons",
@@ -9354,6 +9769,8 @@ class DelegationEventMigrationTests(unittest.TestCase):
             "id": "d-new",
             "delegatePublicKey": "cd" * 32,
             "expiresAt": int(time.time() * 1000) + 3_600_000,
+            "operation": "capability.write",
+            "capabilityVersion": 0,
         }).encode()
         request = Request(self.url("/v1/delegations"), data=body, method="POST")
         request.add_header("Idempotency-Key", "issue-new")
@@ -9376,3 +9793,219 @@ class DelegationEventMigrationTests(unittest.TestCase):
             [(7, "issued")],
         )
         self.assertGreater(payload["events"][0]["createdAt"], 0)
+
+
+class DelegationScopeMigrationTests(unittest.TestCase):
+    # 模拟本次升级前的库：委托无 operation/capability_version，
+    # 委托事件无 resource/request_digest，一次性 scope 标记缺失。
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.database_path = str(Path(self.temporary.name) / "service.db")
+        self.producer = machine_id(PUBLIC_KEY_A)
+        self.expires_at = int(time.time() * 1000) + 3_600_000
+        self._build_old_database()
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = self.database_path
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        request = Request(
+            self.url("/v1/machines"),
+            data=json.dumps({"publicKey": PUBLIC_KEY_A}).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "register-a")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+
+    def _build_old_database(self) -> None:
+        from sla_network.database import connect as database_connect
+
+        connection = database_connect(self.database_path)
+        try:
+            now = int(time.time() * 1000)
+            # d-open 未消费；d-used 已消费。新列先以 NULL 写入随后随列一并删除。
+            connection.execute(
+                "INSERT INTO machine_delegations"
+                "(id, issuer_machine_id, delegate_public_key, expires_at_ms,"
+                " issued_key_version, revoked, consumed, created_at_ms,"
+                " operation, capability_version)"
+                " VALUES (?, ?, ?, ?, 1, 0, 0, ?, NULL, NULL)",
+                ("d-open", self.producer, DELEGATE_PUBLIC, self.expires_at, now),
+            )
+            connection.execute(
+                "INSERT INTO machine_delegations"
+                "(id, issuer_machine_id, delegate_public_key, expires_at_ms,"
+                " issued_key_version, revoked, consumed, created_at_ms,"
+                " operation, capability_version)"
+                " VALUES (?, ?, ?, ?, 1, 0, 1, ?, NULL, NULL)",
+                ("d-used", self.producer, DELEGATE_PUBLIC, self.expires_at, now),
+            )
+            connection.execute(
+                "INSERT INTO delegation_events"
+                "(event_seq, delegation_id, type, created_at_ms, resource, request_digest)"
+                " VALUES (1, 'd-open', 'issued', 0, NULL, NULL)"
+            )
+            connection.execute(
+                "INSERT INTO delegation_events"
+                "(event_seq, delegation_id, type, created_at_ms, resource, request_digest)"
+                " VALUES (2, 'd-used', 'issued', 0, NULL, NULL)"
+            )
+            connection.execute(
+                "INSERT INTO delegation_events"
+                "(event_seq, delegation_id, type, created_at_ms, resource, request_digest)"
+                " VALUES (3, 'd-used', 'consumed', 0, NULL, NULL)"
+            )
+            # 还原为旧表结构并移除一次性标记，触发迁移重新加列。
+            connection.execute(
+                "ALTER TABLE machine_delegations DROP COLUMN operation"
+            )
+            connection.execute(
+                "ALTER TABLE machine_delegations DROP COLUMN capability_version"
+            )
+            connection.execute("ALTER TABLE delegation_events DROP COLUMN resource")
+            connection.execute(
+                "ALTER TABLE delegation_events DROP COLUMN request_digest"
+            )
+            connection.execute(
+                "DELETE FROM schema_metadata WHERE key = 'delegation_scope_added'"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temporary.cleanup()
+
+    def url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}{path}"
+
+    def get_audit(self, path: str) -> tuple[int, object]:
+        request = Request(self.url(path), data=b"", method="GET")
+        request.add_header(
+            "SLA-Auth",
+            make_sla_auth(
+                self.server, None, PRODUCER_SEED, self.producer,
+                "GET", urlsplit(path).path, b"", 1,
+            ),
+        )
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read())
+        except HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    def test_legacy_scope_columns_are_null_and_metadata_preserved(self) -> None:
+        status, payload = self.get_audit(
+            f"/v1/machines/{self.producer}/delegations"
+        )
+        self.assertEqual(status, 200)
+        scopes = {
+            item["id"]: (item["operation"], item["capabilityVersion"])
+            for item in payload["delegations"]
+        }
+        self.assertEqual(
+            scopes, {"d-open": (None, None), "d-used": (None, None)}
+        )
+        # 旧 consumed 事件保留原序号，新增业务元数据均为 null。
+        status, payload = self.get_audit(
+            f"/v1/machines/{self.producer}/delegation-consumptions"
+        )
+        self.assertEqual(status, 200)
+        records = payload["consumptions"]
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(record["eventSeq"], 3)
+        self.assertEqual(record["delegationId"], "d-used")
+        self.assertIsNone(record["operation"])
+        self.assertIsNone(record["capabilityVersion"])
+        self.assertIsNone(record["resource"])
+        self.assertIsNone(record["requestDigest"])
+        self.assertEqual(record["createdAt"], 0)
+        self.assertIsNone(payload["nextCursor"])
+
+    def test_legacy_credential_consumed_without_scope_and_audited(self) -> None:
+        # 旧凭证范围为 NULL：按无范围语义消费（当前无能力，expectedVersion=0）。
+        cap_body = json.dumps({
+            "expectedVersion": 0, "name": "p", "protocol": "http",
+            "region": "eu", "unit": "byte", "capacity": 1,
+        }).encode()
+        cap_path = f"/v1/machines/{self.producer}/capabilities"
+        request = Request(self.url(cap_path), data=cap_body, method="POST")
+        request.add_header("Idempotency-Key", "cap-legacy-1")
+        request.add_header(
+            "SLA-Delegation",
+            make_sla_delegation(
+                self.server, "cap-legacy-1", DELEGATE_SEED, "d-open",
+                "POST", cap_path, cap_body,
+            ),
+        )
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+            self.assertEqual(response.read(), b'{"version":1}')
+        # 新 consumed 事件序号紧接旧序号 3，且审计元数据已落库；
+        # 凭证范围本身仍为 NULL。
+        status, payload = self.get_audit(
+            f"/v1/machines/{self.producer}/delegation-consumptions"
+        )
+        self.assertEqual(status, 200)
+        by_id = {r["delegationId"]: r for r in payload["consumptions"]}
+        self.assertEqual(set(by_id), {"d-used", "d-open"})
+        fresh = by_id["d-open"]
+        self.assertEqual(fresh["eventSeq"], 4)
+        self.assertIsNone(fresh["operation"])
+        self.assertIsNone(fresh["capabilityVersion"])
+        self.assertEqual(fresh["resource"], cap_path)
+        self.assertEqual(fresh["requestDigest"], hashlib.sha256(cap_body).hexdigest())
+        self.assertGreater(fresh["createdAt"], 0)
+
+    def test_legacy_issuance_record_replays_byte_for_byte(self) -> None:
+        # 升级前签发正文仅三字段：同键同请求（含同一认证五段）继续逐字节重放。
+        body = json.dumps({
+            "id": "d-replay",
+            "delegatePublicKey": DELEGATE_PUBLIC,
+            "expiresAt": self.expires_at,
+        }, separators=(",", ":")).encode()
+        header = make_sla_auth(
+            self.server, "issue-old", PRODUCER_SEED, self.producer,
+            "POST", "/v1/delegations", body, 1,
+        )
+        machine, version, request_time, nonce, signature = header.split(";")
+        request_json = json.dumps(
+            json.loads(body), sort_keys=True, separators=(",", ":")
+        )
+        response = json.dumps(
+            {"id": "d-replay", "expiresAt": self.expires_at},
+            separators=(",", ":"),
+        )
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute(
+                "INSERT INTO delegation_idempotency_records"
+                "(key, delegation_id, request_json, status, response_json,"
+                " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                " auth_nonce, auth_signature)"
+                " VALUES (?, ?, ?, 201, ?, ?, ?, ?, ?, ?)",
+                ("issue-old", "d-replay", request_json, response,
+                 machine, int(version), int(request_time), nonce, signature),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        request = Request(self.url("/v1/delegations"), data=body, method="POST")
+        request.add_header("Idempotency-Key", "issue-old")
+        request.add_header("SLA-Auth", header)
+        with urlopen(request, timeout=5) as result:
+            self.assertEqual(result.status, 201)
+            self.assertEqual(result.read(), response.encode())
+        # 重放不写入新委托。
+        connection = sqlite3.connect(self.database_path)
+        try:
+            self.assertIsNone(connection.execute(
+                "SELECT id FROM machine_delegations WHERE id = 'd-replay'"
+            ).fetchone())
+        finally:
+            connection.close()
+
