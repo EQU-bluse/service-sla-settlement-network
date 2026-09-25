@@ -257,6 +257,9 @@ _SLA_AUTH_EVIDENCE = re.compile(r"^/v1/disputes/([^/]+)/evidence$")
 _SLA_AUTH_EVIDENCE_SNAPSHOT = re.compile(
     r"^/v1/disputes/([^/]+)/evidence-snapshots$"
 )
+_SLA_AUTH_ADJUDICATION_PROPOSAL = re.compile(
+    r"^/v1/disputes/([^/]+)/adjudication-proposals$"
+)
 
 
 def _sla_auth_actor(path: str, body: bytes) -> str | None:
@@ -267,6 +270,7 @@ def _sla_auth_actor(path: str, body: bytes) -> str | None:
         _SLA_AUTH_CONFIRMATION.fullmatch(path) is not None
         or _SLA_AUTH_EVIDENCE.fullmatch(path) is not None
         or _SLA_AUTH_EVIDENCE_SNAPSHOT.fullmatch(path) is not None
+        or _SLA_AUTH_ADJUDICATION_PROPOSAL.fullmatch(path) is not None
         or path == "/v1/evidence-proofs"
     ):
         try:
@@ -8024,6 +8028,864 @@ class EvidenceSnapshotTests(_EvidenceScenario, unittest.TestCase):
         )
         self.assertEqual(status, 400)
         self.assertEqual(json.loads(body), {"error": "invalid_request"})
+
+
+class AdjudicationProposalTests(_EvidenceScenario, unittest.TestCase):
+    # 双边裁决提案：首方冻结为 pending，双方同快照同决定原子裁决；
+    # 快照或决定不同保存为 disagreement；POST/GET 的校验沿用证据快照入口。
+    def snapshot_body(self, actor: str | None = None) -> dict[str, object]:
+        return {"actorId": actor if actor is not None else self.consumer_id}
+
+    def proposal_body(
+        self,
+        *,
+        actor: str | None = None,
+        snapshot_seq: int = 1,
+        decision: str = "refund",
+        reason_digest: str | None = None,
+    ) -> dict[str, object]:
+        return {
+            "actorId": actor if actor is not None else self.consumer_id,
+            "snapshotSeq": snapshot_seq,
+            "decision": decision,
+            "reasonDigest": reason_digest if reason_digest is not None else "cd" * 32,
+        }
+
+    def create_snapshot(self, *, actor: str | None = None, key: str = "snap-1") -> int:
+        status, body = self.post_json(
+            "/v1/disputes/dispute-1/evidence-snapshots",
+            self.snapshot_body(actor if actor is not None else self.consumer_id),
+            key,
+        )
+        self.assertEqual(status, 201, body)
+        return json.loads(body)["snapshotSeq"]
+
+    def post_proposal(
+        self,
+        dispute_id: str = "dispute-1",
+        payload: object | None = None,
+        key: str | None = "prop-1",
+    ) -> tuple[int, bytes]:
+        if payload is None:
+            payload = self.proposal_body()
+        return self.post_json(
+            f"/v1/disputes/{dispute_id}/adjudication-proposals", payload, key
+        )
+
+    def post_proposal_raw(
+        self,
+        path: str,
+        body: bytes,
+        key: str | None,
+        *,
+        seed: bytes | None = None,
+        actor: str | None = None,
+        nonce: str | None = None,
+        request_time_ms: int | None = None,
+        delegation: str | None = None,
+    ) -> tuple[int, bytes]:
+        request = Request(self.url(path), data=body, method="POST")
+        if key is not None:
+            request.add_header("Idempotency-Key", key)
+        if delegation is not None:
+            request.add_header("SLA-Delegation", delegation)
+        elif seed is not None:
+            request.add_header(
+                "SLA-Auth",
+                make_sla_auth(
+                    self.server,
+                    key,
+                    seed,
+                    actor if actor is not None else self.consumer_id,
+                    "POST",
+                    urlsplit(path).path,
+                    body,
+                    1,
+                    request_time_ms=request_time_ms,
+                    nonce=nonce,
+                ),
+            )
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def get_proposals(
+        self,
+        path: str,
+        *,
+        seed: bytes | None = None,
+        actor: str | None = None,
+        nonce: str | None = None,
+        request_time_ms: int | None = None,
+        omit_auth: bool = False,
+    ) -> tuple[int, bytes]:
+        # 提案审计读取为 GET 且无正文；标准路径不含查询串，摘要按空字节计算。
+        request = Request(self.url(path), data=b"", method="GET")
+        if not omit_auth:
+            if nonce is None:
+                nonce = f"nonce-prop-audit-{time.time_ns()}"
+            auth = make_sla_auth(
+                self.server,
+                None,
+                seed if seed is not None else PUBLIC_KEY_SEED_B,
+                actor if actor is not None else self.consumer_id,
+                "GET",
+                urlsplit(path).path,
+                b"",
+                1,
+                request_time_ms=request_time_ms,
+                nonce=nonce,
+            )
+            request.add_header("SLA-Auth", auth)
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def proposals_path(self, dispute_id: str = "dispute-1") -> str:
+        return f"/v1/disputes/{dispute_id}/adjudication-proposals"
+
+    def get_snapshot(
+        self,
+        path: str,
+        *,
+        seed: bytes | None = None,
+        actor: str | None = None,
+    ) -> tuple[int, bytes]:
+        # 单笔证据快照审计读取（提案测试仅用于核对冻结摘要）。
+        request = Request(self.url(path), data=b"", method="GET")
+        request.add_header(
+            "SLA-Auth",
+            make_sla_auth(
+                self.server, None,
+                seed if seed is not None else PUBLIC_KEY_SEED_B,
+                actor if actor is not None else self.consumer_id,
+                "GET", urlsplit(path).path, b"", 1,
+            ),
+        )
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def dispute_events(self, dispute_id: str = "dispute-1") -> list[tuple]:
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            return connection.execute(
+                "SELECT type FROM dispute_events WHERE dispute_id = ?"
+                " ORDER BY event_seq",
+                (dispute_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+
+    # ---- POST 成功三态 ----
+
+    def test_first_proposal_freezes_snapshot_as_pending(self) -> None:
+        self.create_snapshot()
+        status, body = self.post_proposal()
+        self.assertEqual(status, 201)
+        payload = json.loads(body)
+        self.assertEqual(
+            list(payload),
+            ["proposalSeq", "result", "decision", "amount", "createdAt"],
+        )
+        self.assertEqual(payload["proposalSeq"], 1)
+        self.assertEqual(payload["result"], "pending")
+        self.assertEqual(payload["decision"], "refund")
+        self.assertIsNone(payload["amount"])
+        self.assertIsInstance(payload["createdAt"], int)
+        self.assertGreaterEqual(payload["createdAt"], 0)
+        self.assertEqual(body, b'{"proposalSeq":1,"result":"pending","decision"'
+                             b':"refund","amount":null,"createdAt":'
+                             + str(payload["createdAt"]).encode() + b"}")
+        # 首方提案不裁决：争议仍 open，无新生命周期事件与账本分录。
+        status, dispute = self.get_json("/v1/disputes/dispute-1")
+        self.assertEqual(dispute["state"], "open")
+        self.assertEqual(self.dispute_events(), [("opened",)])
+
+    def test_matching_refund_resolves_atomically(self) -> None:
+        self.create_snapshot()
+        status, first = self.post_proposal(key="prop-c")
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(first)["result"], "pending")
+        status, body = self.post_proposal(
+            payload=self.proposal_body(
+                actor=self.machine_id, decision="refund", reason_digest="de" * 32
+            ),
+            key="prop-p",
+        )
+        self.assertEqual(status, 201)
+        payload = json.loads(body)
+        self.assertEqual(payload["proposalSeq"], 2)
+        self.assertEqual(payload["result"], "resolved")
+        self.assertEqual(payload["decision"], "refund")
+        self.assertEqual(payload["amount"], 1000)
+        status, dispute = self.get_json("/v1/disputes/dispute-1")
+        self.assertEqual(dispute["state"], "refunded")
+        # 双方各一笔 dispute_refund 分录，保留结算关联。
+        status, ledger = self.get_json(
+            f"/v1/accounts/{self.machine_id}/ledger"
+        )
+        refunds = [
+            entry for entry in ledger["entries"]
+            if entry["kind"] == "dispute_refund"
+        ]
+        self.assertEqual(len(refunds), 1)
+        self.assertEqual(refunds[0]["delta"], -1000)
+        self.assertEqual(refunds[0]["referenceSeq"], self.settlement_seq)
+        self.assertEqual(self.dispute_events(), [("opened",), ("refunded",)])
+
+    def test_matching_release_resolves_without_ledger_entries(self) -> None:
+        self.create_snapshot()
+        status, _ = self.post_proposal(
+            payload=self.proposal_body(decision="release"), key="prop-c"
+        )
+        self.assertEqual(status, 201)
+        status, body = self.post_proposal(
+            payload=self.proposal_body(actor=self.machine_id, decision="release"),
+            key="prop-p",
+        )
+        self.assertEqual(status, 201)
+        payload = json.loads(body)
+        self.assertEqual(payload["result"], "resolved")
+        self.assertEqual(payload["decision"], "release")
+        self.assertEqual(payload["amount"], 1000)
+        status, dispute = self.get_json("/v1/disputes/dispute-1")
+        self.assertEqual(dispute["state"], "released")
+        status, ledger = self.get_json(
+            f"/v1/accounts/{self.machine_id}/ledger"
+        )
+        self.assertFalse(
+            any(e["kind"] == "dispute_refund" for e in ledger["entries"])
+        )
+        self.assertEqual(self.dispute_events(), [("opened",), ("released",)])
+
+    def test_different_decision_saves_disagreement_and_keeps_open(self) -> None:
+        self.create_snapshot()
+        status, _ = self.post_proposal(
+            payload=self.proposal_body(decision="refund"), key="prop-c"
+        )
+        self.assertEqual(status, 201)
+        status, body = self.post_proposal(
+            payload=self.proposal_body(actor=self.machine_id, decision="release"),
+            key="prop-p",
+        )
+        self.assertEqual(status, 201)
+        payload = json.loads(body)
+        self.assertEqual(payload["proposalSeq"], 2)
+        self.assertEqual(payload["result"], "disagreement")
+        self.assertIsNone(payload["amount"])
+        status, dispute = self.get_json("/v1/disputes/dispute-1")
+        self.assertEqual(dispute["state"], "open")
+        # 无裁决事件，资金仍冻结。
+        self.assertEqual(self.dispute_events(), [("opened",)])
+
+    def test_different_snapshot_saves_disagreement(self) -> None:
+        first_seq = self.create_snapshot(key="snap-1")
+        status, second_body = self.post_json(
+            "/v1/disputes/dispute-1/evidence-snapshots",
+            self.snapshot_body(self.machine_id), "snap-2",
+        )
+        self.assertEqual(status, 201)
+        second_seq = json.loads(second_body)["snapshotSeq"]
+        status, _ = self.post_proposal(
+            payload=self.proposal_body(snapshot_seq=first_seq, decision="release"),
+            key="prop-c",
+        )
+        self.assertEqual(status, 201)
+        status, body = self.post_proposal(
+            payload=self.proposal_body(
+                actor=self.machine_id, snapshot_seq=second_seq, decision="release",
+            ),
+            key="prop-p",
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(body)["result"], "disagreement")
+        status, dispute = self.get_json("/v1/disputes/dispute-1")
+        self.assertEqual(dispute["state"], "open")
+
+    def test_same_party_second_proposal_conflicts_without_sequence_gap(self) -> None:
+        self.create_snapshot()
+        status, first = self.post_proposal(key="prop-c")
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(first)["proposalSeq"], 1)
+        status, body = self.post_proposal(
+            payload=self.proposal_body(decision="release"), key="prop-c-other"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "proposal_exists"})
+        # 另一参与方仍可提交并正常裁决；失败不推进序号，成功提案序号紧接为 2。
+        status, body = self.post_proposal(
+            payload=self.proposal_body(actor=self.machine_id), key="prop-p"
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(body)["proposalSeq"], 2)
+        self.assertEqual(json.loads(body)["result"], "resolved")
+
+    def test_refund_insufficient_funds_saves_nothing(self) -> None:
+        self.create_snapshot()
+        status, _ = self.post_proposal(key="prop-c")
+        self.assertEqual(status, 201)
+        # 收款方（机器）总余额被提空（争议冻结仍登记 open），退款必然不足。
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            connection.execute(
+                "UPDATE ledger_accounts SET balance_micros = 0"
+                " WHERE account_id = ?",
+                (self.machine_id,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        raw = json.dumps(
+            self.proposal_body(actor=self.machine_id, decision="refund")
+        ).encode()
+        fixed_nonce = "nonce-prop-insufficient-000001"
+        status, body = self.post_proposal_raw(
+            self.proposals_path(), raw, "prop-p-fail",
+            seed=PRODUCER_SEED, actor=self.machine_id, nonce=fixed_nonce,
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "insufficient_funds"})
+        # 第二份提案、裁决事件、幂等结果均不保存；争议保持 open 与冻结。
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            count = connection.execute(
+                "SELECT COUNT(*) AS c FROM dispute_adjudication_proposals"
+            ).fetchone()[0]
+            idem = connection.execute(
+                "SELECT COUNT(*) AS c FROM"
+                " dispute_adjudication_proposal_idempotency_records"
+            ).fetchone()[0]
+            state = connection.execute(
+                "SELECT state FROM disputes WHERE id = 'dispute-1'"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(count, 1)
+        self.assertEqual(idem, 1)
+        self.assertEqual(state, "open")
+        self.assertEqual(self.dispute_events(), [("opened",)])
+        # 失败不消费随机数：同随机数重试仍是余额不足而非 replay_detected。
+        status, body = self.post_proposal_raw(
+            self.proposals_path(), raw, "prop-p-fail-2",
+            seed=PRODUCER_SEED, actor=self.machine_id, nonce=fixed_nonce,
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "insufficient_funds"})
+        # 原幂等键未占用：补足余额后同键重试成功并裁决。
+        status, _ = self.post_json(
+            f"/v1/funds/{self.machine_id}",
+            {"amountMicros": 5000, "reference": "ref-fund-prop"},
+            "fund-prop",
+        )
+        self.assertEqual(status, 201)
+        status, body = self.post_proposal_raw(
+            self.proposals_path(), raw, "prop-p-fail",
+            seed=PRODUCER_SEED, actor=self.machine_id, nonce="nonce-prop-retry-001",
+        )
+        self.assertEqual(status, 201, body)
+        self.assertEqual(json.loads(body)["result"], "resolved")
+
+    def test_resolved_dispute_rejects_proposals(self) -> None:
+        self.create_snapshot()
+        status, _ = self.post_proposal(key="prop-c")
+        self.assertEqual(status, 201)
+        status, _ = self.post_json(
+            "/v1/disputes/dispute-1/resolution",
+            {"decision": "release"}, "resolve-1",
+        )
+        self.assertEqual(status, 200)
+        status, body = self.post_proposal(
+            payload=self.proposal_body(actor=self.machine_id), key="prop-late"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "already_resolved"})
+
+    # ---- 资源、身份与快照关联 ----
+
+    def test_missing_dispute_is_404(self) -> None:
+        self.create_snapshot()
+        status, body = self.post_proposal(
+            dispute_id="dispute-ghost", key="prop-ghost"
+        )
+        # 快照不属于该争议：争议存在性先判，争议本身缺失即 404。
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+
+    def test_missing_or_cross_dispute_snapshot_is_404(self) -> None:
+        self.create_snapshot()
+        # 快照序号不存在。
+        status, body = self.post_proposal(
+            payload=self.proposal_body(snapshot_seq=99), key="prop-no-snap"
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+        # 跨争议引用：dispute-1 的快照用在 dispute-2 上。
+        self.create_second_dispute()
+        status, body = self.post_proposal(
+            dispute_id="dispute-2",
+            payload=self.proposal_body(snapshot_seq=1, decision="release"),
+            key="prop-cross",
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+
+    def test_actor_must_be_party_and_match_auth_machine(self) -> None:
+        self.create_snapshot()
+        status, _ = self.post_json(
+            "/v1/machines", {"publicKey": PUBLIC_KEY_C}, "register-3"
+        )
+        self.assertEqual(status, 201)
+        stranger = machine_id(PUBLIC_KEY_C)
+        raw = json.dumps(self.proposal_body(actor=stranger)).encode()
+        status, body = self.post_proposal_raw(
+            self.proposals_path(), raw, "prop-stranger",
+            seed=PUBLIC_KEY_SEED_C, actor=stranger,
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body), {"error": "forbidden"})
+        # 正文 actorId 与认证机器不一致：生产方密钥签消费方身份。
+        raw = json.dumps(self.proposal_body()).encode()
+        status, body = self.post_proposal_raw(
+            self.proposals_path(), raw, "prop-mismatch",
+            seed=PRODUCER_SEED, actor=self.machine_id,
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body), {"error": "forbidden"})
+
+    # ---- 结构、认证、幂等、序号 ----
+
+    def test_invalid_requests(self) -> None:
+        self.create_snapshot()
+        valid = self.proposal_body()
+        cases = [
+            b"",
+            b"{not json",
+            json.dumps({}).encode(),
+            json.dumps({"actorId": valid["actorId"], "snapshotSeq": 1,
+                        "decision": "refund"}).encode(),
+            json.dumps({**valid, "extra": 1}).encode(),
+            json.dumps({**valid, "actorId": "zz"}).encode(),
+            json.dumps({**valid, "actorId": valid["actorId"].upper()}).encode(),
+            json.dumps({**valid, "actorId": 1}).encode(),
+            json.dumps({**valid, "snapshotSeq": 0}).encode(),
+            json.dumps({**valid, "snapshotSeq": True}).encode(),
+            json.dumps({**valid, "snapshotSeq": "1"}).encode(),
+            json.dumps({**valid, "decision": "void"}).encode(),
+            json.dumps({**valid, "reasonDigest": "ZZ" * 32}).encode(),
+            json.dumps({**valid, "reasonDigest": "abc"}).encode(),
+            json.dumps({**valid, "reasonDigest": 1}).encode(),
+        ]
+        for index, bad in enumerate(cases):
+            status, body = self.post_proposal_raw(
+                self.proposals_path(), bad, f"bad-{index}",
+                seed=PUBLIC_KEY_SEED_B, actor=self.consumer_id,
+            )
+            self.assertEqual(status, 400, bad)
+            self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        # 缺少幂等头。
+        status, _ = self.post_proposal_raw(
+            self.proposals_path(), json.dumps(valid).encode(), None,
+            seed=PUBLIC_KEY_SEED_B, actor=self.consumer_id,
+        )
+        self.assertEqual(status, 400)
+        # 查询参数非法先于争议查询。
+        status, _ = self.post_proposal_raw(
+            self.proposals_path() + "?x=1", json.dumps(valid).encode(),
+            "prop-query", seed=PUBLIC_KEY_SEED_B, actor=self.consumer_id,
+        )
+        self.assertEqual(status, 400)
+        # 缺少认证头。
+        status, _ = self.post_proposal_raw(
+            self.proposals_path(), json.dumps(valid).encode(), "prop-no-auth",
+        )
+        self.assertEqual(status, 400)
+        # 携带代理头同样非法。
+        status, _ = self.post_proposal_raw(
+            self.proposals_path(), json.dumps(valid).encode(),
+            "prop-delegation",
+            delegation="del-1;0;0;nonce-delegation-00000000;" + "ab" * 64,
+        )
+        self.assertEqual(status, 400)
+
+    def test_stale_request_is_401(self) -> None:
+        self.create_snapshot()
+        raw = json.dumps(self.proposal_body()).encode()
+        stale = int(time.time() * 1000) - 301_000
+        status, body = self.post_proposal_raw(
+            self.proposals_path(), raw, "prop-stale",
+            seed=PUBLIC_KEY_SEED_B, actor=self.consumer_id,
+            request_time_ms=stale,
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(body), {"error": "stale_request"})
+
+    def test_nonce_replay_detected(self) -> None:
+        self.create_snapshot()
+        raw = json.dumps(self.proposal_body()).encode()
+        fixed = "nonce-prop-fixed-0000000001"
+        status, _ = self.post_proposal_raw(
+            self.proposals_path(), raw, "prop-nonce-1",
+            seed=PUBLIC_KEY_SEED_B, actor=self.consumer_id, nonce=fixed,
+        )
+        self.assertEqual(status, 201)
+        status, body = self.post_proposal_raw(
+            self.proposals_path(),
+            json.dumps(self.proposal_body(decision="release")).encode(),
+            "prop-nonce-2",
+            seed=PUBLIC_KEY_SEED_B, actor=self.consumer_id, nonce=fixed,
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "replay_detected"})
+
+    def test_same_key_conflict_and_replay_bytes(self) -> None:
+        self.create_snapshot()
+        status, first = self.post_proposal(key="prop-1")
+        self.assertEqual(status, 201)
+        # 同键重放原字节。
+        status, replay = self.post_proposal(key="prop-1")
+        self.assertEqual(status, 201)
+        self.assertEqual(replay, first)
+        # 同键异正文冲突，且先于争议查询。
+        status, body = self.post_proposal(
+            payload=self.proposal_body(decision="release"), key="prop-1"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+        status, body = self.post_proposal(
+            dispute_id="dispute-other", key="prop-1"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+        # 同键异认证五段冲突。
+        raw = json.dumps(self.proposal_body()).encode()
+        status, body = self.post_proposal_raw(
+            self.proposals_path(), raw, "prop-1",
+            seed=PUBLIC_KEY_SEED_B, actor=self.consumer_id,
+            nonce="nonce-prop-replay-other-0001",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_replay_survives_restart(self) -> None:
+        self.create_snapshot()
+        status, first = self.post_proposal(key="prop-1")
+        self.assertEqual(status, 201)
+        self.restart()
+        status, replay = self.post_proposal(key="prop-1")
+        self.assertEqual(status, 201)
+        self.assertEqual(replay, first)
+        status, body = self.get_proposals(self.proposals_path())
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            json.loads(body)["proposals"][0]["proposalSeq"],
+            json.loads(first)["proposalSeq"],
+        )
+
+    def test_global_sequence_spans_disputes_and_failures_do_not_advance(self) -> None:
+        self.create_snapshot(key="snap-d1")
+        status, body = self.post_proposal(key="prop-d1")
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(body)["proposalSeq"], 1)
+        self.create_second_dispute()
+        status, snap2_body = self.post_json(
+            "/v1/disputes/dispute-2/evidence-snapshots",
+            {"actorId": self.consumer_id}, "snap-d2",
+        )
+        self.assertEqual(status, 201)
+        snap2_seq = json.loads(snap2_body)["snapshotSeq"]
+        status, body = self.post_proposal(
+            dispute_id="dispute-2",
+            payload=self.proposal_body(
+                snapshot_seq=snap2_seq, decision="release"
+            ),
+            key="prop-d2",
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(body)["proposalSeq"], 2)
+        # 失败请求不推进序号。
+        status, _ = self.post_proposal(
+            payload=self.proposal_body(snapshot_seq=99), key="prop-missing-snap"
+        )
+        self.assertEqual(status, 404)
+        status, body = self.post_proposal(
+            payload=self.proposal_body(
+                actor=self.machine_id, decision="release"
+            ),
+            key="prop-d1-p",
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(body)["proposalSeq"], 3)
+
+    def test_concurrent_matching_proposals_adjudicate_once(self) -> None:
+        self.create_snapshot()
+        barrier = threading.Barrier(2)
+        results: list[dict] = []
+        lock = threading.Lock()
+
+        def submit(seed: bytes, actor: str, key: str) -> None:
+            barrier.wait()
+            status, body = self.post_proposal(
+                payload=self.proposal_body(actor=actor, decision="refund"),
+                key=key,
+            )
+            with lock:
+                results.append({"status": status, **json.loads(body)})
+
+        threads = [
+            threading.Thread(
+                target=submit,
+                args=(PUBLIC_KEY_SEED_B, self.consumer_id, "prop-race-c"),
+            ),
+            threading.Thread(
+                target=submit,
+                args=(PRODUCER_SEED, self.machine_id, "prop-race-p"),
+            ),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual(sorted(r["status"] for r in results), [201, 201])
+        self.assertEqual(sorted(r["result"] for r in results), ["pending", "resolved"])
+        self.assertEqual(
+            sorted(r["proposalSeq"] for r in results), [1, 2]
+        )
+        # 资金只移动一次，裁决事件仅一条。
+        status, ledger = self.get_json(
+            f"/v1/accounts/{self.machine_id}/ledger"
+        )
+        refunds = [
+            entry for entry in ledger["entries"]
+            if entry["kind"] == "dispute_refund"
+        ]
+        self.assertEqual(len(refunds), 1)
+        self.assertEqual(self.dispute_events(), [("opened",), ("refunded",)])
+
+    # ---- GET 集合 ----
+
+    def test_get_collection_empty(self) -> None:
+        self.create_snapshot()
+        status, body = self.get_proposals(self.proposals_path())
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            json.loads(body), {"proposals": [], "nextCursor": None}
+        )
+
+    def test_get_collection_returns_frozen_digest_and_results(self) -> None:
+        self.create_snapshot()
+        first_status, first_body = self.post_proposal(
+            payload=self.proposal_body(decision="refund"), key="prop-c"
+        )
+        self.assertEqual(first_status, 201)
+        second_status, _ = self.post_proposal(
+            payload=self.proposal_body(actor=self.machine_id), key="prop-p"
+        )
+        self.assertEqual(second_status, 201)
+        status, body = self.get_proposals(self.proposals_path())
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(list(payload), ["proposals", "nextCursor"])
+        proposals = payload["proposals"]
+        self.assertEqual(
+            [list(item) for item in proposals],
+            [
+                [
+                    "proposalSeq", "actorId", "snapshotSeq", "snapshotDigest",
+                    "decision", "reasonDigest", "result", "amount", "createdAt",
+                ],
+                [
+                    "proposalSeq", "actorId", "snapshotSeq", "snapshotDigest",
+                    "decision", "reasonDigest", "result", "amount", "createdAt",
+                ],
+            ],
+        )
+        self.assertEqual([item["proposalSeq"] for item in proposals], [1, 2])
+        first, second = proposals
+        self.assertEqual(first["actorId"], self.consumer_id)
+        self.assertEqual(first["snapshotSeq"], 1)
+        self.assertEqual(first["decision"], "refund")
+        self.assertEqual(first["reasonDigest"], "cd" * 32)
+        self.assertEqual(first["result"], "pending")
+        self.assertIsNone(first["amount"])
+        self.assertEqual(second["actorId"], self.machine_id)
+        self.assertEqual(second["result"], "resolved")
+        self.assertEqual(second["amount"], 1000)
+        # 双方引用同一快照：冻结摘要等于快照摘要。
+        status, snapshot_body = self.get_snapshot(
+            "/v1/disputes/dispute-1/evidence-snapshots/1",
+            seed=PRODUCER_SEED, actor=self.machine_id,
+        )
+        self.assertEqual(status, 200)
+        snapshot_digest = json.loads(snapshot_body)["digest"]
+        self.assertEqual(first["snapshotDigest"], snapshot_digest)
+        self.assertEqual(second["snapshotDigest"], snapshot_digest)
+        self.assertIsNone(payload["nextCursor"])
+
+    def test_get_collection_readable_after_resolution(self) -> None:
+        self.create_snapshot()
+        status, _ = self.post_proposal(
+            payload=self.proposal_body(decision="release"), key="prop-c"
+        )
+        self.assertEqual(status, 201)
+        status, _ = self.post_proposal(
+            payload=self.proposal_body(
+                actor=self.machine_id, decision="release"
+            ),
+            key="prop-p",
+        )
+        self.assertEqual(status, 201)
+        status, body = self.get_proposals(
+            self.proposals_path(), seed=PRODUCER_SEED, actor=self.machine_id
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["result"] for item in json.loads(body)["proposals"]],
+            ["pending", "resolved"],
+        )
+
+    def test_get_collection_pagination_and_cursor_isolation(self) -> None:
+        self.create_snapshot()
+        self.post_proposal(key="prop-page-1")
+        self.post_proposal(
+            payload=self.proposal_body(
+                actor=self.machine_id, decision="refund",
+                reason_digest="ef" * 32,
+            ),
+            key="prop-page-2",
+        )
+        status, first_page = self.get_proposals(
+            self.proposals_path() + "?limit=1"
+        )
+        self.assertEqual(status, 200)
+        first_payload = json.loads(first_page)
+        self.assertEqual(
+            [item["proposalSeq"] for item in first_payload["proposals"]], [1]
+        )
+        self.assertEqual(first_payload["nextCursor"], "2:1")
+        # 裁决后新增的提案不进入旧 cut 续页（本争议已裁决，改用跨争议新增验证）。
+        self.create_second_dispute()
+        status, snap2_body = self.post_json(
+            "/v1/disputes/dispute-2/evidence-snapshots",
+            {"actorId": self.consumer_id}, "snap-other",
+        )
+        self.assertEqual(status, 201)
+        snap2_seq = json.loads(snap2_body)["snapshotSeq"]
+        self.assertEqual(
+            self.post_proposal(
+                dispute_id="dispute-2",
+                payload=self.proposal_body(
+                    snapshot_seq=snap2_seq, decision="release"
+                ),
+                key="prop-other",
+            )[0],
+            201,
+        )
+        status, second_page = self.get_proposals(
+            self.proposals_path() + "?limit=1"
+            f"&cursor={first_payload['nextCursor']}"
+        )
+        self.assertEqual(status, 200)
+        second_payload = json.loads(second_page)
+        self.assertEqual(
+            [item["proposalSeq"] for item in second_payload["proposals"]], [2]
+        )
+        self.assertIsNone(second_payload["nextCursor"])
+
+    def test_get_collection_errors_and_nonce_consumption(self) -> None:
+        self.create_snapshot()
+        self.post_proposal(key="prop-1")
+        for query in (
+            "limit=0", "limit=101", "limit=01", "limit=1&limit=2",
+            "unknown=1", "cursor=1", "cursor=x:1", "cursor=1:y",
+        ):
+            status, body = self.get_proposals(
+                self.proposals_path() + f"?{query}"
+            )
+            self.assertEqual(status, 400, query)
+            self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        # 参数错误先于争议查询。
+        status, _ = self.get_proposals(
+            self.proposals_path("dispute-missing") + "?limit=0"
+        )
+        self.assertEqual(status, 400)
+        # 争议不存在 404；非参与方 403。
+        status, body = self.get_proposals(self.proposals_path("dispute-missing"))
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+        status, _ = self.post_json(
+            "/v1/machines", {"publicKey": PUBLIC_KEY_C}, "register-3"
+        )
+        self.assertEqual(status, 201)
+        status, body = self.get_proposals(
+            self.proposals_path(),
+            seed=PUBLIC_KEY_SEED_C, actor=machine_id(PUBLIC_KEY_C),
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body), {"error": "forbidden"})
+        # cut 超前 / 锚点属于其他争议为 400。
+        self.create_second_dispute()
+        status, snap2_body = self.post_json(
+            "/v1/disputes/dispute-2/evidence-snapshots",
+            {"actorId": self.consumer_id}, "snap-d2",
+        )
+        self.assertEqual(status, 201)
+        snap2_seq = json.loads(snap2_body)["snapshotSeq"]
+        self.assertEqual(
+            self.post_proposal(
+                dispute_id="dispute-2",
+                payload=self.proposal_body(
+                    snapshot_seq=snap2_seq, decision="release"
+                ),
+                key="prop-d2",
+            )[0],
+            201,
+        )
+        status, body = self.get_proposals(
+            self.proposals_path() + "?cursor=99:1"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        status, body = self.get_proposals(
+            self.proposals_path() + "?cursor=2:2"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        # 成功读取消费随机数；失败（cut 超前）不消费。
+        fixed = "nonce-prop-get-000000000001"
+        status, _ = self.get_proposals(
+            self.proposals_path() + "?cursor=99:1", nonce=fixed
+        )
+        self.assertEqual(status, 400)
+        status, body = self.get_proposals(
+            self.proposals_path() + "?cursor=99:1", nonce=fixed
+        )
+        self.assertEqual(status, 400)
+        status, body = self.get_proposals(self.proposals_path(), nonce=fixed)
+        self.assertEqual(status, 200, body)
+        status, body = self.get_proposals(self.proposals_path(), nonce=fixed)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "replay_detected"})
+        # 缺少认证头为 400 且先于争议查询；携带代理头同样非法。
+        status, _ = self.get_proposals(
+            self.proposals_path("dispute-missing"), omit_auth=True
+        )
+        self.assertEqual(status, 400)
+        request = Request(
+            self.url(self.proposals_path()), data=b"", method="GET"
+        )
+        request.add_header(
+            "SLA-Delegation", "del-1;0;0;nonce-delegation-00000001;" + "ab" * 64
+        )
+        with self.assertRaises(HTTPError) as context:
+            urlopen(request, timeout=5)
+        self.assertEqual(context.exception.code, 400)
 
 
 class EvidenceSnapshotStorageMigrationTests(unittest.TestCase):
