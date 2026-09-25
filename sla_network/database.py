@@ -264,7 +264,8 @@ CREATE TABLE IF NOT EXISTS machine_delegations (
     consumed INTEGER NOT NULL DEFAULT 0,
     created_at_ms INTEGER NOT NULL,
     operation TEXT,
-    capability_version INTEGER
+    capability_version INTEGER,
+    dispute_id TEXT
 );
 CREATE TABLE IF NOT EXISTS delegation_idempotency_records (
     key TEXT PRIMARY KEY,
@@ -325,6 +326,7 @@ SLA_AUTH_MARKER = "sla_auth_added"
 DELEGATION_EVENT_MARKER = "delegation_events_backfilled"
 DELEGATION_EVENT_INDEX = "idx_delegation_events_delegation_seq"
 DELEGATION_SCOPE_MARKER = "delegation_scope_added"
+DELEGATION_DISPUTE_SCOPE_MARKER = "delegation_dispute_scope_added"
 
 AUTH_IDEMPOTENCY_TABLES = (
     "capability_idempotency_records",
@@ -739,6 +741,40 @@ def _add_delegation_scope(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _add_delegation_dispute_scope(connection: sqlite3.Connection) -> None:
+    # 仅在一次性迁移（含空库首次连接）时取写锁；BEGIN IMMEDIATE 串行并发首启。
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        if (
+            connection.execute(
+                "SELECT 1 FROM schema_metadata WHERE key = ?",
+                (DELEGATION_DISPUTE_SCOPE_MARKER,),
+            ).fetchone()
+            is not None
+        ):
+            # 其他连接已完成迁移，直接释放写锁。
+            connection.execute("COMMIT")
+            return
+        # 单笔争议授权在既有字段末尾追加可空 dispute_id：旧委托一律保持 NULL，
+        # 能力授权及升级前凭证该列为 null，不改动旧序号、幂等数据与历史响应字节。
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(machine_delegations)")
+        }
+        if "dispute_id" not in columns:
+            connection.execute(
+                "ALTER TABLE machine_delegations ADD COLUMN dispute_id TEXT"
+            )
+        connection.execute(
+            "INSERT INTO schema_metadata(key, value) VALUES (?, '1')",
+            (DELEGATION_DISPUTE_SCOPE_MARKER,),
+        )
+        connection.execute("COMMIT")
+    except BaseException:
+        connection.execute("ROLLBACK")
+        raise
+
+
 def connect(path: str) -> sqlite3.Connection:
     database = Path(path)
     database.parent.mkdir(parents=True, exist_ok=True)
@@ -829,6 +865,14 @@ def connect(path: str) -> sqlite3.Connection:
         is None
     ):
         _add_delegation_scope(connection)
+    if (
+        connection.execute(
+            "SELECT 1 FROM schema_metadata WHERE key = ?",
+            (DELEGATION_DISPUTE_SCOPE_MARKER,),
+        ).fetchone()
+        is None
+    ):
+        _add_delegation_dispute_scope(connection)
     # 委托按签发事件序号分页：事件表 join 委托后需 (issuer, issued_seq) 索引。
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_delegation_events_delegation_seq"
