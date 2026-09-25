@@ -260,6 +260,39 @@ CREATE TABLE IF NOT EXISTS auth_nonce_records (
     request_time_ms INTEGER NOT NULL,
     PRIMARY KEY (machine_id, nonce)
 );
+CREATE TABLE IF NOT EXISTS delegations (
+    id TEXT PRIMARY KEY,
+    machine_id TEXT NOT NULL,
+    delegate_public_key TEXT NOT NULL,
+    expires_at_ms INTEGER NOT NULL,
+    key_version INTEGER NOT NULL,
+    revoked INTEGER NOT NULL DEFAULT 0,
+    consumed INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS delegation_idempotency_records (
+    key TEXT PRIMARY KEY,
+    machine_id TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    response_json TEXT NOT NULL,
+    auth_machine_id TEXT,
+    auth_key_version INTEGER,
+    auth_request_time_ms INTEGER,
+    auth_nonce TEXT,
+    auth_signature TEXT
+);
+CREATE TABLE IF NOT EXISTS delegation_revocation_idempotency_records (
+    key TEXT PRIMARY KEY,
+    delegation_id TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    response_json TEXT NOT NULL,
+    auth_machine_id TEXT,
+    auth_key_version INTEGER,
+    auth_request_time_ms INTEGER,
+    auth_nonce TEXT,
+    auth_signature TEXT
+);
 CREATE INDEX IF NOT EXISTS idx_dispute_evidences_dispute_seq
 ON dispute_evidences(dispute_id, evidence_seq);
 CREATE INDEX IF NOT EXISTS idx_dispute_evidence_proofs_evidence_seq
