@@ -42,6 +42,21 @@ python3 -m sla_network --host 127.0.0.1 --port 8080 --database var/service-sla.d
 - `POST /v1/evidence-proofs`：为一条已提交的不可变证据追加签名证明。请求须携带 `Idempotency-Key` 头（格式同上）且不接受任何查询参数，JSON 请求体仅含且不得重复 `evidenceSeq`（非布尔正整数）、`actorId`（`[0-9a-f]{64}`）、`signature`（恰 128 位小写十六进制字符）。签名按 RFC 8032 以 `actorId` 登记的 `publicKey` 验证 Ed25519；被签消息为 UTF-8 字符串 `proof-v1\n争议id\nevidenceSeq\n证据digest\nactorId`（整数为无前导零十进制，争议 id 与 digest 取该证据记录）的字节。判定顺序为头、查询参数、体、幂等记录、证据、签名者身份、争议状态、重复证明、验签：头、查询参数或体非法返回 `400`/`invalid_request`，且先于一切资源查询；同键异证据、签名者或签名返回 `409`/`conflict`，且先于资源查询；证据不存在返回 `404`/`not_found`；`actorId` 非该证据所属争议的付款方或收款方返回 `403`/`forbidden`；争议已裁决返回 `409`/`already_resolved`；验签失败（含查不到登记公钥）返回 `409`/`invalid_signature`；同一证据同一签名者已被异键证明返回 `409`/`proof_exists`（每条证据双方各可证明一次，唯一性最后判定）。首次成功在同一写事务内原子分配全库唯一、持久递增的证明序号 `proofSeq`（取全库最大序号加一，空库为 `1`，跨证据唯一）与非负事务 UTC 毫秒时间 `createdAt`，返回 `201`，正文键序为 `proofSeq,verified,createdAt`，`verified` 为 `true`。证明、`proofSeq`、`createdAt` 与幂等结果同事务原子持久化；任何失败均不写记录、不推进序号；同键同请求并发或重启后重放首次状态码与响应字节；同一签名者并发至多成功一次。
 - `GET /v1/evidence/{evidenceSeq}/proofs`：分页读取一条证据的签名证明，争议裁决后仍可读取已有证明。路径 `evidenceSeq` 为无前导零十进制正整数；查询参数仅允许且每项限单值 `limit`、`cursor`，格式、缺省值（`limit` 缺省 `50`、范围 `1..100`）、错误次序与 `cursor=cut:lastSeq` 的快照语义均沿用 SLA 评估历史查询：缺项、未知/重复参数、格式或范围非法在证据查询之前返回 `400`/`invalid_request`；证据序号非法或不存在返回 `404`/`not_found`。无 `cursor` 时，`cut` 取同一读事务起点的全库最大 `proofSeq`（空库为 `0`）；按全局序号升序返回该证据内 `0<proofSeq<=cut` 的证明，续页在同一 `cut` 下再限 `proofSeq>lastSeq`。`cut` 大于当前全库最大序号、或 `lastSeq` 锚点不属于该证据（含锚点属于其他证据或不存在），均为 `400`/`invalid_request`（这些状态校验在证据查询之后）。成功为 `200`，正文键序 `proofs,nextCursor`；`proofs` 为对象数组，元素键序 `proofSeq,actorId,signature,verified,createdAt`，分别为正整数、机器 id、128 位小写十六进制签名、`true`、非负毫秒整数。页长不超过 `limit`；有后页时 `nextCursor` 为 `cut:末序号`，否则为 `null`。`cut` 由游标携带并跨重启稳定；旧游标隔离并发写入，续页不混入新证明（全新首页才取新 `cut`）。
 
+## 请求认证（SLA-Auth）
+
+能力声明（`POST /v1/machines/{id}/capabilities`）、SLA 确认（`POST /v1/slas/{id}/confirmations`）、争议证据（`POST /v1/disputes/{id}/evidence`）与证据证明（`POST /v1/evidence-proofs`）四个入口须额外携带单值 `SLA-Auth` 请求头。该头由五段 ASCII 文本以分号连接：机器标识、无前导零正整数密钥版本、无前导零十进制 UTC 毫秒请求时间、随机数（`[A-Za-z0-9-]{16,64}`），以及一百二十八位小写十六进制 Ed25519 签名。
+
+待签字节以 `request-auth-v1` 开头，再依次换行连接大写方法、标准路径（请求目标问号前的 ASCII 路径，业务标识保持公开入口规定的形式）与正文摘要；随后依次连接请求时间、随机数、密钥版本、机器标识，末尾无换行。正文摘要是服务收到的原始正文之 SHA-256 小写十六进制，不重新序列化 JSON。签名按 RFC 8032 以该机器指定密钥版本登记的 `publicKey` 严格验证。
+
+- 机器标识须等于能力路径机器、确认或证据正文 `actorId`、证明正文 `actorId`，不一致返回 `403`/`forbidden`。
+- 接收时请求时间与当前 UTC 毫秒相差超过 `300000`，返回 `401`/`stale_request`。
+- 密钥不存在、不是届时最新版本、已吊销，或未通过严格 Ed25519 验签，统一返回 `401`/`invalid_authentication`。
+- 认证头缺失、重复或格式非法返回 `400`/`invalid_request`，且先于资源与业务检查。
+- 认证结构通过后先处理既有幂等记录：同键同请求直接重放首次响应，且不再次消费随机数。未命中幂等记录后，依次检查资源和签名者、时间、密钥与签名、随机数，再执行既有业务判定。
+- 同键更换认证五段或业务请求返回 `409`/`conflict`；同一机器以异键复用有效期内随机数返回 `409`/`replay_detected`。
+- 仅首次业务成功才在同一事务内原子写入随机数、业务变更与幂等结果；任何失败均不消费随机数、不写入幂等结果、不推进全局序号。随机数记录至少保留到请求时间后十分钟，此后可清理；过期请求仍由三十万毫秒时间窗口拒绝。
+- 升级前已有的幂等记录（无认证数据）是唯一例外：按原请求先行重放原响应，且不补认证数据。
+
 ## 测试
 
 ```bash

@@ -5,6 +5,7 @@ import json
 import re
 import sqlite3
 from contextlib import closing
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -15,6 +16,11 @@ from .database import connect
 from .ed25519 import verify as ed25519_verify
 
 IDEMPOTENCY_KEY_PATTERN = re.compile(r"[A-Za-z0-9-]{1,64}")
+SLAAUTH_HEADER = "SLA-Auth"
+SLAAUTH_POSITIVE_DECIMAL_PATTERN = re.compile(r"[1-9][0-9]*")
+SLAAUTH_NONCE_PATTERN = re.compile(r"[A-Za-z0-9-]{16,64}")
+SLAAUTH_SKEW_MS = 300_000
+SLAAUTH_NONCE_RETENTION_MS = 600_000
 PUBLIC_KEY_PATTERN = re.compile(r"[0-9a-f]{64}")
 CAPABILITIES_PATH_PATTERN = re.compile(r"/v1/machines/([^/]+)/capabilities")
 MACHINE_KEYS_PATH_PATTERN = re.compile(r"/v1/machines/([^/]+)/keys")
@@ -103,6 +109,27 @@ def _bounded_int(value: Any, minimum: int, maximum: int) -> bool:
         and not isinstance(value, bool)
         and minimum <= value <= maximum
     )
+
+
+@dataclass(frozen=True)
+class SlaAuth:
+    """解析后的 SLA-Auth 五段认证结构（仅结构合法，尚未验签）。"""
+
+    machine_id: str
+    key_version: int
+    request_time_ms: int
+    nonce: str
+    signature: str
+
+
+@dataclass(frozen=True)
+class AuthContext:
+    """一次受保护请求的认证上下文：结构、原始正文、摘要与标准路径。"""
+
+    auth: SlaAuth
+    body: bytes
+    body_digest: str
+    path: str
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1137,6 +1164,13 @@ class Handler(BaseHTTPRequestHandler):
         self._json(status, payload)
 
     def _read_json_object(self) -> dict[str, Any] | None:
+        body = self._read_raw_body()
+        if body is None:
+            return None
+        return self._parse_json_object(body)
+
+    def _read_raw_body(self) -> bytes | None:
+        # 读取服务收到的原始正文字节：摘要必须针对原始字节，不得重新序列化 JSON。
         length_header = self.headers.get("Content-Length")
         if length_header is None:
             return None
@@ -1146,7 +1180,10 @@ class Handler(BaseHTTPRequestHandler):
             return None
         if length <= 0:
             return None
-        body = self.rfile.read(length)
+        return self.rfile.read(length)
+
+    @staticmethod
+    def _parse_json_object(body: bytes) -> dict[str, Any] | None:
         try:
             text = body.decode("utf-8")
         except UnicodeDecodeError:
@@ -1158,6 +1195,119 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(parsed, dict):
             return None
         return parsed
+
+    def _parse_sla_auth(self) -> SlaAuth | None:
+        # 单值 SLA-Auth 头：缺失、重复或五段结构非法均为 None（调用方返回 400）。
+        values = self.headers.get_all(SLAAUTH_HEADER)
+        if values is None or len(values) != 1:
+            return None
+        parts = values[0].split(";")
+        if len(parts) != 5:
+            return None
+        machine_id_text, version_text, time_text, nonce, signature = parts
+        if PUBLIC_KEY_PATTERN.fullmatch(machine_id_text) is None:
+            return None
+        if SLAAUTH_POSITIVE_DECIMAL_PATTERN.fullmatch(version_text) is None:
+            return None
+        # 请求时间为无前导零十进制 UTC 毫秒，允许单个 "0"（随后由时间窗口拒绝）。
+        if DECIMAL_PATTERN.fullmatch(time_text) is None:
+            return None
+        if SLAAUTH_NONCE_PATTERN.fullmatch(nonce) is None:
+            return None
+        if SIGNATURE_PATTERN.fullmatch(signature) is None:
+            return None
+        return SlaAuth(
+            machine_id=machine_id_text,
+            key_version=int(version_text),
+            request_time_ms=int(time_text),
+            nonce=nonce,
+            signature=signature,
+        )
+
+    @staticmethod
+    def _request_auth_message(
+        method: str, path: str, body_digest: str, auth: SlaAuth
+    ) -> bytes:
+        # request-auth-v1\n方法\n标准路径\n正文摘要\n时间\n随机数\n密钥版本\n机器标识
+        # 各项逐行连接，末尾无换行。
+        return (
+            f"request-auth-v1\n{method}\n{path}\n{body_digest}\n"
+            f"{auth.request_time_ms}\n{auth.nonce}\n"
+            f"{auth.key_version}\n{auth.machine_id}"
+        ).encode("utf-8")
+
+    def _verify_request_auth(
+        self, database: Any, ctx: AuthContext
+    ) -> tuple[HTTPStatus, dict[str, Any]] | None:
+        """时间、密钥与签名、随机数校验。全部通过返回 None，否则返回错误响应。
+
+        资源存在性与签名者身份（404/403）由各入口在调用前判定。
+        """
+        auth = ctx.auth
+        now_ms = int(datetime.now(UTC).timestamp() * 1000)
+        # 请求时间与当前 UTC 毫秒相差超过三十万：stale_request。
+        if abs(auth.request_time_ms - now_ms) > SLAAUTH_SKEW_MS:
+            return HTTPStatus.UNAUTHORIZED, {"error": "stale_request"}
+        latest = database.execute(
+            "SELECT MAX(version) AS latest FROM machine_keys WHERE machine_id = ?",
+            (auth.machine_id,),
+        ).fetchone()
+        key = database.execute(
+            "SELECT public_key, revoked FROM machine_keys"
+            " WHERE machine_id = ? AND version = ?",
+            (auth.machine_id, auth.key_version),
+        ).fetchone()
+        # 密钥不存在、不是届时最新版本或已吊销：统一 invalid_authentication。
+        if (
+            latest is None
+            or latest["latest"] is None
+            or key is None
+            or latest["latest"] != auth.key_version
+            or key["revoked"]
+        ):
+            return HTTPStatus.UNAUTHORIZED, {"error": "invalid_authentication"}
+        message = self._request_auth_message("POST", ctx.path, ctx.body_digest, auth)
+        if not ed25519_verify(
+            bytes.fromhex(key["public_key"]),
+            message,
+            bytes.fromhex(auth.signature),
+        ):
+            return HTTPStatus.UNAUTHORIZED, {"error": "invalid_authentication"}
+        # 过期随机数记录（请求时间后十分钟之外）可清理；新请求时间受时间窗口约束。
+        database.execute(
+            "DELETE FROM auth_nonce_consumptions"
+            " WHERE request_time_ms + ? < ?",
+            (SLAAUTH_NONCE_RETENTION_MS, now_ms),
+        )
+        consumed = database.execute(
+            "SELECT 1 FROM auth_nonce_consumptions"
+            " WHERE machine_id = ? AND nonce = ?",
+            (auth.machine_id, auth.nonce),
+        ).fetchone()
+        # 同一机器以异键复用有效期内随机数：replay_detected。
+        if consumed is not None:
+            return HTTPStatus.CONFLICT, {"error": "replay_detected"}
+        return None
+
+    @staticmethod
+    def _consume_nonce(database: Any, ctx: AuthContext) -> None:
+        # 仅首次业务成功时原子写入随机数；过期记录已在校验时清理，REPLACE 兜底。
+        database.execute(
+            "INSERT OR REPLACE INTO auth_nonce_consumptions"
+            "(machine_id, nonce, request_time_ms) VALUES (?, ?, ?)",
+            (ctx.auth.machine_id, ctx.auth.nonce, ctx.auth.request_time_ms),
+        )
+
+    @staticmethod
+    def _auth_matches(record: Any, auth: SlaAuth) -> bool:
+        # 新记录的幂等匹配要求五段认证完全一致；任一段更换即冲突。
+        return (
+            record["auth_machine_id"] == auth.machine_id
+            and record["auth_key_version"] == auth.key_version
+            and record["auth_request_time_ms"] == auth.request_time_ms
+            and record["auth_nonce"] == auth.nonce
+            and record["auth_signature"] == auth.signature
+        )
 
     def _read_request_object(self) -> dict[str, Any] | None:
         parsed = self._read_json_object()
@@ -1215,15 +1365,23 @@ class Handler(BaseHTTPRequestHandler):
         if idempotency_key is None or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None:
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
-        fields = self._read_capability_object()
+        body = self._read_raw_body()
+        if body is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        parsed = self._parse_json_object(body)
+        fields = self._validate_capability_object(parsed)
         if fields is None:
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
-        status, payload = self._apply_capability(idempotency_key, machine_id, fields)
+        status, payload = self._apply_capability(
+            idempotency_key, machine_id, fields, body
+        )
         self._json(status, payload)
 
-    def _read_capability_object(self) -> dict[str, Any] | None:
-        parsed = self._read_json_object()
+    def _validate_capability_object(
+        self, parsed: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
         if parsed is None or set(parsed) != CAPABILITY_FIELDS:
             return None
         if not _bounded_int(parsed["expectedVersion"], 0, 2147483646):
@@ -1245,28 +1403,67 @@ class Handler(BaseHTTPRequestHandler):
         return parsed
 
     def _apply_capability(
-        self, idempotency_key: str, machine_id: str, fields: dict[str, Any]
+        self,
+        idempotency_key: str,
+        machine_id: str,
+        fields: dict[str, Any],
+        raw_body: bytes,
     ) -> tuple[HTTPStatus, dict[str, Any]]:
         request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
         with closing(connect(self.server.database_path)) as database:
             database.execute("BEGIN IMMEDIATE")
             try:
                 record = database.execute(
-                    "SELECT machine_id, request_json, status, response_json"
+                    "SELECT machine_id, request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature"
                     " FROM capability_idempotency_records WHERE key = ?",
                     (idempotency_key,),
                 ).fetchone()
-                if record is not None:
+                # 升级前已有幂等记录：唯一例外，按原请求先行重放，不补认证数据。
+                if record is not None and record["auth_machine_id"] is None:
                     database.execute("ROLLBACK")
-                    if record["machine_id"] == machine_id and record["request_json"] == request_json:
+                    if (
+                        record["machine_id"] == machine_id
+                        and record["request_json"] == request_json
+                    ):
                         return HTTPStatus(record["status"]), json.loads(record["response_json"])
                     return HTTPStatus.CONFLICT, {"error": "conflict"}
+                # 非旧记录：认证结构必须合法，先于资源与业务判定。
+                auth = self._parse_sla_auth()
+                if auth is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                ctx = AuthContext(
+                    auth=auth,
+                    body=raw_body,
+                    body_digest=hashlib.sha256(raw_body).hexdigest(),
+                    path=urlsplit(self.path).path,
+                )
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    # 同键更换认证五段或业务请求均为冲突；全同则重放首次响应。
+                    if (
+                        record["machine_id"] == machine_id
+                        and record["request_json"] == request_json
+                        and self._auth_matches(record, auth)
+                    ):
+                        return HTTPStatus(record["status"]), json.loads(record["response_json"])
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                # 未命中幂等记录：资源 → 签名者身份 → 时间/密钥/签名/随机数 → 业务。
                 machine = database.execute(
                     "SELECT id FROM machines WHERE id = ?", (machine_id,)
                 ).fetchone()
                 if machine is None:
                     database.execute("ROLLBACK")
                     return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                if auth.machine_id != machine_id:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
+                auth_error = self._verify_request_auth(database, ctx)
+                if auth_error is not None:
+                    database.execute("ROLLBACK")
+                    return auth_error
                 current = database.execute(
                     "SELECT version FROM machine_capabilities WHERE machine_id = ?",
                     (machine_id,),
@@ -1296,16 +1493,25 @@ class Handler(BaseHTTPRequestHandler):
                         new_version,
                     ),
                 )
+                # 首次业务成功：随机数、业务变更与幂等结果同事务原子写入。
+                self._consume_nonce(database, ctx)
                 database.execute(
                     "INSERT INTO capability_idempotency_records"
-                    "(key, machine_id, request_json, status, response_json)"
-                    " VALUES (?, ?, ?, ?, ?)",
+                    "(key, machine_id, request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         idempotency_key,
                         machine_id,
                         request_json,
                         int(status),
                         json.dumps(payload, separators=(",", ":")),
+                        auth.machine_id,
+                        auth.key_version,
+                        auth.request_time_ms,
+                        auth.nonce,
+                        auth.signature,
                     ),
                 )
                 database.execute("COMMIT")
@@ -1798,15 +2004,22 @@ class Handler(BaseHTTPRequestHandler):
         if idempotency_key is None or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None:
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
-        fields = self._read_confirmation_object()
+        body = self._read_raw_body()
+        if body is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        fields = self._validate_confirmation_object(self._parse_json_object(body))
         if fields is None:
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
-        status, payload = self._apply_confirmation(idempotency_key, sla_id, fields)
+        status, payload = self._apply_confirmation(
+            idempotency_key, sla_id, fields, body
+        )
         self._json(status, payload)
 
-    def _read_confirmation_object(self) -> dict[str, Any] | None:
-        parsed = self._read_json_object()
+    def _validate_confirmation_object(
+        self, parsed: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
         if parsed is None or set(parsed) != CONFIRMATION_FIELDS:
             return None
         party = parsed["party"]
@@ -1818,7 +2031,11 @@ class Handler(BaseHTTPRequestHandler):
         return parsed
 
     def _apply_confirmation(
-        self, idempotency_key: str, sla_id: str, fields: dict[str, Any]
+        self,
+        idempotency_key: str,
+        sla_id: str,
+        fields: dict[str, Any],
+        raw_body: bytes,
     ) -> tuple[HTTPStatus, dict[str, Any]]:
         request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
         with closing(connect(self.server.database_path)) as database:
@@ -1826,13 +2043,36 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 now = int(datetime.now(UTC).timestamp())
                 record = database.execute(
-                    "SELECT sla_id, request_json, status, response_json"
+                    "SELECT sla_id, request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature"
                     " FROM sla_confirmation_idempotency_records WHERE key = ?",
                     (idempotency_key,),
                 ).fetchone()
-                if record is not None:
+                # 升级前已有幂等记录：按原请求先行重放，不补认证数据。
+                if record is not None and record["auth_machine_id"] is None:
                     database.execute("ROLLBACK")
                     if record["sla_id"] == sla_id and record["request_json"] == request_json:
+                        return HTTPStatus(record["status"]), json.loads(record["response_json"])
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                auth = self._parse_sla_auth()
+                if auth is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                ctx = AuthContext(
+                    auth=auth,
+                    body=raw_body,
+                    body_digest=hashlib.sha256(raw_body).hexdigest(),
+                    path=urlsplit(self.path).path,
+                )
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    # 同键更换认证五段或业务请求均为冲突；全同则重放首次响应。
+                    if (
+                        record["sla_id"] == sla_id
+                        and record["request_json"] == request_json
+                        and self._auth_matches(record, auth)
+                    ):
                         return HTTPStatus(record["status"]), json.loads(record["response_json"])
                     return HTTPStatus.CONFLICT, {"error": "conflict"}
                 sla = database.execute(
@@ -1846,9 +2086,17 @@ class Handler(BaseHTTPRequestHandler):
                 expected_actor = (
                     sla["machine_id"] if fields["party"] == "producer" else sla["consumer_id"]
                 )
+                # 资源与签名者：认证机器标识须等于正文 actorId，且 actorId 为对应参与方。
+                if auth.machine_id != fields["actorId"]:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
                 if fields["actorId"] != expected_actor:
                     database.execute("ROLLBACK")
                     return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
+                auth_error = self._verify_request_auth(database, ctx)
+                if auth_error is not None:
+                    database.execute("ROLLBACK")
+                    return auth_error
                 existing = database.execute(
                     "SELECT party FROM sla_confirmations WHERE sla_id = ? AND party = ?",
                     (sla_id, fields["party"]),
@@ -1883,16 +2131,25 @@ class Handler(BaseHTTPRequestHandler):
                         (sla_id,),
                     )
                 payload = {"state": new_state}
+                # 首次业务成功：随机数、确认与幂等结果同事务原子写入。
+                self._consume_nonce(database, ctx)
                 database.execute(
                     "INSERT INTO sla_confirmation_idempotency_records"
-                    "(key, sla_id, request_json, status, response_json)"
-                    " VALUES (?, ?, ?, ?, ?)",
+                    "(key, sla_id, request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         idempotency_key,
                         sla_id,
                         request_json,
                         int(HTTPStatus.OK),
                         json.dumps(payload, separators=(",", ":")),
+                        auth.machine_id,
+                        auth.key_version,
+                        auth.request_time_ms,
+                        auth.nonce,
+                        auth.signature,
                     ),
                 )
                 database.execute("COMMIT")
@@ -2646,15 +2903,22 @@ class Handler(BaseHTTPRequestHandler):
         if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
-        fields = self._read_evidence_object()
+        body = self._read_raw_body()
+        if body is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        fields = self._validate_evidence_object(self._parse_json_object(body))
         if fields is None:
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
-        status, payload = self._apply_evidence(idempotency_key, dispute_id, fields)
+        status, payload = self._apply_evidence(
+            idempotency_key, dispute_id, fields, body
+        )
         self._json(status, payload)
 
-    def _read_evidence_object(self) -> dict[str, Any] | None:
-        parsed = self._read_json_object()
+    def _validate_evidence_object(
+        self, parsed: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
         if parsed is None or set(parsed) != EVIDENCE_FIELDS:
             return None
         evidence_id = parsed["evidenceId"]
@@ -2678,22 +2942,51 @@ class Handler(BaseHTTPRequestHandler):
         return parsed
 
     def _apply_evidence(
-        self, idempotency_key: str, dispute_id: str, fields: dict[str, Any]
+        self,
+        idempotency_key: str,
+        dispute_id: str,
+        fields: dict[str, Any],
+        raw_body: bytes,
     ) -> tuple[HTTPStatus, dict[str, Any]]:
         request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
         with closing(connect(self.server.database_path)) as database:
             database.execute("BEGIN IMMEDIATE")
             try:
                 record = database.execute(
-                    "SELECT dispute_id, request_json, status, response_json"
+                    "SELECT dispute_id, request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature"
                     " FROM dispute_evidence_idempotency_records WHERE key = ?",
                     (idempotency_key,),
                 ).fetchone()
-                if record is not None:
+                # 升级前已有幂等记录：按原请求先行重放，不补认证数据。
+                if record is not None and record["auth_machine_id"] is None:
                     database.execute("ROLLBACK")
                     if (
                         record["dispute_id"] == dispute_id
                         and record["request_json"] == request_json
+                    ):
+                        return HTTPStatus(record["status"]), json.loads(
+                            record["response_json"]
+                        )
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                auth = self._parse_sla_auth()
+                if auth is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                ctx = AuthContext(
+                    auth=auth,
+                    body=raw_body,
+                    body_digest=hashlib.sha256(raw_body).hexdigest(),
+                    path=urlsplit(self.path).path,
+                )
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    # 同键更换认证五段或业务请求均为冲突；全同则重放首次响应。
+                    if (
+                        record["dispute_id"] == dispute_id
+                        and record["request_json"] == request_json
+                        and self._auth_matches(record, auth)
                     ):
                         return HTTPStatus(record["status"]), json.loads(
                             record["response_json"]
@@ -2706,12 +2999,21 @@ class Handler(BaseHTTPRequestHandler):
                 if dispute is None:
                     database.execute("ROLLBACK")
                     return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                # 资源与签名者：认证机器标识须等于正文 actorId 且为付款方或收款方。
+                if auth.machine_id != fields["actorId"]:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
                 if fields["actorId"] not in (
                     dispute["payer_id"],
                     dispute["payee_id"],
                 ):
                     database.execute("ROLLBACK")
                     return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
+                auth_error = self._verify_request_auth(database, ctx)
+                if auth_error is not None:
+                    database.execute("ROLLBACK")
+                    return auth_error
+                # 认证通过后才执行既有业务判定：争议状态、唯一性。
                 if dispute["state"] != "open":
                     database.execute("ROLLBACK")
                     return HTTPStatus.CONFLICT, {"error": "already_resolved"}
@@ -2745,16 +3047,25 @@ class Handler(BaseHTTPRequestHandler):
                     ),
                 )
                 payload = {"evidenceSeq": evidence_seq}
+                # 首次业务成功：随机数、证据与幂等结果同事务原子写入。
+                self._consume_nonce(database, ctx)
                 database.execute(
                     "INSERT INTO dispute_evidence_idempotency_records"
-                    "(key, dispute_id, request_json, status, response_json)"
-                    " VALUES (?, ?, ?, ?, ?)",
+                    "(key, dispute_id, request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         idempotency_key,
                         dispute_id,
                         request_json,
                         int(HTTPStatus.CREATED),
                         json.dumps(payload, separators=(",", ":")),
+                        auth.machine_id,
+                        auth.key_version,
+                        auth.request_time_ms,
+                        auth.nonce,
+                        auth.signature,
                     ),
                 )
                 database.execute("COMMIT")
@@ -2775,15 +3086,20 @@ class Handler(BaseHTTPRequestHandler):
         if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
-        fields = self._read_evidence_proof_object()
+        body = self._read_raw_body()
+        if body is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        fields = self._validate_evidence_proof_object(self._parse_json_object(body))
         if fields is None:
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
-        status, payload = self._apply_evidence_proof(idempotency_key, fields)
+        status, payload = self._apply_evidence_proof(idempotency_key, fields, body)
         self._json(status, payload)
 
-    def _read_evidence_proof_object(self) -> dict[str, Any] | None:
-        parsed = self._read_json_object()
+    def _validate_evidence_proof_object(
+        self, parsed: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
         if parsed is None or set(parsed) != EVIDENCE_PROOF_FIELDS:
             return None
         evidence_seq = parsed["evidenceSeq"]
@@ -2806,22 +3122,44 @@ class Handler(BaseHTTPRequestHandler):
         return parsed
 
     def _apply_evidence_proof(
-        self, idempotency_key: str, fields: dict[str, Any]
+        self, idempotency_key: str, fields: dict[str, Any], raw_body: bytes
     ) -> tuple[HTTPStatus, dict[str, Any]]:
         request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
         evidence_seq = fields["evidenceSeq"]
         with closing(connect(self.server.database_path)) as database:
             database.execute("BEGIN IMMEDIATE")
             try:
-                # 幂等判定先于一切资源查询：同键异证据、签名者或签名均冲突。
                 record = database.execute(
-                    "SELECT request_json, status, response_json"
+                    "SELECT request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature"
                     " FROM dispute_evidence_proof_idempotency_records WHERE key = ?",
                     (idempotency_key,),
                 ).fetchone()
-                if record is not None:
+                # 升级前已有幂等记录：唯一例外，按原请求先行重放，不补认证数据。
+                if record is not None and record["auth_machine_id"] is None:
                     database.execute("ROLLBACK")
                     if record["request_json"] == request_json:
+                        return HTTPStatus(record["status"]), json.loads(
+                            record["response_json"]
+                        )
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                auth = self._parse_sla_auth()
+                if auth is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                ctx = AuthContext(
+                    auth=auth,
+                    body=raw_body,
+                    body_digest=hashlib.sha256(raw_body).hexdigest(),
+                    path=urlsplit(self.path).path,
+                )
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    # 同键更换认证五段或业务请求均为冲突（先于资源查询）；全同重放。
+                    if record["request_json"] == request_json and self._auth_matches(
+                        record, auth
+                    ):
                         return HTTPStatus(record["status"]), json.loads(
                             record["response_json"]
                         )
@@ -2841,13 +3179,22 @@ class Handler(BaseHTTPRequestHandler):
                     database.execute("ROLLBACK")
                     return HTTPStatus.NOT_FOUND, {"error": "not_found"}
                 actor_id = fields["actorId"]
+                # 资源与签名者：认证机器标识须等于正文 actorId 且为付款方或收款方。
+                if auth.machine_id != actor_id:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
                 if actor_id not in (evidence["payer_id"], evidence["payee_id"]):
                     database.execute("ROLLBACK")
                     return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
+                # 时间、密钥与签名、随机数：先于既有业务判定。
+                auth_error = self._verify_request_auth(database, ctx)
+                if auth_error is not None:
+                    database.execute("ROLLBACK")
+                    return auth_error
                 if evidence["state"] != "open":
                     database.execute("ROLLBACK")
                     return HTTPStatus.CONFLICT, {"error": "already_resolved"}
-                # 用登记的 publicKey 按 RFC 8032 验证 Ed25519 签名；
+                # 用登记的 publicKey 按 RFC 8032 验证业务 Ed25519 签名；
                 # 参与方必为已登记机器，查不到公钥等同验签失败。
                 machine = database.execute(
                     "SELECT public_key FROM machines WHERE id = ?",
@@ -2902,15 +3249,24 @@ class Handler(BaseHTTPRequestHandler):
                     "verified": True,
                     "createdAt": created_at_ms,
                 }
+                # 首次业务成功：随机数、证明与幂等结果同事务原子写入。
+                self._consume_nonce(database, ctx)
                 database.execute(
                     "INSERT INTO dispute_evidence_proof_idempotency_records"
-                    "(key, request_json, status, response_json)"
-                    " VALUES (?, ?, ?, ?)",
+                    "(key, request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         idempotency_key,
                         request_json,
                         int(HTTPStatus.CREATED),
                         json.dumps(payload, separators=(",", ":")),
+                        auth.machine_id,
+                        auth.key_version,
+                        auth.request_time_ms,
+                        auth.nonce,
+                        auth.signature,
                     ),
                 )
                 database.execute("COMMIT")
