@@ -48,6 +48,9 @@ DISPUTE_EVIDENCE_SNAPSHOT_ITEM_PATH_PATTERN = re.compile(
 DISPUTE_ADJUDICATION_PROPOSALS_PATH_PATTERN = re.compile(
     r"/v1/disputes/([^/]+)/adjudication-proposals"
 )
+DISPUTE_ESCALATIONS_PATH_PATTERN = re.compile(
+    r"/v1/disputes/([^/]+)/escalations"
+)
 DISPUTE_RESOLUTION_PATH_PATTERN = re.compile(r"/v1/disputes/([^/]+)/resolution")
 EVIDENCE_PROOFS_PATH_PATTERN = re.compile(r"/v1/evidence/([^/]+)/proofs")
 CAPABILITY_FIELDS = {"expectedVersion", "name", "protocol", "region", "unit", "capacity"}
@@ -73,6 +76,7 @@ RESOLUTION_FIELDS = {"decision"}
 EVIDENCE_FIELDS = {"evidenceId", "actorId", "observedAt", "digest"}
 EVIDENCE_SNAPSHOT_FIELDS = {"actorId"}
 ADJUDICATION_PROPOSAL_FIELDS = {"actorId", "snapshotSeq", "decision", "reasonDigest"}
+ESCALATION_FIELDS = {"actorId"}
 EVIDENCE_PROOF_FIELDS = {"evidenceSeq", "actorId", "signature"}
 KEY_ROTATION_FIELDS = {
     "expectedVersion",
@@ -94,11 +98,13 @@ DISPUTE_EVENTS_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTE_EVIDENCE_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTE_EVIDENCE_SNAPSHOTS_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTE_ADJUDICATION_PROPOSALS_QUERY_PARAMS = {"limit", "cursor"}
+DISPUTE_ESCALATIONS_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTES_QUERY_PARAMS = {"accountId", "state", "limit", "cursor"}
 MACHINE_DELEGATIONS_QUERY_PARAMS = {"limit", "cursor"}
 DELEGATION_EVENTS_QUERY_PARAMS = {"limit", "cursor"}
 DELEGATION_CONSUMPTIONS_QUERY_PARAMS = {"limit", "cursor"}
-DISPUTE_SNAPSHOT_STATES = {"open", "released", "refunded"}
+DISPUTE_SNAPSHOT_STATES = {"open", "released", "refunded", "escalated"}
+ESCALATION_DELAY_MS = 86_400_000
 TELEMETRY_TIME_MAX = 2147483648000
 TELEMETRY_DEFAULT_LIMIT = 50
 TELEMETRY_MAX_LIMIT = 100
@@ -303,6 +309,10 @@ class Handler(BaseHTTPRequestHandler):
             self._get_adjudication_proposals(
                 proposals_match.group(1), target.query
             )
+            return
+        escalations_match = DISPUTE_ESCALATIONS_PATH_PATTERN.fullmatch(target.path)
+        if escalations_match is not None:
+            self._get_escalations(escalations_match.group(1), target.query)
             return
         dispute_match = DISPUTE_PATH_PATTERN.fullmatch(target.path)
         if dispute_match is not None:
@@ -778,9 +788,15 @@ class Handler(BaseHTTPRequestHandler):
                     " FROM ledger_entries AS e"
                     " LEFT JOIN fund_deposits AS d"
                     " ON e.kind = 'deposit' AND e.reference_seq = d.deposit_seq"
+                    " LEFT JOIN dispute_escalations AS x"
+                    " ON e.kind = 'dispute_escalation'"
+                    " AND e.reference_seq = x.escalation_seq"
+                    " LEFT JOIN disputes AS ed ON ed.id = x.dispute_id"
                     " LEFT JOIN settlements AS s"
-                    " ON e.kind IN ('settlement', 'dispute_refund')"
-                    " AND e.reference_seq = s.settlement_seq"
+                    " ON (e.kind IN ('settlement', 'dispute_refund')"
+                    " AND e.reference_seq = s.settlement_seq)"
+                    " OR (e.kind = 'dispute_escalation'"
+                    " AND s.settlement_seq = ed.settlement_seq)"
                     " WHERE e.account_id = ? AND e.entry_seq <= ? AND e.entry_seq > ?"
                     " ORDER BY e.entry_seq ASC"
                     " LIMIT ?",
@@ -1571,6 +1587,12 @@ class Handler(BaseHTTPRequestHandler):
         )
         if proposals_match is not None:
             self._create_adjudication_proposal(proposals_match.group(1))
+            return
+        escalations_match = DISPUTE_ESCALATIONS_PATH_PATTERN.fullmatch(
+            urlsplit(self.path).path
+        )
+        if escalations_match is not None:
+            self._create_escalation(escalations_match.group(1))
             return
         resolution_match = DISPUTE_RESOLUTION_PATH_PATTERN.fullmatch(self.path)
         if resolution_match is not None:
@@ -4426,8 +4448,14 @@ class Handler(BaseHTTPRequestHandler):
             or PUBLIC_KEY_PATTERN.fullmatch(actor_id) is None
         ):
             return None
-        # snapshotSeq 为非布尔正整数。
-        if not _bounded_int(parsed["snapshotSeq"], 1, INT64_MAX):
+        # snapshotSeq 为任意非布尔正整数（无上界）；超出存储范围的值进入关联
+        # 检查，与缺失或跨争议快照一样按 404 处理。
+        snapshot_seq = parsed["snapshotSeq"]
+        if (
+            not isinstance(snapshot_seq, int)
+            or isinstance(snapshot_seq, bool)
+            or snapshot_seq < 1
+        ):
             return None
         decision = parsed["decision"]
         if not isinstance(decision, str) or decision not in DISPUTE_DECISIONS:
@@ -4501,11 +4529,14 @@ class Handler(BaseHTTPRequestHandler):
                     database.execute("ROLLBACK")
                     return HTTPStatus.CONFLICT, {"error": "already_resolved"}
                 # 快照须存在且属于本争议；缺失或跨争议引用均为 404。
-                snapshot = database.execute(
-                    "SELECT digest FROM dispute_evidence_snapshots"
-                    " WHERE dispute_id = ? AND snapshot_seq = ?",
-                    (dispute_id, fields["snapshotSeq"]),
-                ).fetchone()
+                # 超出 SQLite 整数范围的序号必然不存在，直接按缺失处理。
+                snapshot = None
+                if fields["snapshotSeq"] <= INT64_MAX:
+                    snapshot = database.execute(
+                        "SELECT digest FROM dispute_evidence_snapshots"
+                        " WHERE dispute_id = ? AND snapshot_seq = ?",
+                        (dispute_id, fields["snapshotSeq"]),
+                    ).fetchone()
                 if snapshot is None:
                     database.execute("ROLLBACK")
                     return HTTPStatus.NOT_FOUND, {"error": "not_found"}
@@ -4663,6 +4694,332 @@ class Handler(BaseHTTPRequestHandler):
             except BaseException:
                 database.execute("ROLLBACK")
                 raise
+
+    def _create_escalation(self, dispute_id: str) -> None:
+        idempotency_key = self.headers.get("Idempotency-Key")
+        if (
+            idempotency_key is None
+            or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None
+        ):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 升级不接受任何查询参数：参数校验先于体校验与争议查询。
+        if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        raw_body = self._read_raw_body()
+        fields = (
+            None
+            if raw_body is None
+            else self._read_escalation_object(raw_body)
+        )
+        if fields is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 仅支持单一 SLA-Auth：头缺失、重复、结构非法或携带代理头均为非法请求，
+        # 且先于争议查询。
+        if self.headers.get_all(SLA_DELEGATION_HEADER):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        auth = self._parse_sla_auth()
+        if auth is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        body_digest = hashlib.sha256(raw_body).hexdigest()
+        status, payload = self._apply_escalation(
+            idempotency_key, dispute_id, fields, auth, body_digest
+        )
+        self._json(status, payload)
+
+    def _read_escalation_object(self, body: bytes) -> dict[str, Any] | None:
+        parsed = self._read_json_object(body)
+        if parsed is None or set(parsed) != ESCALATION_FIELDS:
+            return None
+        actor_id = parsed["actorId"]
+        if (
+            not isinstance(actor_id, str)
+            or PUBLIC_KEY_PATTERN.fullmatch(actor_id) is None
+        ):
+            return None
+        return parsed
+
+    def _apply_escalation(
+        self,
+        idempotency_key: str,
+        dispute_id: str,
+        fields: dict[str, Any],
+        auth: SlaAuth,
+        body_digest: str,
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+        standard_path = urlsplit(self.path).path
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                # 幂等判定先于资源查询：同键更换路径、正文或认证五段均冲突。
+                record = database.execute(
+                    "SELECT dispute_id, request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature"
+                    " FROM dispute_escalation_idempotency_records"
+                    " WHERE key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    if (
+                        record["dispute_id"] == dispute_id
+                        and record["request_json"] == request_json
+                        and self._auth_record_matches(record, auth)
+                    ):
+                        return HTTPStatus(record["status"]), json.loads(
+                            record["response_json"]
+                        )
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                dispute = database.execute(
+                    "SELECT settlement_seq, payer_id, payee_id,"
+                    " amount_micros, state"
+                    " FROM disputes WHERE id = ?",
+                    (dispute_id,),
+                ).fetchone()
+                if dispute is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                actor_id = fields["actorId"]
+                if actor_id not in (dispute["payer_id"], dispute["payee_id"]):
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
+                try:
+                    # 认证机器标识须等于正文 actorId（争议参与方），
+                    # 再依次校验时间、密钥、签名、随机数。
+                    self._verify_request_auth(
+                        database, auth, actor_id, standard_path, body_digest
+                    )
+                    self._check_request_nonce(database, auth)
+                except AuthRejected as rejected:
+                    database.execute("ROLLBACK")
+                    return rejected.status, {"error": rejected.error}
+                # 已有升级记录（异键重复升级）：成功升级与状态变更原子提交，
+                # 故记录存在即已升级；与直接 resolution 并发时仅先提交者生效。
+                existing = database.execute(
+                    "SELECT 1 FROM dispute_escalations WHERE dispute_id = ?",
+                    (dispute_id,),
+                ).fetchone()
+                if existing is not None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "escalation_exists"}
+                # 仅 open 争议可升级；已裁决（含被直接 resolution）为已解决。
+                if dispute["state"] != "open":
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "already_resolved"}
+                # 须恰有两份提案且结果为分歧（第二份为 disagreement）；
+                # 分歧提案不完整为冲突。
+                proposals = database.execute(
+                    "SELECT proposal_seq, snapshot_digest, result, created_at_ms"
+                    " FROM dispute_adjudication_proposals"
+                    " WHERE dispute_id = ? ORDER BY proposal_seq ASC",
+                    (dispute_id,),
+                ).fetchall()
+                if (
+                    len(proposals) != 2
+                    or proposals[1]["result"] != "disagreement"
+                ):
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                # 截止时间固定为第二份提案创建后二十四小时；提前请求为 not_due。
+                deadline_ms = proposals[1]["created_at_ms"] + ESCALATION_DELAY_MS
+                created_at_ms = int(datetime.now(UTC).timestamp() * 1000)
+                if created_at_ms < deadline_ms:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "not_due"}
+                amount = dispute["amount_micros"]
+                balance_record = database.execute(
+                    "SELECT balance_micros FROM ledger_accounts"
+                    " WHERE account_id = ?",
+                    (dispute["payee_id"],),
+                ).fetchone()
+                payee_balance = (
+                    balance_record["balance_micros"]
+                    if balance_record is not None
+                    else 0
+                )
+                # 收款方总余额不足：升级、账本、事件、幂等结果与随机数均不保存。
+                if payee_balance < amount:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "insufficient_funds"}
+                # 全库唯一持久递增升级序号：取写锁后取最大序号 + 1（空表 1）。
+                escalation_seq = database.execute(
+                    "SELECT COALESCE(MAX(escalation_seq), 0) + 1 AS next_seq"
+                    " FROM dispute_escalations"
+                ).fetchone()["next_seq"]
+                # 冻结额自收款方划入外部清算账户：双方各写一笔
+                # dispute_escalation 分录，referenceSeq 取升级序号。
+                payee_after = self._adjust_account(
+                    database, dispute["payee_id"], -amount
+                )
+                clearing_after = self._adjust_account(
+                    database, CLEARING_ACCOUNT_ID, amount
+                )
+                self._record_entry(
+                    database, "dispute_escalation", escalation_seq,
+                    dispute["payee_id"], -amount, payee_after, created_at_ms,
+                )
+                self._record_entry(
+                    database, "dispute_escalation", escalation_seq,
+                    CLEARING_ACCOUNT_ID, amount, clearing_after, created_at_ms,
+                )
+                database.execute(
+                    "UPDATE disputes SET state = 'escalated' WHERE id = ?",
+                    (dispute_id,),
+                )
+                # 生命周期事件与升级、余额、分录及幂等结果同事务原子提交。
+                next_event = database.execute(
+                    "SELECT COALESCE(MAX(event_seq), 0) + 1 AS next_seq"
+                    " FROM dispute_events"
+                ).fetchone()
+                database.execute(
+                    "INSERT INTO dispute_events"
+                    "(event_seq, dispute_id, type, created_at_ms)"
+                    " VALUES (?, ?, 'escalated', ?)",
+                    (next_event["next_seq"], dispute_id, created_at_ms),
+                )
+                # 记录冻结两份提案序号及对应快照摘要。
+                database.execute(
+                    "INSERT INTO dispute_escalations"
+                    "(escalation_seq, dispute_id, first_proposal_seq,"
+                    " second_proposal_seq, first_snapshot_digest,"
+                    " second_snapshot_digest, deadline_ms, amount_micros,"
+                    " created_at_ms)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        escalation_seq,
+                        dispute_id,
+                        proposals[0]["proposal_seq"],
+                        proposals[1]["proposal_seq"],
+                        proposals[0]["snapshot_digest"],
+                        proposals[1]["snapshot_digest"],
+                        deadline_ms,
+                        amount,
+                        created_at_ms,
+                    ),
+                )
+                payload = {
+                    "escalationSeq": escalation_seq,
+                    "deadline": deadline_ms,
+                    "amount": amount,
+                    "createdAt": created_at_ms,
+                }
+                database.execute(
+                    "INSERT INTO dispute_escalation_idempotency_records"
+                    "(key, dispute_id, request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        dispute_id,
+                        request_json,
+                        int(HTTPStatus.CREATED),
+                        json.dumps(payload, separators=(",", ":")),
+                        auth.machine_id,
+                        auth.key_version,
+                        auth.request_time_ms,
+                        auth.nonce,
+                        auth.signature,
+                    ),
+                )
+                # 升级、资金、事件、幂等结果与随机数同一事务原子提交；
+                # 任何失败路径都不到达此处，不消费随机数、不推进序号。
+                self._consume_request_nonce(database, auth)
+                database.execute("COMMIT")
+                return HTTPStatus.CREATED, payload
+            except sqlite3.IntegrityError:
+                # 异键并发升级同一争议：唯一约束兜底，至多一项成功。
+                database.execute("ROLLBACK")
+                return HTTPStatus.CONFLICT, {"error": "escalation_exists"}
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+
+    def _get_escalations(self, dispute_id: str, query: str) -> None:
+        # limit、cursor=cut:lastSeq 的格式、缺省值、认证、错误次序与随机数消费
+        # 均沿用裁决提案集合读取，仅序号改为 escalationSeq。
+        parsed = self._parse_evaluation_query(
+            query, DISPUTE_ESCALATIONS_QUERY_PARAMS
+        )
+        if parsed is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        limit, cursor = parsed
+        if self.headers.get_all(SLA_DELEGATION_HEADER):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        auth = self._parse_sla_auth()
+        if auth is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+
+        def build(database: Any) -> dict[str, Any] | None:
+            # 首页以读事务起点的全库最大升级序号冻结 cut；空库为 0。
+            max_record = database.execute(
+                "SELECT MAX(escalation_seq) AS current_max"
+                " FROM dispute_escalations"
+            ).fetchone()
+            current_max = max_record["current_max"] or 0
+            if cursor is None:
+                cut = current_max
+                last_seq = 0
+            else:
+                cut, last_seq = cursor
+                if cut > current_max:
+                    return None
+                # 锚点须属于目标争议且在当前快照内；属于其他争议或不存在均非法。
+                anchor = database.execute(
+                    "SELECT 1 FROM dispute_escalations"
+                    " WHERE dispute_id = ? AND escalation_seq = ?"
+                    " AND escalation_seq <= ?",
+                    (dispute_id, last_seq, cut),
+                ).fetchone()
+                if anchor is None:
+                    return None
+            rows = database.execute(
+                "SELECT escalation_seq, first_proposal_seq, second_proposal_seq,"
+                " first_snapshot_digest, second_snapshot_digest, deadline_ms,"
+                " amount_micros, created_at_ms"
+                " FROM dispute_escalations"
+                " WHERE dispute_id = ? AND escalation_seq <= ?"
+                " AND escalation_seq > ?"
+                " ORDER BY escalation_seq ASC"
+                " LIMIT ?",
+                (dispute_id, cut, last_seq, limit + 1),
+            ).fetchall()
+            has_next = len(rows) > limit
+            page = rows[:limit]
+            escalations = [
+                {
+                    "escalationSeq": row["escalation_seq"],
+                    "firstProposalSeq": row["first_proposal_seq"],
+                    "firstSnapshotDigest": row["first_snapshot_digest"],
+                    "secondProposalSeq": row["second_proposal_seq"],
+                    "secondSnapshotDigest": row["second_snapshot_digest"],
+                    "deadline": row["deadline_ms"],
+                    "amount": row["amount_micros"],
+                    "createdAt": row["created_at_ms"],
+                }
+                for row in page
+            ]
+            next_cursor = (
+                f"{cut}:{page[-1]['escalation_seq']}" if has_next else None
+            )
+            return {"escalations": escalations, "nextCursor": next_cursor}
+
+        status, error, payload = self._read_snapshot_get(
+            dispute_id, auth, build, HTTPStatus.BAD_REQUEST
+        )
+        if payload is None:
+            self._json(status, {"error": error})
+            return
+        self._json(status, payload)
 
     def _create_evidence_proof(self) -> None:
         idempotency_key = self.headers.get("Idempotency-Key")

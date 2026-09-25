@@ -260,6 +260,7 @@ _SLA_AUTH_EVIDENCE_SNAPSHOT = re.compile(
 _SLA_AUTH_ADJUDICATION_PROPOSAL = re.compile(
     r"^/v1/disputes/([^/]+)/adjudication-proposals$"
 )
+_SLA_AUTH_ESCALATION = re.compile(r"^/v1/disputes/([^/]+)/escalations$")
 
 
 def _sla_auth_actor(path: str, body: bytes) -> str | None:
@@ -271,6 +272,7 @@ def _sla_auth_actor(path: str, body: bytes) -> str | None:
         or _SLA_AUTH_EVIDENCE.fullmatch(path) is not None
         or _SLA_AUTH_EVIDENCE_SNAPSHOT.fullmatch(path) is not None
         or _SLA_AUTH_ADJUDICATION_PROPOSAL.fullmatch(path) is not None
+        or _SLA_AUTH_ESCALATION.fullmatch(path) is not None
         or path == "/v1/evidence-proofs"
     ):
         try:
@@ -8436,6 +8438,17 @@ class AdjudicationProposalTests(_EvidenceScenario, unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertEqual(json.loads(body), {"error": "not_found"})
 
+    def test_out_of_range_snapshot_seq_enters_lookup_and_is_404(self) -> None:
+        self.create_snapshot()
+        # 任意非布尔正整数进入关联检查：超出存储范围的序号与缺失快照同为 404。
+        for index, huge in enumerate((2**63, 2**63 + 1, 2**100)):
+            status, body = self.post_proposal(
+                payload=self.proposal_body(snapshot_seq=huge),
+                key=f"prop-huge-{index}",
+            )
+            self.assertEqual(status, 404, huge)
+            self.assertEqual(json.loads(body), {"error": "not_found"})
+
     def test_actor_must_be_party_and_match_auth_machine(self) -> None:
         self.create_snapshot()
         status, _ = self.post_json(
@@ -8886,6 +8899,811 @@ class AdjudicationProposalTests(_EvidenceScenario, unittest.TestCase):
         with self.assertRaises(HTTPError) as context:
             urlopen(request, timeout=5)
         self.assertEqual(context.exception.code, 400)
+
+
+class EscalationTests(_EvidenceScenario, unittest.TestCase):
+    # 分歧超时升级：恰有两份分歧提案且争议 open 时，双方可在第二份提案
+    # 创建二十四小时后把冻结额移交外部清算账户；读取沿用提案审计入口。
+    def create_disagreement(
+        self, dispute_id: str = "dispute-1", *, backdate_ms: int = 0
+    ) -> tuple[int, str, int, int]:
+        # 建立快照与两份决定不同的提案，返回
+        # （快照序号, 快照摘要, 首份提案序号, 回拨后第二份创建时间）。
+        status, body = self.post_json(
+            f"/v1/disputes/{dispute_id}/evidence-snapshots",
+            {"actorId": self.consumer_id},
+            f"snap-{dispute_id}",
+        )
+        self.assertEqual(status, 201, body)
+        snapshot = json.loads(body)
+        snapshot_seq = snapshot["snapshotSeq"]
+        status, first = self.post_json(
+            f"/v1/disputes/{dispute_id}/adjudication-proposals",
+            {
+                "actorId": self.consumer_id,
+                "snapshotSeq": snapshot_seq,
+                "decision": "refund",
+                "reasonDigest": "cd" * 32,
+            },
+            f"prop-c-{dispute_id}",
+        )
+        self.assertEqual(status, 201, first)
+        status, second = self.post_json(
+            f"/v1/disputes/{dispute_id}/adjudication-proposals",
+            {
+                "actorId": self.machine_id,
+                "snapshotSeq": snapshot_seq,
+                "decision": "release",
+                "reasonDigest": "de" * 32,
+            },
+            f"prop-p-{dispute_id}",
+        )
+        self.assertEqual(status, 201, second)
+        second_payload = json.loads(second)
+        self.assertEqual(second_payload["result"], "disagreement")
+        if backdate_ms:
+            # 测试无法等待二十四小时：直接回拨第二份提案的创建时间。
+            connection = sqlite3.connect(self.server.database_path)
+            try:
+                connection.execute(
+                    "UPDATE dispute_adjudication_proposals"
+                    " SET created_at_ms = created_at_ms - ?"
+                    " WHERE dispute_id = ?",
+                    (backdate_ms, dispute_id),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+        return (
+            snapshot_seq,
+            snapshot["digest"],
+            json.loads(first)["proposalSeq"],
+            second_payload["createdAt"] - backdate_ms,
+        )
+
+    def post_escalation(
+        self,
+        dispute_id: str = "dispute-1",
+        payload: object | None = None,
+        key: str | None = "esc-1",
+    ) -> tuple[int, bytes]:
+        if payload is None:
+            payload = {"actorId": self.consumer_id}
+        return self.post_json(
+            f"/v1/disputes/{dispute_id}/escalations", payload, key
+        )
+
+    def post_escalation_raw(
+        self,
+        path: str,
+        body: bytes,
+        key: str | None,
+        *,
+        seed: bytes | None = None,
+        actor: str | None = None,
+        nonce: str | None = None,
+        request_time_ms: int | None = None,
+        delegation: str | None = None,
+    ) -> tuple[int, bytes]:
+        request = Request(self.url(path), data=body, method="POST")
+        if key is not None:
+            request.add_header("Idempotency-Key", key)
+        if delegation is not None:
+            request.add_header("SLA-Delegation", delegation)
+        elif seed is not None:
+            request.add_header(
+                "SLA-Auth",
+                make_sla_auth(
+                    self.server,
+                    key,
+                    seed,
+                    actor if actor is not None else self.consumer_id,
+                    "POST",
+                    urlsplit(path).path,
+                    body,
+                    1,
+                    request_time_ms=request_time_ms,
+                    nonce=nonce,
+                ),
+            )
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def get_escalations(
+        self,
+        path: str,
+        *,
+        seed: bytes | None = None,
+        actor: str | None = None,
+        nonce: str | None = None,
+        omit_auth: bool = False,
+    ) -> tuple[int, bytes]:
+        # 升级记录审计读取为 GET 且无正文；标准路径不含查询串，摘要按空字节计算。
+        request = Request(self.url(path), data=b"", method="GET")
+        if not omit_auth:
+            if nonce is None:
+                nonce = f"nonce-esc-audit-{time.time_ns()}"
+            request.add_header(
+                "SLA-Auth",
+                make_sla_auth(
+                    self.server,
+                    None,
+                    seed if seed is not None else PUBLIC_KEY_SEED_B,
+                    actor if actor is not None else self.consumer_id,
+                    "GET",
+                    urlsplit(path).path,
+                    b"",
+                    1,
+                    nonce=nonce,
+                ),
+            )
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def escalations_path(self, dispute_id: str = "dispute-1") -> str:
+        return f"/v1/disputes/{dispute_id}/escalations"
+
+    def dispute_row(self, dispute_id: str = "dispute-1") -> tuple:
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            return connection.execute(
+                "SELECT state FROM disputes WHERE id = ?", (dispute_id,)
+            ).fetchone()
+        finally:
+            connection.close()
+
+    # ---- 成功路径：资金移交、状态、事件、账本 ----
+
+    def test_escalation_moves_frozen_funds_to_clearing(self) -> None:
+        _, _, _, second_created = self.create_disagreement(
+            backdate_ms=90_000_000
+        )
+        status, body = self.post_escalation()
+        self.assertEqual(status, 201, body)
+        payload = json.loads(body)
+        self.assertEqual(
+            list(payload), ["escalationSeq", "deadline", "amount", "createdAt"]
+        )
+        self.assertEqual(payload["escalationSeq"], 1)
+        self.assertEqual(payload["deadline"], second_created + 86_400_000)
+        self.assertEqual(payload["amount"], 1000)
+        self.assertIsInstance(payload["createdAt"], int)
+        self.assertGreaterEqual(payload["createdAt"], payload["deadline"])
+        # 争议状态与生命周期事件。
+        status, dispute = self.get_json("/v1/disputes/dispute-1")
+        self.assertEqual(dispute["state"], "escalated")
+        status, events = self.get_json("/v1/disputes/dispute-1/events")
+        self.assertEqual(
+            [event["type"] for event in events["events"]],
+            ["opened", "escalated"],
+        )
+        # 收款方（机器）划出 1000，外部清算账户等额入账。
+        status, ledger = self.get_json(
+            f"/v1/accounts/{self.machine_id}/ledger"
+        )
+        escalations = [
+            entry for entry in ledger["entries"]
+            if entry["kind"] == "dispute_escalation"
+        ]
+        self.assertEqual(len(escalations), 1)
+        entry = escalations[0]
+        self.assertEqual(
+            list(entry),
+            [
+                "entrySeq", "kind", "referenceSeq", "reference", "slaId",
+                "evaluationSeq", "delta", "balanceAfter", "createdAt",
+            ],
+        )
+        self.assertEqual(entry["referenceSeq"], 1)
+        self.assertIsNone(entry["reference"])
+        self.assertEqual(entry["slaId"], "sla-1")
+        self.assertEqual(entry["evaluationSeq"], 1)
+        self.assertEqual(entry["delta"], -1000)
+        self.assertEqual(entry["balanceAfter"], 0)
+        status, clearing = self.get_json(
+            "/v1/accounts/external:clearing/ledger"
+        )
+        clearing_entries = [
+            entry for entry in clearing["entries"]
+            if entry["kind"] == "dispute_escalation"
+        ]
+        self.assertEqual(len(clearing_entries), 1)
+        self.assertEqual(clearing_entries[0]["delta"], 1000)
+        self.assertEqual(clearing_entries[0]["referenceSeq"], 1)
+
+    def test_payee_may_escalate(self) -> None:
+        self.create_disagreement(backdate_ms=90_000_000)
+        status, body = self.post_escalation(
+            payload={"actorId": self.machine_id}, key="esc-p"
+        )
+        self.assertEqual(status, 201, body)
+        self.assertEqual(json.loads(body)["escalationSeq"], 1)
+
+    def test_escalation_sequences_are_global_across_disputes(self) -> None:
+        self.create_disagreement(backdate_ms=90_000_000)
+        status, body = self.post_escalation(key="esc-d1")
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(body)["escalationSeq"], 1)
+        self.create_second_dispute()
+        self.create_disagreement("dispute-2", backdate_ms=90_000_000)
+        status, body = self.post_escalation("dispute-2", key="esc-d2")
+        self.assertEqual(status, 201, body)
+        self.assertEqual(json.loads(body)["escalationSeq"], 2)
+        # 各自争议的升级记录只含本争议项。
+        status, first = self.get_escalations(self.escalations_path())
+        self.assertEqual(
+            [item["escalationSeq"] for item in json.loads(first)["escalations"]],
+            [1],
+        )
+        status, second = self.get_escalations(self.escalations_path("dispute-2"))
+        self.assertEqual(
+            [item["escalationSeq"] for item in json.loads(second)["escalations"]],
+            [2],
+        )
+
+    # ---- 前置条件错误 ----
+
+    def test_not_due_before_deadline(self) -> None:
+        self.create_disagreement()
+        status, body = self.post_escalation()
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "not_due"})
+        # 失败无副作用：争议仍 open，无事件、无升级记录。
+        self.assertEqual(self.dispute_row()[0], "open")
+        status, events = self.get_json("/v1/disputes/dispute-1/events")
+        self.assertEqual([event["type"] for event in events["events"]], ["opened"])
+        status, payload = self.get_escalations(self.escalations_path())
+        self.assertEqual(json.loads(payload)["escalations"], [])
+
+    def test_deadline_boundary_is_due(self) -> None:
+        # 回拨恰好二十四小时：到达截止时间即可升级。
+        self.create_disagreement(backdate_ms=86_400_000)
+        status, body = self.post_escalation()
+        self.assertEqual(status, 201, body)
+
+    def test_incomplete_proposals_conflict(self) -> None:
+        # 无提案。
+        status, body = self.post_escalation(key="esc-none")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+        # 仅一份提案。
+        status, snap = self.post_json(
+            "/v1/disputes/dispute-1/evidence-snapshots",
+            {"actorId": self.consumer_id},
+            "snap-single",
+        )
+        self.assertEqual(status, 201)
+        status, _ = self.post_json(
+            "/v1/disputes/dispute-1/adjudication-proposals",
+            {
+                "actorId": self.consumer_id,
+                "snapshotSeq": json.loads(snap)["snapshotSeq"],
+                "decision": "refund",
+                "reasonDigest": "cd" * 32,
+            },
+            "prop-single",
+        )
+        self.assertEqual(status, 201)
+        status, body = self.post_escalation(key="esc-single")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_already_resolved_dispute_rejects_escalation(self) -> None:
+        self.create_disagreement(backdate_ms=90_000_000)
+        status, _ = self.post_json(
+            "/v1/disputes/dispute-1/resolution",
+            {"decision": "release"},
+            "resolve-1",
+        )
+        self.assertEqual(status, 200)
+        status, body = self.post_escalation()
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "already_resolved"})
+
+    def test_repeat_escalation_with_different_key_is_escalation_exists(self) -> None:
+        self.create_disagreement(backdate_ms=90_000_000)
+        status, first = self.post_escalation(key="esc-first")
+        self.assertEqual(status, 201)
+        status, body = self.post_escalation(
+            payload={"actorId": self.machine_id}, key="esc-again"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "escalation_exists"})
+        # 同键重放仍返回首次响应字节。
+        status, replay = self.post_escalation(key="esc-first")
+        self.assertEqual(status, 201)
+        self.assertEqual(replay, first)
+
+    def test_insufficient_funds_saves_nothing(self) -> None:
+        self.create_disagreement(backdate_ms=90_000_000)
+        # 收款方（机器）总余额被提空，升级必然不足。
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            connection.execute(
+                "UPDATE ledger_accounts SET balance_micros = 0"
+                " WHERE account_id = ?",
+                (self.machine_id,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        raw = json.dumps({"actorId": self.consumer_id}).encode()
+        fixed_nonce = "nonce-esc-insufficient-00001"
+        status, body = self.post_escalation_raw(
+            self.escalations_path(), raw, "esc-fail",
+            seed=PUBLIC_KEY_SEED_B, actor=self.consumer_id, nonce=fixed_nonce,
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "insufficient_funds"})
+        # 升级记录、事件、幂等结果均不保存；争议保持 open 与冻结。
+        self.assertEqual(self.dispute_row()[0], "open")
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM dispute_escalations"
+            ).fetchone()[0]
+            idem = connection.execute(
+                "SELECT COUNT(*) FROM dispute_escalation_idempotency_records"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(count, 0)
+        self.assertEqual(idem, 0)
+        status, events = self.get_json("/v1/disputes/dispute-1/events")
+        self.assertEqual([event["type"] for event in events["events"]], ["opened"])
+        # 失败不消费随机数：同随机数重试仍是余额不足而非 replay_detected。
+        status, body = self.post_escalation_raw(
+            self.escalations_path(), raw, "esc-fail-2",
+            seed=PUBLIC_KEY_SEED_B, actor=self.consumer_id, nonce=fixed_nonce,
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "insufficient_funds"})
+        # 补足余额后同键重试成功。
+        status, _ = self.post_json(
+            f"/v1/funds/{self.machine_id}",
+            {"amountMicros": 5000, "reference": "ref-fund-esc"},
+            "fund-esc",
+        )
+        self.assertEqual(status, 201)
+        status, body = self.post_escalation_raw(
+            self.escalations_path(), raw, "esc-fail",
+            seed=PUBLIC_KEY_SEED_B, actor=self.consumer_id,
+            nonce="nonce-esc-retry-0000001",
+        )
+        self.assertEqual(status, 201, body)
+
+    # ---- 资源、身份与认证 ----
+
+    def test_missing_dispute_is_404(self) -> None:
+        status, body = self.post_escalation(
+            dispute_id="dispute-ghost", key="esc-ghost"
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+
+    def test_actor_must_be_party_and_match_auth_machine(self) -> None:
+        self.create_disagreement(backdate_ms=90_000_000)
+        status, _ = self.post_json(
+            "/v1/machines", {"publicKey": PUBLIC_KEY_C}, "register-3"
+        )
+        self.assertEqual(status, 201)
+        stranger = machine_id(PUBLIC_KEY_C)
+        raw = json.dumps({"actorId": stranger}).encode()
+        status, body = self.post_escalation_raw(
+            self.escalations_path(), raw, "esc-stranger",
+            seed=PUBLIC_KEY_SEED_C, actor=stranger,
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body), {"error": "forbidden"})
+        # 正文 actorId 与认证机器不一致：生产方密钥签消费方身份。
+        raw = json.dumps({"actorId": self.consumer_id}).encode()
+        status, body = self.post_escalation_raw(
+            self.escalations_path(), raw, "esc-mismatch",
+            seed=PRODUCER_SEED, actor=self.machine_id,
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body), {"error": "forbidden"})
+
+    def test_invalid_requests(self) -> None:
+        self.create_disagreement(backdate_ms=90_000_000)
+        valid = {"actorId": self.consumer_id}
+        cases = [
+            b"",
+            b"{not json",
+            json.dumps({}).encode(),
+            json.dumps({**valid, "extra": 1}).encode(),
+            json.dumps({"actorId": "zz"}).encode(),
+            json.dumps({"actorId": self.consumer_id.upper()}).encode(),
+            json.dumps({"actorId": 1}).encode(),
+        ]
+        for index, bad in enumerate(cases):
+            status, body = self.post_escalation_raw(
+                self.escalations_path(), bad, f"esc-bad-{index}",
+                seed=PUBLIC_KEY_SEED_B, actor=self.consumer_id,
+            )
+            self.assertEqual(status, 400, bad)
+            self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        # 缺少幂等头。
+        status, _ = self.post_escalation_raw(
+            self.escalations_path(), json.dumps(valid).encode(), None,
+            seed=PUBLIC_KEY_SEED_B, actor=self.consumer_id,
+        )
+        self.assertEqual(status, 400)
+        # 查询参数非法先于争议查询。
+        status, _ = self.post_escalation_raw(
+            self.escalations_path() + "?x=1", json.dumps(valid).encode(),
+            "esc-query", seed=PUBLIC_KEY_SEED_B, actor=self.consumer_id,
+        )
+        self.assertEqual(status, 400)
+        # 缺少认证头。
+        status, _ = self.post_escalation_raw(
+            self.escalations_path(), json.dumps(valid).encode(), "esc-no-auth",
+        )
+        self.assertEqual(status, 400)
+        # 携带代理头同样非法。
+        status, _ = self.post_escalation_raw(
+            self.escalations_path(), json.dumps(valid).encode(),
+            "esc-delegation",
+            delegation="del-1;0;0;nonce-delegation-00000002;" + "ab" * 64,
+        )
+        self.assertEqual(status, 400)
+
+    def test_stale_request_is_401(self) -> None:
+        self.create_disagreement(backdate_ms=90_000_000)
+        raw = json.dumps({"actorId": self.consumer_id}).encode()
+        stale = int(time.time() * 1000) - 301_000
+        status, body = self.post_escalation_raw(
+            self.escalations_path(), raw, "esc-stale",
+            seed=PUBLIC_KEY_SEED_B, actor=self.consumer_id,
+            request_time_ms=stale,
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(body), {"error": "stale_request"})
+
+    def test_nonce_replay_detected(self) -> None:
+        self.create_disagreement(backdate_ms=90_000_000)
+        raw = json.dumps({"actorId": self.consumer_id}).encode()
+        fixed = "nonce-esc-fixed-00000000001"
+        status, _ = self.post_escalation_raw(
+            self.escalations_path(), raw, "esc-nonce-1",
+            seed=PUBLIC_KEY_SEED_B, actor=self.consumer_id, nonce=fixed,
+        )
+        self.assertEqual(status, 201)
+        status, body = self.post_escalation_raw(
+            self.escalations_path(), raw, "esc-nonce-2",
+            seed=PUBLIC_KEY_SEED_B, actor=self.consumer_id, nonce=fixed,
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "replay_detected"})
+
+    def test_same_key_conflict_and_replay_bytes(self) -> None:
+        self.create_disagreement(backdate_ms=90_000_000)
+        status, first = self.post_escalation(key="esc-1")
+        self.assertEqual(status, 201)
+        # 同键重放原字节。
+        status, replay = self.post_escalation(key="esc-1")
+        self.assertEqual(status, 201)
+        self.assertEqual(replay, first)
+        # 同键异正文冲突，且先于争议查询。
+        status, body = self.post_escalation(
+            payload={"actorId": self.machine_id}, key="esc-1"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+        status, body = self.post_escalation(
+            dispute_id="dispute-other", key="esc-1"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+        # 同键异认证五段冲突。
+        raw = json.dumps({"actorId": self.consumer_id}).encode()
+        status, body = self.post_escalation_raw(
+            self.escalations_path(), raw, "esc-1",
+            seed=PUBLIC_KEY_SEED_B, actor=self.consumer_id,
+            nonce="nonce-esc-replay-other-0001",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_replay_survives_restart(self) -> None:
+        self.create_disagreement(backdate_ms=90_000_000)
+        status, first = self.post_escalation(key="esc-1")
+        self.assertEqual(status, 201)
+        self.restart()
+        status, replay = self.post_escalation(key="esc-1")
+        self.assertEqual(status, 201)
+        self.assertEqual(replay, first)
+        status, body = self.get_escalations(self.escalations_path())
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            json.loads(body)["escalations"][0]["escalationSeq"],
+            json.loads(first)["escalationSeq"],
+        )
+
+    # ---- 并发 ----
+
+    def test_concurrent_escalations_single_winner(self) -> None:
+        self.create_disagreement(backdate_ms=90_000_000)
+        barrier = threading.Barrier(2)
+        results: list[dict] = []
+        lock = threading.Lock()
+
+        def submit(seed: bytes, actor: str, key: str) -> None:
+            barrier.wait()
+            raw = json.dumps({"actorId": actor}).encode()
+            status, body = self.post_escalation_raw(
+                self.escalations_path(), raw, key, seed=seed, actor=actor,
+            )
+            with lock:
+                results.append({"status": status, "body": json.loads(body)})
+
+        threads = [
+            threading.Thread(
+                target=submit,
+                args=(PUBLIC_KEY_SEED_B, self.consumer_id, "esc-race-c"),
+            ),
+            threading.Thread(
+                target=submit,
+                args=(PRODUCER_SEED, self.machine_id, "esc-race-p"),
+            ),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        statuses = sorted(result["status"] for result in results)
+        self.assertEqual(statuses, [201, 409])
+        loser = [r for r in results if r["status"] == 409][0]
+        self.assertEqual(loser["body"], {"error": "escalation_exists"})
+        # 资金只移动一次，事件仅一条。
+        status, ledger = self.get_json(
+            f"/v1/accounts/{self.machine_id}/ledger"
+        )
+        moves = [
+            entry for entry in ledger["entries"]
+            if entry["kind"] == "dispute_escalation"
+        ]
+        self.assertEqual(len(moves), 1)
+        status, events = self.get_json("/v1/disputes/dispute-1/events")
+        self.assertEqual(
+            [event["type"] for event in events["events"]],
+            ["opened", "escalated"],
+        )
+
+    def test_concurrent_escalation_and_resolution_single_winner(self) -> None:
+        self.create_disagreement(backdate_ms=90_000_000)
+        barrier = threading.Barrier(2)
+        results: list[int] = []
+        lock = threading.Lock()
+
+        def escalate() -> None:
+            barrier.wait()
+            status, _ = self.post_escalation(key="esc-race")
+            with lock:
+                results.append(status)
+
+        def resolve() -> None:
+            barrier.wait()
+            status, _ = self.post_json(
+                "/v1/disputes/dispute-1/resolution",
+                {"decision": "release"},
+                "resolve-race",
+            )
+            with lock:
+                results.append(status)
+
+        threads = [
+            threading.Thread(target=escalate),
+            threading.Thread(target=resolve),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        # 仅先提交者生效：一个 2xx（升级 201 或裁决 200），另一个 409。
+        self.assertEqual(len(results), 2)
+        self.assertIn(409, results)
+        self.assertTrue(any(code in (200, 201) for code in results))
+        status, dispute = self.get_json("/v1/disputes/dispute-1")
+        self.assertIn(dispute["state"], ("escalated", "released"))
+        status, events = self.get_json("/v1/disputes/dispute-1/events")
+        self.assertEqual(len(events["events"]), 2)
+
+    # ---- 升级后的既有入口行为 ----
+
+    def test_reads_and_writes_after_escalation(self) -> None:
+        self.create_disagreement(backdate_ms=90_000_000)
+        status, _ = self.post_escalation()
+        self.assertEqual(status, 201)
+        # 详情、集合与事件读取展示 escalated。
+        status, dispute = self.get_json("/v1/disputes/dispute-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(dispute["state"], "escalated")
+        status, collection = self.get_json(
+            f"/v1/disputes?accountId={self.machine_id}&state=escalated"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(len(collection["disputes"]), 1)
+        self.assertEqual(collection["disputes"][0]["state"], "escalated")
+        self.assertIsNotNone(collection["disputes"][0]["resolvedEventSeq"])
+        status, events = self.get_json("/v1/disputes/dispute-1/events")
+        self.assertEqual(events["events"][-1]["type"], "escalated")
+        # 既有 resolution 此后返回 already_resolved。
+        status, body = self.post_json(
+            "/v1/disputes/dispute-1/resolution",
+            {"decision": "refund"},
+            "resolve-late",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "already_resolved"})
+        # 证据与提案写入口同样视为已裁决。
+        status, body = self.post_evidence(
+            payload=self.evidence_body(evidenceId="ev-late"),
+            key="evidence-late",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "already_resolved"})
+        status, body = self.post_json(
+            "/v1/disputes/dispute-1/adjudication-proposals",
+            {
+                "actorId": self.consumer_id,
+                "snapshotSeq": 1,
+                "decision": "refund",
+                "reasonDigest": "cd" * 32,
+            },
+            "prop-late",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "already_resolved"})
+
+    # ---- GET 集合 ----
+
+    def test_get_collection_empty(self) -> None:
+        status, body = self.get_escalations(self.escalations_path())
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            json.loads(body), {"escalations": [], "nextCursor": None}
+        )
+
+    def test_get_collection_returns_frozen_proposals(self) -> None:
+        snapshot_seq, snapshot_digest, first_seq, second_created = (
+            self.create_disagreement(backdate_ms=90_000_000)
+        )
+        status, created = self.post_escalation()
+        self.assertEqual(status, 201)
+        created_payload = json.loads(created)
+        status, body = self.get_escalations(self.escalations_path())
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(list(payload), ["escalations", "nextCursor"])
+        self.assertEqual(len(payload["escalations"]), 1)
+        item = payload["escalations"][0]
+        self.assertEqual(
+            list(item),
+            [
+                "escalationSeq", "firstProposalSeq", "firstSnapshotDigest",
+                "secondProposalSeq", "secondSnapshotDigest", "deadline",
+                "amount", "createdAt",
+            ],
+        )
+        self.assertEqual(item["escalationSeq"], 1)
+        self.assertEqual(item["firstProposalSeq"], first_seq)
+        self.assertEqual(item["secondProposalSeq"], first_seq + 1)
+        # 两份提案均引用同一快照：冻结摘要等于该快照摘要且彼此相等。
+        self.assertEqual(item["firstSnapshotDigest"], item["secondSnapshotDigest"])
+        self.assertEqual(item["firstSnapshotDigest"], snapshot_digest)
+        self.assertEqual(item["deadline"], second_created + 86_400_000)
+        self.assertEqual(item["amount"], 1000)
+        self.assertEqual(item["createdAt"], created_payload["createdAt"])
+        self.assertIsNone(payload["nextCursor"])
+
+    def test_get_collection_errors_and_nonce_consumption(self) -> None:
+        self.create_disagreement(backdate_ms=90_000_000)
+        self.assertEqual(self.post_escalation()[0], 201)
+        for query in (
+            "limit=0", "limit=101", "limit=01", "limit=1&limit=2",
+            "unknown=1", "cursor=1", "cursor=x:1", "cursor=1:y",
+        ):
+            status, body = self.get_escalations(
+                self.escalations_path() + f"?{query}"
+            )
+            self.assertEqual(status, 400, query)
+            self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        # 参数错误先于争议查询。
+        status, _ = self.get_escalations(
+            self.escalations_path("dispute-missing") + "?limit=0"
+        )
+        self.assertEqual(status, 400)
+        # 争议不存在 404；非参与方 403。
+        status, body = self.get_escalations(
+            self.escalations_path("dispute-missing")
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+        status, _ = self.post_json(
+            "/v1/machines", {"publicKey": PUBLIC_KEY_C}, "register-3"
+        )
+        self.assertEqual(status, 201)
+        status, body = self.get_escalations(
+            self.escalations_path(),
+            seed=PUBLIC_KEY_SEED_C, actor=machine_id(PUBLIC_KEY_C),
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body), {"error": "forbidden"})
+        # cut 超前 / 锚点不属于该争议为 400。
+        self.create_second_dispute()
+        self.create_disagreement("dispute-2", backdate_ms=90_000_000)
+        self.assertEqual(self.post_escalation("dispute-2", key="esc-d2")[0], 201)
+        status, body = self.get_escalations(
+            self.escalations_path() + "?cursor=99:1"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        status, body = self.get_escalations(
+            self.escalations_path() + "?cursor=2:2"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        # 成功读取消费随机数；失败（cut 超前）不消费。
+        fixed = "nonce-esc-get-0000000000001"
+        status, _ = self.get_escalations(
+            self.escalations_path() + "?cursor=99:1", nonce=fixed
+        )
+        self.assertEqual(status, 400)
+        status, _ = self.get_escalations(
+            self.escalations_path() + "?cursor=99:1", nonce=fixed
+        )
+        self.assertEqual(status, 400)
+        status, body = self.get_escalations(
+            self.escalations_path(), nonce=fixed
+        )
+        self.assertEqual(status, 200, body)
+        status, body = self.get_escalations(
+            self.escalations_path(), nonce=fixed
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "replay_detected"})
+        # 缺少认证头为 400 且先于争议查询；携带代理头同样非法。
+        status, _ = self.get_escalations(
+            self.escalations_path("dispute-missing"), omit_auth=True
+        )
+        self.assertEqual(status, 400)
+        request = Request(
+            self.url(self.escalations_path()), data=b"", method="GET"
+        )
+        request.add_header(
+            "SLA-Delegation", "del-1;0;0;nonce-delegation-00000003;" + "ab" * 64
+        )
+        with self.assertRaises(HTTPError) as context:
+            urlopen(request, timeout=5)
+        self.assertEqual(context.exception.code, 400)
+
+    def test_get_collection_cursor_cut_isolates_later_escalations(self) -> None:
+        self.create_disagreement(backdate_ms=90_000_000)
+        self.assertEqual(self.post_escalation(key="esc-d1")[0], 201)
+        # 第二争议的升级推进全库最大序号；旧 cut=1 的续页不得看到新升级。
+        self.create_second_dispute()
+        self.create_disagreement("dispute-2", backdate_ms=90_000_000)
+        self.assertEqual(self.post_escalation("dispute-2", key="esc-d2")[0], 201)
+        status, continuation = self.get_escalations(
+            self.escalations_path() + "?cursor=1:1"
+        )
+        self.assertEqual(status, 200)
+        payload = json.loads(continuation)
+        self.assertEqual(payload["escalations"], [])
+        self.assertIsNone(payload["nextCursor"])
+        # 全新首页取新 cut，但 dispute-1 仍只含自己的升级。
+        status, fresh = self.get_escalations(self.escalations_path())
+        self.assertEqual(
+            [item["escalationSeq"] for item in json.loads(fresh)["escalations"]],
+            [1],
+        )
 
 
 class EvidenceSnapshotStorageMigrationTests(unittest.TestCase):
