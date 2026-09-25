@@ -39,6 +39,12 @@ FUNDS_PATH_PATTERN = re.compile(r"/v1/funds/([^/]+)")
 DISPUTE_PATH_PATTERN = re.compile(r"/v1/disputes/([^/]+)")
 DISPUTE_EVENTS_PATH_PATTERN = re.compile(r"/v1/disputes/([^/]+)/events")
 DISPUTE_EVIDENCE_PATH_PATTERN = re.compile(r"/v1/disputes/([^/]+)/evidence")
+DISPUTE_EVIDENCE_SNAPSHOTS_PATH_PATTERN = re.compile(
+    r"/v1/disputes/([^/]+)/evidence-snapshots"
+)
+DISPUTE_EVIDENCE_SNAPSHOT_PATH_PATTERN = re.compile(
+    r"/v1/disputes/([^/]+)/evidence-snapshots/([^/]+)"
+)
 DISPUTE_RESOLUTION_PATH_PATTERN = re.compile(r"/v1/disputes/([^/]+)/resolution")
 EVIDENCE_PROOFS_PATH_PATTERN = re.compile(r"/v1/evidence/([^/]+)/proofs")
 CAPABILITY_FIELDS = {"expectedVersion", "name", "protocol", "region", "unit", "capacity"}
@@ -62,6 +68,7 @@ SETTLEMENT_FIELDS = {"slaId", "evaluationSeq"}
 DISPUTE_FIELDS = {"id", "settlementSeq", "claimantId"}
 RESOLUTION_FIELDS = {"decision"}
 EVIDENCE_FIELDS = {"evidenceId", "actorId", "observedAt", "digest"}
+EVIDENCE_SNAPSHOT_FIELDS = {"actorId"}
 EVIDENCE_PROOF_FIELDS = {"evidenceSeq", "actorId", "signature"}
 KEY_ROTATION_FIELDS = {
     "expectedVersion",
@@ -81,6 +88,7 @@ SETTLEMENT_QUERY_PARAMS = {"limit", "cursor"}
 LEDGER_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTE_EVENTS_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTE_EVIDENCE_QUERY_PARAMS = {"limit", "cursor"}
+EVIDENCE_SNAPSHOT_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTES_QUERY_PARAMS = {"accountId", "state", "limit", "cursor"}
 MACHINE_DELEGATIONS_QUERY_PARAMS = {"limit", "cursor"}
 DELEGATION_EVENTS_QUERY_PARAMS = {"limit", "cursor"}
@@ -157,6 +165,10 @@ class AuthRejected(Exception):
         super().__init__(error)
         self.status = status
         self.error = error
+
+
+class _SnapshotNotFound(Exception):
+    """单笔快照读取中资源（快照）不存在：穿透共用读事务后转为 404。"""
 
 
 class ApiServer(ThreadingHTTPServer):
@@ -257,6 +269,24 @@ class Handler(BaseHTTPRequestHandler):
         if dispute_evidence_match is not None:
             self._get_dispute_evidence(
                 dispute_evidence_match.group(1), target.query
+            )
+            return
+        dispute_snapshot_single_match = (
+            DISPUTE_EVIDENCE_SNAPSHOT_PATH_PATTERN.fullmatch(target.path)
+        )
+        if dispute_snapshot_single_match is not None:
+            self._get_evidence_snapshot(
+                dispute_snapshot_single_match.group(1),
+                dispute_snapshot_single_match.group(2),
+                target.query,
+            )
+            return
+        dispute_snapshots_match = (
+            DISPUTE_EVIDENCE_SNAPSHOTS_PATH_PATTERN.fullmatch(target.path)
+        )
+        if dispute_snapshots_match is not None:
+            self._get_evidence_snapshots(
+                dispute_snapshots_match.group(1), target.query
             )
             return
         evidence_proofs_match = EVIDENCE_PROOFS_PATH_PATTERN.fullmatch(target.path)
@@ -982,6 +1012,182 @@ class Handler(BaseHTTPRequestHandler):
             {"evidence": evidence, "nextCursor": next_cursor},
         )
 
+    def _snapshot_payload(self, row: Any) -> dict[str, Any]:
+        # 单笔与集合读取均返回创建时的完整对象；evidence 取自不可变快照字节。
+        document = json.loads(row["snapshot_json"].decode("utf-8"))
+        return {
+            "snapshotSeq": row["snapshot_seq"],
+            "evidenceSeqUpperBound": row["evidence_cut"],
+            "proofSeqUpperBound": row["proof_cut"],
+            "digest": row["digest"],
+            "creatorId": row["creator_id"],
+            "createdAt": row["created_at_ms"],
+            "evidence": document["evidence"],
+        }
+
+    def _authenticated_snapshot_read(
+        self,
+        path: str,
+        auth: SlaAuth,
+        actor_id: str,
+        dispute_id: str,
+        build_result: Any,
+    ) -> tuple[HTTPStatus, str | None, Any]:
+        # 快照审计读取共用判定：资源（争议）、参与方身份、认证有效性、随机数、
+        # 游标关联。GET 无正文：正文摘要按空字节 SHA-256 计算。只有全部判定
+        # 通过、读取完成后才在同一写事务内消费随机数；任何失败均不消费。
+        body_digest = hashlib.sha256(b"").hexdigest()
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                dispute = database.execute(
+                    "SELECT payer_id, payee_id FROM disputes WHERE id = ?",
+                    (dispute_id,),
+                ).fetchone()
+                if dispute is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.NOT_FOUND, "not_found", None
+                if actor_id not in (dispute["payer_id"], dispute["payee_id"]):
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.FORBIDDEN, "forbidden", None
+                try:
+                    self._verify_request_auth(
+                        database, auth, actor_id, path, body_digest
+                    )
+                    self._check_request_nonce(database, auth)
+                except AuthRejected as rejected:
+                    database.execute("ROLLBACK")
+                    return rejected.status, rejected.error, None
+                result = build_result(database)
+                if result is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.BAD_REQUEST, "invalid_request", None
+                self._consume_request_nonce(database, auth)
+                database.execute("COMMIT")
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+        return HTTPStatus.OK, None, result
+
+    def _get_evidence_snapshots(self, dispute_id: str, query: str) -> None:
+        # 分页参数、limit、cursor=cut:lastSeq 的格式与范围沿用评估历史查询。
+        parsed = self._parse_evaluation_query(
+            query, EVIDENCE_SNAPSHOT_QUERY_PARAMS
+        )
+        if parsed is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        limit, cursor = parsed
+        # 认证结构先于资源检查；GET 无正文。仅接受单一 SLA-Auth。
+        if self.headers.get_all(SLA_DELEGATION_HEADER):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        auth = self._parse_sla_auth()
+        if auth is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        actor_id = auth.machine_id
+        standard_path = urlsplit(self.path).path
+
+        def build_result(database: Any) -> dict[str, Any] | None:
+            # 首页以读事务起点的全库最大快照序号冻结快照。
+            max_record = database.execute(
+                "SELECT MAX(snapshot_seq) AS current_max"
+                " FROM dispute_evidence_snapshots"
+            ).fetchone()
+            current_max = max_record["current_max"] or 0
+            if cursor is None:
+                cut = current_max
+                last_seq = 0
+            else:
+                cut, last_seq = cursor
+                if cut > current_max:
+                    return None
+                # 锚点须属于目标争议且在当前快照内；属于其他争议或不存在均非法。
+                anchor = database.execute(
+                    "SELECT 1 FROM dispute_evidence_snapshots"
+                    " WHERE dispute_id = ? AND snapshot_seq = ? AND snapshot_seq <= ?",
+                    (dispute_id, last_seq, cut),
+                ).fetchone()
+                if anchor is None:
+                    return None
+            rows = database.execute(
+                "SELECT snapshot_seq, dispute_id, evidence_cut, proof_cut,"
+                " snapshot_json, digest, creator_id, created_at_ms"
+                " FROM dispute_evidence_snapshots"
+                " WHERE dispute_id = ? AND snapshot_seq <= ? AND snapshot_seq > ?"
+                " ORDER BY snapshot_seq ASC"
+                " LIMIT ?",
+                (dispute_id, cut, last_seq, limit + 1),
+            ).fetchall()
+            has_next = len(rows) > limit
+            page = rows[:limit]
+            snapshots = [self._snapshot_payload(row) for row in page]
+            next_cursor = (
+                f"{cut}:{page[-1]['snapshot_seq']}" if has_next else None
+            )
+            return {"snapshots": snapshots, "nextCursor": next_cursor}
+
+        status, error, payload = self._authenticated_snapshot_read(
+            standard_path, auth, actor_id, dispute_id, build_result
+        )
+        if payload is None:
+            self._json(status, {"error": error})
+            return
+        self._json(HTTPStatus.OK, payload)
+
+    def _get_evidence_snapshot(
+        self, dispute_id: str, snapshot_seq_text: str, query: str
+    ) -> None:
+        # 单笔读取不接受任何查询参数：参数校验先于认证与资源查询。
+        if parse_qsl(query, keep_blank_values=True):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 快照序号须为无前导零十进制正整数；非法按不存在处理（404）。
+        snapshot_seq: int | None = None
+        if DECIMAL_PATTERN.fullmatch(snapshot_seq_text) is not None:
+            value = int(snapshot_seq_text)
+            if 1 <= value <= INT64_MAX:
+                snapshot_seq = value
+        # 仅接受单一 SLA-Auth：认证结构先于资源查询；GET 无正文。
+        if self.headers.get_all(SLA_DELEGATION_HEADER):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        auth = self._parse_sla_auth()
+        if auth is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        actor_id = auth.machine_id
+        standard_path = urlsplit(self.path).path
+
+        def build_result(database: Any) -> dict[str, Any] | None:
+            row = None
+            if snapshot_seq is not None:
+                row = database.execute(
+                    "SELECT snapshot_seq, dispute_id, evidence_cut, proof_cut,"
+                    " snapshot_json, digest, creator_id, created_at_ms"
+                    " FROM dispute_evidence_snapshots"
+                    " WHERE snapshot_seq = ? AND dispute_id = ?",
+                    (snapshot_seq, dispute_id),
+                ).fetchone()
+            if row is None:
+                # 序号非法、不存在或不属于该争议均为 not_found：以哨兵异常穿透
+                # 共用读取事务的 400/提交路径。
+                raise _SnapshotNotFound
+            return self._snapshot_payload(row)
+
+        try:
+            status, error, payload = self._authenticated_snapshot_read(
+                standard_path, auth, actor_id, dispute_id, build_result
+            )
+        except _SnapshotNotFound:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        if payload is None:
+            self._json(status, {"error": error})
+            return
+        self._json(HTTPStatus.OK, payload)
+
     def _parse_disputes_query(
         self, query: str
     ) -> tuple[str, str | None, int, tuple[int, int] | None] | None:
@@ -1521,6 +1727,12 @@ class Handler(BaseHTTPRequestHandler):
         if evidence_match is not None:
             self._submit_evidence(evidence_match.group(1))
             return
+        snapshots_match = DISPUTE_EVIDENCE_SNAPSHOTS_PATH_PATTERN.fullmatch(
+            urlsplit(self.path).path
+        )
+        if snapshots_match is not None:
+            self._create_evidence_snapshot(snapshots_match.group(1))
+            return
         resolution_match = DISPUTE_RESOLUTION_PATH_PATTERN.fullmatch(self.path)
         if resolution_match is not None:
             self._resolve_dispute(resolution_match.group(1))
@@ -1635,6 +1847,16 @@ class Handler(BaseHTTPRequestHandler):
         # 次序：签名者（机器标识一致）、时间窗口、密钥与严格 Ed25519 验签。
         if auth.machine_id != expected_machine:
             raise AuthRejected(HTTPStatus.FORBIDDEN, "forbidden")
+        self._verify_request_auth_credentials(database, auth, path, body_digest)
+
+    def _verify_request_auth_credentials(
+        self,
+        database: Any,
+        auth: SlaAuth,
+        path: str,
+        body_digest: str,
+    ) -> None:
+        # 时间窗口、密钥版本与严格 Ed25519 验签；签名者身份由调用方先行判定。
         now_ms = int(datetime.now(UTC).timestamp() * 1000)
         if abs(auth.request_time_ms - now_ms) > SLA_AUTH_SKEW_MS:
             raise AuthRejected(HTTPStatus.UNAUTHORIZED, "stale_request")
@@ -4071,6 +4293,242 @@ class Handler(BaseHTTPRequestHandler):
                         standard_path,
                         body_digest,
                     )
+                self._consume_request_nonce(database, auth)
+                database.execute("COMMIT")
+                return HTTPStatus.CREATED, payload
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+
+    def _create_evidence_snapshot(self, dispute_id: str) -> None:
+        idempotency_key = self.headers.get("Idempotency-Key")
+        if (
+            idempotency_key is None
+            or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None
+        ):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 快照入口不接受任何查询参数：参数校验先于体校验与争议查询。
+        if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        raw_body = self._read_raw_body()
+        fields = (
+            None
+            if raw_body is None
+            else self._read_evidence_snapshot_object(raw_body)
+        )
+        if fields is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 仅接受单一 SLA-Auth（不接受 SLA-Delegation）；头缺失、重复或结构非法
+        # 均为 400，且先于争议查询。
+        if self.headers.get_all(SLA_DELEGATION_HEADER):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        auth = self._parse_sla_auth()
+        if auth is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        body_digest = hashlib.sha256(raw_body).hexdigest()
+        status, payload = self._apply_evidence_snapshot(
+            idempotency_key, dispute_id, fields, auth, body_digest
+        )
+        self._json(status, payload)
+
+    def _read_evidence_snapshot_object(self, body: bytes) -> dict[str, Any] | None:
+        parsed = self._read_json_object(body)
+        if parsed is None or set(parsed) != EVIDENCE_SNAPSHOT_FIELDS:
+            return None
+        actor_id = parsed["actorId"]
+        if (
+            not isinstance(actor_id, str)
+            or PUBLIC_KEY_PATTERN.fullmatch(actor_id) is None
+        ):
+            return None
+        return parsed
+
+    @staticmethod
+    def _build_snapshot_document(
+        database: Any,
+        dispute_id: str,
+        evidence_cut: int,
+        proof_cut: int,
+    ) -> list[dict[str, Any]]:
+        # 收录该争议上界内的证据（按全局 evidenceSeq 升序），每条证据末附
+        # proofSeq 上界内的证明（按全局 proofSeq 升序）。
+        evidence_rows = database.execute(
+            "SELECT evidence_seq, evidence_id, actor_id, observed_at_ms, digest"
+            " FROM dispute_evidences"
+            " WHERE dispute_id = ? AND evidence_seq <= ?"
+            " ORDER BY evidence_seq ASC",
+            (dispute_id, evidence_cut),
+        ).fetchall()
+        evidence: list[dict[str, Any]] = []
+        for row in evidence_rows:
+            proof_rows = database.execute(
+                "SELECT proof_seq, actor_id, signature, verified, created_at_ms"
+                " FROM dispute_evidence_proofs"
+                " WHERE evidence_seq = ? AND proof_seq <= ?"
+                " ORDER BY proof_seq ASC",
+                (row["evidence_seq"], proof_cut),
+            ).fetchall()
+            proofs = [
+                {
+                    "proofSeq": proof_row["proof_seq"],
+                    "actorId": proof_row["actor_id"],
+                    "signature": proof_row["signature"],
+                    "verified": proof_row["verified"] == 1,
+                    "createdAt": proof_row["created_at_ms"],
+                }
+                for proof_row in proof_rows
+            ]
+            evidence.append(
+                {
+                    "evidenceSeq": row["evidence_seq"],
+                    "evidenceId": row["evidence_id"],
+                    "actorId": row["actor_id"],
+                    "observedAt": row["observed_at_ms"],
+                    "digest": row["digest"],
+                    "proofs": proofs,
+                }
+            )
+        return evidence
+
+    def _apply_evidence_snapshot(
+        self,
+        idempotency_key: str,
+        dispute_id: str,
+        fields: dict[str, Any],
+        auth: SlaAuth,
+        body_digest: str,
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+        standard_path = urlsplit(self.path).path
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                record = database.execute(
+                    "SELECT dispute_id, request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature"
+                    " FROM dispute_evidence_snapshot_idempotency_records"
+                    " WHERE key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    if (
+                        record["dispute_id"] == dispute_id
+                        and record["request_json"] == request_json
+                        and self._auth_record_matches(record, auth)
+                    ):
+                        return HTTPStatus(record["status"]), json.loads(
+                            record["response_json"]
+                        )
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                dispute = database.execute(
+                    "SELECT payer_id, payee_id, state FROM disputes WHERE id = ?",
+                    (dispute_id,),
+                ).fetchone()
+                if dispute is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                actor_id = fields["actorId"]
+                # 仅争议双方可创建；认证机器标识须等于正文 actorId。
+                if actor_id not in (dispute["payer_id"], dispute["payee_id"]):
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
+                try:
+                    self._verify_request_auth(
+                        database, auth, actor_id, standard_path, body_digest
+                    )
+                    self._check_request_nonce(database, auth)
+                except AuthRejected as rejected:
+                    database.execute("ROLLBACK")
+                    return rejected.status, {"error": rejected.error}
+                # 认证全部通过后判状态：仅 open 争议可创建快照。
+                if dispute["state"] != "open":
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "already_resolved"}
+                # 事务冻结全库 evidenceSeq、proofSeq 上界（空库取零）。
+                evidence_cut_record = database.execute(
+                    "SELECT COALESCE(MAX(evidence_seq), 0) AS current_max"
+                    " FROM dispute_evidences"
+                ).fetchone()
+                proof_cut_record = database.execute(
+                    "SELECT COALESCE(MAX(proof_seq), 0) AS current_max"
+                    " FROM dispute_evidence_proofs"
+                ).fetchone()
+                evidence_cut = evidence_cut_record["current_max"]
+                proof_cut = proof_cut_record["current_max"]
+                evidence = self._build_snapshot_document(
+                    database, dispute_id, evidence_cut, proof_cut
+                )
+                # 紧凑、无尾换行的 UTF-8 JSON；SHA-256 小写十六进制为摘要。
+                document = {
+                    "disputeId": dispute_id,
+                    "evidenceSeqUpperBound": evidence_cut,
+                    "proofSeqUpperBound": proof_cut,
+                    "evidence": evidence,
+                }
+                snapshot_bytes = json.dumps(
+                    document, ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
+                digest = hashlib.sha256(snapshot_bytes).hexdigest()
+                # 全库唯一持久递增快照序号：取写锁后取最大序号 + 1（空表 1）。
+                next_record = database.execute(
+                    "SELECT COALESCE(MAX(snapshot_seq), 0) + 1 AS next_seq"
+                    " FROM dispute_evidence_snapshots"
+                ).fetchone()
+                snapshot_seq = next_record["next_seq"]
+                created_at_ms = int(datetime.now(UTC).timestamp() * 1000)
+                payload = {
+                    "snapshotSeq": snapshot_seq,
+                    "evidenceSeqUpperBound": evidence_cut,
+                    "proofSeqUpperBound": proof_cut,
+                    "digest": digest,
+                    "creatorId": actor_id,
+                    "createdAt": created_at_ms,
+                    "evidence": evidence,
+                }
+                response_json = json.dumps(payload, separators=(",", ":"))
+                database.execute(
+                    "INSERT INTO dispute_evidence_snapshots"
+                    "(snapshot_seq, dispute_id, evidence_cut, proof_cut,"
+                    " snapshot_json, digest, creator_id, created_at_ms)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        snapshot_seq,
+                        dispute_id,
+                        evidence_cut,
+                        proof_cut,
+                        snapshot_bytes,
+                        digest,
+                        actor_id,
+                        created_at_ms,
+                    ),
+                )
+                database.execute(
+                    "INSERT INTO dispute_evidence_snapshot_idempotency_records"
+                    "(key, dispute_id, request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        dispute_id,
+                        request_json,
+                        int(HTTPStatus.CREATED),
+                        response_json,
+                        auth.machine_id,
+                        auth.key_version,
+                        auth.request_time_ms,
+                        auth.nonce,
+                        auth.signature,
+                    ),
+                )
+                # 快照、序号、时间、摘要、幂等结果与随机数在同一事务原子提交。
                 self._consume_request_nonce(database, auth)
                 database.execute("COMMIT")
                 return HTTPStatus.CREATED, payload
