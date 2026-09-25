@@ -67,6 +67,9 @@ PUBLIC_KEY_SEED_B = b"\x02" * 32
 PUBLIC_KEY_SEED_C = b"\x03" * 32
 PUBLIC_KEY_B = _ed25519_public_key(PUBLIC_KEY_SEED_B).hex()
 PUBLIC_KEY_C = _ed25519_public_key(PUBLIC_KEY_SEED_C).hex()
+# 代理凭证固定使用与三台机器不同的 Ed25519 密钥对。
+DELEGATE_SEED = b"\x09" * 32
+DELEGATE_PUBLIC = _ed25519_public_key(DELEGATE_SEED).hex()
 
 
 def telemetry_signature(
@@ -5945,7 +5948,9 @@ class DisputeCollectionTests(unittest.TestCase):
         self.assertIsNone(second_page["nextCursor"])
 
 
-class DisputeEvidenceTests(unittest.TestCase):
+class _EvidenceScenario:
+    # 共享建场景（机器、SLA、结算、争议）的 mixin：本身不继承 TestCase，
+    # 因此不被 unittest 收集；由 DisputeEvidenceTests 等具体类继承。
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.server = ApiServer(("127.0.0.1", 0), Handler)
@@ -6567,6 +6572,597 @@ class DisputeEvidenceTests(unittest.TestCase):
         )
         self.assertEqual(status, 201)
         self.assertEqual(json.loads(body), {"evidenceSeq": 2})
+
+
+class DisputeEvidenceTests(_EvidenceScenario, unittest.TestCase):
+    pass
+
+
+class DelegationEvidenceTests(_EvidenceScenario, unittest.TestCase):
+    # 证据提交入口接受 SLA-Delegation（evidence.write + disputeId 范围）。
+    def issue_evidence_delegation(
+        self,
+        delegation_id: str = "del-ev-1",
+        *,
+        dispute_id: str = "dispute-1",
+        key: str = "issue-ev-1",
+        seed: bytes = PUBLIC_KEY_SEED_B,
+        actor: str | None = None,
+        expires_at: int | None = None,
+        operation: str = "evidence.write",
+        extra: dict[str, object] | None = None,
+        raw_body: bytes | None = None,
+    ) -> tuple[int, bytes]:
+        if raw_body is not None:
+            body = raw_body
+        else:
+            fields: dict[str, object] = {
+                "id": delegation_id,
+                "delegatePublicKey": DELEGATE_PUBLIC,
+                "expiresAt": expires_at or int(time.time() * 1000) + 3_600_000,
+                "operation": operation,
+                "disputeId": dispute_id,
+            }
+            if extra is not None:
+                fields.update(extra)
+            body = json.dumps(fields).encode()
+        return self.post_json_with(
+            "/v1/delegations", body, key,
+            seed=seed, actor=actor or self.consumer_id,
+        )
+
+    def post_json_with(
+        self,
+        path: str,
+        body: bytes,
+        key: str,
+        *,
+        seed: bytes,
+        actor: str,
+        delegation: tuple[bytes, str] | str | None = None,
+        request_time_ms: int | None = None,
+        nonce: str | None = None,
+        no_auth: bool = False,
+    ) -> tuple[int, bytes]:
+        request = Request(self.url(path), data=body, method="POST")
+        request.add_header("Idempotency-Key", key)
+        if not no_auth:
+            if delegation is not None:
+                if isinstance(delegation, str):
+                    header = delegation
+                else:
+                    delegate_seed, delegation_id = delegation
+                    header = make_sla_delegation(
+                        self.server, key, delegate_seed, delegation_id,
+                        "POST", urlsplit(path).path, body,
+                        request_time_ms=request_time_ms, nonce=nonce,
+                    )
+                request.add_header("SLA-Delegation", header)
+            else:
+                request.add_header(
+                    "SLA-Auth",
+                    make_sla_auth(
+                        self.server, key, seed, actor,
+                        "POST", urlsplit(path).path, body, 1,
+                        request_time_ms=request_time_ms, nonce=nonce,
+                    ),
+                )
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def submit_delegated(
+        self,
+        body: dict[str, object] | None = None,
+        key: str = "dev-1",
+        *,
+        dispute_id: str = "dispute-1",
+        delegation_id: str = "del-ev-1",
+        seed: bytes = DELEGATE_SEED,
+        actor: str | None = None,
+        request_time_ms: int | None = None,
+        nonce: str | None = None,
+    ) -> tuple[int, bytes]:
+        if body is None:
+            body = self.evidence_body()
+        if actor is not None:
+            body = {**body, "actorId": actor}
+        return self.post_json_with(
+            f"/v1/disputes/{dispute_id}/evidence",
+            json.dumps(body).encode(),
+            key,
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+            delegation=(seed, delegation_id),
+            request_time_ms=request_time_ms,
+            nonce=nonce,
+        )
+
+    def consumed_flag(self, delegation_id: str) -> int:
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            return connection.execute(
+                "SELECT consumed FROM machine_delegations WHERE id = ?",
+                (delegation_id,),
+            ).fetchone()[0]
+        finally:
+            connection.close()
+
+    def test_issue_evidence_scope_persisted_and_listed(self) -> None:
+        body = json.dumps({
+            "id": "del-ev-1",
+            "delegatePublicKey": DELEGATE_PUBLIC,
+            "expiresAt": int(time.time() * 1000) + 3_600_000,
+            "operation": "evidence.write",
+            "disputeId": "dispute-1",
+        }, separators=(",", ":")).encode()
+        status, payload = self.issue_evidence_delegation(raw_body=body)
+        self.assertEqual(status, 201)
+        self.assertEqual(
+            payload,
+            json.dumps(
+                {"id": "del-ev-1", "expiresAt": json.loads(body)["expiresAt"]},
+                separators=(",", ":"),
+            ).encode(),
+        )
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            row = connection.execute(
+                "SELECT operation, capability_version, dispute_id"
+                " FROM machine_delegations WHERE id = 'del-ev-1'"
+            ).fetchone()
+            self.assertEqual(row, ("evidence.write", None, "dispute-1"))
+        finally:
+            connection.close()
+        request = Request(
+            self.url(f"/v1/machines/{self.consumer_id}/delegations"),
+            data=b"", method="GET",
+        )
+        request.add_header(
+            "SLA-Auth",
+            make_sla_auth(
+                self.server, None, PUBLIC_KEY_SEED_B, self.consumer_id,
+                "GET", f"/v1/machines/{self.consumer_id}/delegations", b"", 1,
+            ),
+        )
+        with urlopen(request, timeout=5) as response:
+            listed = json.load(response)
+        item = listed["delegations"][0]
+        self.assertEqual(
+            list(item),
+            [
+                "id", "delegatePublicKey", "expiresAt", "issuedKeyVersion",
+                "consumed", "revoked", "operation", "capabilityVersion", "disputeId",
+            ],
+        )
+        self.assertEqual(
+            (item["operation"], item["capabilityVersion"], item["disputeId"]),
+            ("evidence.write", None, "dispute-1"),
+        )
+
+    def test_issue_evidence_scope_invalid_bodies(self) -> None:
+        now = int(time.time() * 1000)
+        base = {
+            "id": "del-ev-x",
+            "delegatePublicKey": DELEGATE_PUBLIC,
+            "expiresAt": now + 1000,
+        }
+        cases = [
+            {**base, "operation": "evidence.write"},
+            {**base, "operation": "evidence.write",
+             "capabilityVersion": 0, "disputeId": "dispute-1"},
+            {**base, "operation": "capability.write", "disputeId": "dispute-1"},
+            {**base, "operation": "evidence.write", "capabilityVersion": 0},
+            {**base, "operation": "sla.write", "disputeId": "dispute-1"},
+            {**base, "operation": "evidence.write", "disputeId": "Bad Id"},
+            {**base, "operation": "evidence.write", "disputeId": ""},
+            {**base, "operation": "evidence.write", "disputeId": 1},
+            {**base, "operation": "evidence.write", "disputeId": None},
+            {**base, "operation": "evidence.write", "disputeId": ["dispute-1"]},
+        ]
+        for index, fields in enumerate(cases):
+            status, payload = self.post_json_with(
+                "/v1/delegations", json.dumps(fields).encode(), f"bad-ev-{index}",
+                seed=PUBLIC_KEY_SEED_B, actor=self.consumer_id,
+            )
+            self.assertEqual(
+                (status, json.loads(payload)),
+                (400, {"error": "invalid_request"}),
+                fields,
+            )
+
+    def test_delegate_submits_evidence_created(self) -> None:
+        self.assertEqual(self.issue_evidence_delegation()[0], 201)
+        status, payload = self.submit_delegated()
+        self.assertEqual((status, payload), (201, b'{"evidenceSeq":1}'))
+
+    def test_payee_issues_and_delegate_submits(self) -> None:
+        # 收款方（生产者）签发：证据 actorId 为收款方，委托签发者须与之相同。
+        self.assertEqual(
+            self.issue_evidence_delegation(
+                "del-ev-p", key="issue-ev-p",
+                seed=PRODUCER_SEED, actor=self.machine_id,
+            )[0],
+            201,
+        )
+        status, payload = self.submit_delegated(
+            self.evidence_body(actorId=self.machine_id),
+            "dev-p", delegation_id="del-ev-p", actor=self.machine_id,
+        )
+        self.assertEqual((status, payload), (201, b'{"evidenceSeq":1}'))
+
+    def test_delegate_replay_same_key_first_bytes(self) -> None:
+        self.assertEqual(self.issue_evidence_delegation()[0], 201)
+        status, first = self.submit_delegated()
+        self.assertEqual(status, 201)
+        for _ in range(2):
+            self.assertEqual(self.submit_delegated(), (201, first))
+        status, payload = self.get_json("/v1/disputes/dispute-1/evidence")
+        self.assertEqual(len(payload["evidence"]), 1)
+
+    def test_delegate_replay_survives_restart(self) -> None:
+        self.assertEqual(self.issue_evidence_delegation()[0], 201)
+        status, first = self.submit_delegated()
+        self.assertEqual(status, 201)
+        self.restart()
+        self.assertEqual(self.submit_delegated(), (201, first))
+
+    def test_same_key_different_path_body_or_auth_conflicts(self) -> None:
+        self.assertEqual(self.issue_evidence_delegation()[0], 201)
+        body = self.evidence_body()
+        self.assertEqual(self.submit_delegated(body, "dev-1")[0], 201)
+        # 同键异正文。
+        status, payload = self.submit_delegated(
+            self.evidence_body(digest="cd" * 32), "dev-1"
+        )
+        self.assertEqual((status, json.loads(payload)), (409, {"error": "conflict"}))
+        # 同键异路径，先于争议查询。
+        status, payload = self.submit_delegated(body, "dev-1", dispute_id="dispute-2")
+        self.assertEqual((status, json.loads(payload)), (409, {"error": "conflict"}))
+        # 同键异认证五段（异随机数）。
+        status, payload = self.submit_delegated(body, "dev-1", nonce="nonce-dev-other-1")
+        self.assertEqual((status, json.loads(payload)), (409, {"error": "conflict"}))
+
+    def test_once_consumed_second_use_is_401_but_evidence_stored(self) -> None:
+        self.assertEqual(self.issue_evidence_delegation()[0], 201)
+        self.assertEqual(self.submit_delegated(key="dev-1")[0], 201)
+        status, payload = self.submit_delegated(
+            self.evidence_body(evidenceId="ev-2", digest="cd" * 32), "dev-2"
+        )
+        self.assertEqual(
+            (status, json.loads(payload)),
+            (401, {"error": "invalid_authentication"}),
+        )
+
+    def test_scope_dispute_mismatch_is_403_and_credential_reusable(self) -> None:
+        self.create_second_dispute()
+        self.assertEqual(
+            self.issue_evidence_delegation(dispute_id="dispute-2")[0], 201
+        )
+        # 凭证绑定 dispute-2：提交到 dispute-1 为范围越界 403，不消费凭证。
+        status, payload = self.submit_delegated(key="dev-bad")
+        self.assertEqual((status, json.loads(payload)), (403, {"error": "forbidden"}))
+        self.assertEqual(self.consumed_flag("del-ev-1"), 0)
+        # 同一凭证随后合法提交至绑定争议成功。
+        status, payload = self.submit_delegated(
+            self.evidence_body(actorId=self.consumer_id),
+            "dev-ok", dispute_id="dispute-2",
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(self.consumed_flag("del-ev-1"), 1)
+
+    def test_capability_scope_credential_forbidden_on_evidence(self) -> None:
+        body = json.dumps({
+            "id": "del-cap",
+            "delegatePublicKey": DELEGATE_PUBLIC,
+            "expiresAt": int(time.time() * 1000) + 3_600_000,
+            "operation": "capability.write",
+            "capabilityVersion": 0,
+        }).encode()
+        self.assertEqual(
+            self.post_json_with(
+                "/v1/delegations", body, "issue-cap",
+                seed=PUBLIC_KEY_SEED_B, actor=self.consumer_id,
+            )[0],
+            201,
+        )
+        status, payload = self.submit_delegated(
+            key="dev-cap", delegation_id="del-cap"
+        )
+        self.assertEqual((status, json.loads(payload)), (403, {"error": "forbidden"}))
+        self.assertEqual(self.consumed_flag("del-cap"), 0)
+
+    def test_legacy_null_scope_credential_forbidden_on_evidence(self) -> None:
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            connection.execute(
+                "INSERT INTO machine_delegations"
+                "(id, issuer_machine_id, delegate_public_key, expires_at_ms,"
+                " issued_key_version, revoked, consumed, created_at_ms,"
+                " operation, capability_version, dispute_id)"
+                " VALUES (?, ?, ?, ?, 1, 0, 0, ?, NULL, NULL, NULL)",
+                ("del-legacy", self.consumer_id, DELEGATE_PUBLIC,
+                 int(time.time() * 1000) + 3_600_000, int(time.time() * 1000)),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        status, payload = self.submit_delegated(
+            key="dev-legacy", delegation_id="del-legacy"
+        )
+        self.assertEqual((status, json.loads(payload)), (403, {"error": "forbidden"}))
+        self.assertEqual(self.consumed_flag("del-legacy"), 0)
+
+    def test_issuer_must_equal_actor(self) -> None:
+        # 凭证由消费者签发，但证据 actorId 为生产者：签发身份越界 403。
+        self.assertEqual(self.issue_evidence_delegation()[0], 201)
+        status, payload = self.submit_delegated(
+            self.evidence_body(actorId=self.machine_id),
+            "dev-actor", actor=self.machine_id,
+        )
+        self.assertEqual((status, json.loads(payload)), (403, {"error": "forbidden"}))
+        self.assertEqual(self.consumed_flag("del-ev-1"), 0)
+
+    def test_missing_dispute_is_404_after_idempotency(self) -> None:
+        self.assertEqual(self.issue_evidence_delegation()[0], 201)
+        # 无幂等记录：争议不存在 404（结构与幂等先于争议查询）。
+        status, payload = self.submit_delegated(
+            key="dev-missing", dispute_id="dispute-ghost"
+        )
+        self.assertEqual((status, json.loads(payload)), (404, {"error": "not_found"}))
+
+    def test_stale_request_is_401(self) -> None:
+        self.assertEqual(self.issue_evidence_delegation()[0], 201)
+        status, payload = self.submit_delegated(
+            key="dev-stale",
+            request_time_ms=int(time.time() * 1000) - 400_000,
+        )
+        self.assertEqual(
+            (status, json.loads(payload)), (401, {"error": "stale_request"})
+        )
+        self.assertEqual(self.consumed_flag("del-ev-1"), 0)
+
+    def test_bad_delegate_signature_is_401(self) -> None:
+        self.assertEqual(self.issue_evidence_delegation()[0], 201)
+        status, payload = self.submit_delegated(
+            key="dev-badsig", seed=PUBLIC_KEY_SEED_C
+        )
+        self.assertEqual(
+            (status, json.loads(payload)),
+            (401, {"error": "invalid_authentication"}),
+        )
+
+    def test_unknown_revoked_and_rotated_credentials_are_401(self) -> None:
+        # 未知委托。
+        status, payload = self.submit_delegated(
+            key="dev-unknown", delegation_id="del-ghost"
+        )
+        self.assertEqual(
+            (status, json.loads(payload)),
+            (401, {"error": "invalid_authentication"}),
+        )
+        # 已撤销委托。
+        self.assertEqual(self.issue_evidence_delegation("del-rev")[0], 201)
+        status, _ = self.post_json_with(
+            "/v1/delegations/del-rev/revocation", b"{}", "revoke-1",
+            seed=PUBLIC_KEY_SEED_B, actor=self.consumer_id,
+        )
+        self.assertEqual(status, 200)
+        status, payload = self.submit_delegated(
+            key="dev-rev", delegation_id="del-rev"
+        )
+        self.assertEqual(
+            (status, json.loads(payload)),
+            (401, {"error": "invalid_authentication"}),
+        )
+        # 签发密钥轮换后委托失效。
+        self.assertEqual(
+            self.issue_evidence_delegation(
+                "del-rot", key="issue-rot",
+                seed=PRODUCER_SEED, actor=self.machine_id,
+            )[0],
+            201,
+        )
+        new_seed = b"\x0a" * 32
+        new_public = _ed25519_public_key(new_seed).hex()
+        current_sig, new_sig = key_rotation_signatures(
+            PRODUCER_SEED, new_seed, self.machine_id, 1, new_public
+        )
+        rotation = json.dumps({
+            "expectedVersion": 1, "publicKey": new_public,
+            "currentSignature": current_sig, "newSignature": new_sig,
+        }).encode()
+        self.assertEqual(
+            self.post_json_with(
+                f"/v1/machines/{self.machine_id}/keys", rotation, "rotate-1",
+                seed=PRODUCER_SEED, actor=self.machine_id,
+            )[0],
+            201,
+        )
+        status, payload = self.submit_delegated(
+            self.evidence_body(actorId=self.machine_id),
+            "dev-rot", delegation_id="del-rot", actor=self.machine_id,
+        )
+        self.assertEqual(
+            (status, json.loads(payload)),
+            (401, {"error": "invalid_authentication"}),
+        )
+
+    def test_both_headers_and_malformed_are_400(self) -> None:
+        self.assertEqual(self.issue_evidence_delegation()[0], 201)
+        body = json.dumps(self.evidence_body()).encode()
+        path = "/v1/disputes/dispute-1/evidence"
+        request = Request(self.url(path), data=body, method="POST")
+        request.add_header("Idempotency-Key", "dev-both")
+        request.add_header(
+            "SLA-Auth",
+            make_sla_auth(
+                self.server, "dev-both", PUBLIC_KEY_SEED_B, self.consumer_id,
+                "POST", path, body, 1,
+            ),
+        )
+        request.add_header(
+            "SLA-Delegation",
+            make_sla_delegation(
+                self.server, "dev-both", DELEGATE_SEED, "del-ev-1",
+                "POST", path, body,
+            ),
+        )
+        with self.assertRaises(HTTPError) as captured:
+            urlopen(request, timeout=5)
+        self.assertEqual(captured.exception.code, 400)
+        now = int(time.time() * 1000)
+        for raw in (
+            "x",
+            f"del-ev-1;1;{now};nonce-0123456789ab;{'a' * 128}",
+            f"del-ev-1;00;{now};nonce-0123456789ab;{'a' * 128}",
+            f"Bad_id;0;{now};nonce-0123456789ab;{'a' * 128}",
+        ):
+            status, payload = self.post_json_with(
+                path, body, "dev-malformed",
+                seed=PUBLIC_KEY_SEED_B, actor=self.consumer_id, delegation=raw,
+            )
+            self.assertEqual(
+                (status, json.loads(payload)),
+                (400, {"error": "invalid_request"}),
+                raw,
+            )
+        # 两种认证头均缺失同样为 400。
+        status, payload = self.post_json_with(
+            path, body, "dev-none",
+            seed=PUBLIC_KEY_SEED_B, actor=self.consumer_id, no_auth=True,
+        )
+        self.assertEqual((status, json.loads(payload)), (400, {"error": "invalid_request"}))
+
+    def test_already_resolved_and_evidence_exists_consume_nothing(self) -> None:
+        self.assertEqual(self.issue_evidence_delegation()[0], 201)
+        # 争议裁决后提交：409 already_resolved，凭证不消费。
+        self.assertEqual(self.post_evidence()[0], 201)
+        self.assertEqual(
+            self.post_json(
+                "/v1/disputes/dispute-1/resolution",
+                {"decision": "release"}, "resolve-1",
+            )[0],
+            200,
+        )
+        status, payload = self.submit_delegated(
+            self.evidence_body(evidenceId="ev-9"), "dev-resolved"
+        )
+        self.assertEqual(
+            (status, json.loads(payload)), (409, {"error": "already_resolved"})
+        )
+        self.assertEqual(self.consumed_flag("del-ev-1"), 0)
+        # 新争议：重复 evidenceId/digest 返回 evidence_exists，凭证仍可合法使用。
+        self.create_second_dispute()
+        # 凭证绑定 dispute-1，不能用于 dispute-2；改发一张绑定 dispute-2 的凭证。
+        self.assertEqual(
+            self.issue_evidence_delegation(
+                "del-ev-2", dispute_id="dispute-2", key="issue-ev-2"
+            )[0],
+            201,
+        )
+        # dispute-2 内先用直接认证占用 ev/digest，再以委托重复提交。
+        status, _ = self.post_evidence(
+            dispute_id="dispute-2",
+            payload=self.evidence_body(
+                evidenceId="ev-x", digest="fe" * 32, actorId=self.consumer_id
+            ),
+            key="direct-x",
+        )
+        self.assertEqual(status, 201)
+        status, payload = self.submit_delegated(
+            self.evidence_body(
+                evidenceId="ev-x", digest="fe" * 32, actorId=self.consumer_id
+            ),
+            "dev-dup", dispute_id="dispute-2", delegation_id="del-ev-2",
+        )
+        self.assertEqual(
+            (status, json.loads(payload)), (409, {"error": "evidence_exists"})
+        )
+        self.assertEqual(self.consumed_flag("del-ev-2"), 0)
+        status, payload = self.submit_delegated(
+            self.evidence_body(
+                evidenceId="ev-y", digest="dc" * 32, actorId=self.consumer_id
+            ),
+            "dev-ok", dispute_id="dispute-2", delegation_id="del-ev-2",
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(self.consumed_flag("del-ev-2"), 1)
+
+    def test_concurrent_same_credential_single_winner(self) -> None:
+        self.assertEqual(self.issue_evidence_delegation()[0], 201)
+        results: list[int] = []
+        lock = threading.Lock()
+
+        def submit(index: int) -> None:
+            status, _ = self.submit_delegated(
+                self.evidence_body(
+                    evidenceId=f"ev-race-{index}",
+                    digest=hashlib.sha256(str(index).encode()).hexdigest(),
+                ),
+                f"dev-race-{index}",
+            )
+            with lock:
+                results.append(status)
+
+        threads = [threading.Thread(target=submit, args=(i,)) for i in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual(sorted(results), [201] + [401] * 7)
+        status, payload = self.get_json("/v1/disputes/dispute-1/evidence")
+        self.assertEqual(len(payload["evidence"]), 1)
+
+    def test_consumed_event_records_resource_and_digest(self) -> None:
+        self.assertEqual(self.issue_evidence_delegation()[0], 201)
+        status, payload = self.submit_delegated()
+        self.assertEqual(status, 201)
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            rows = connection.execute(
+                "SELECT event_seq, type, resource, request_digest"
+                " FROM delegation_events ORDER BY event_seq"
+            ).fetchall()
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[0][1], "issued")
+            self.assertEqual(rows[1][1], "consumed")
+            self.assertEqual(rows[1][2], "/v1/disputes/dispute-1/evidence")
+            self.assertEqual(
+                rows[1][3],
+                hashlib.sha256(json.dumps(self.evidence_body()).encode()).hexdigest(),
+            )
+        finally:
+            connection.close()
+        # 消费审计既有字段、排序与分页不变：记录追加在消费者的审计集合中。
+        request = Request(
+            self.url(f"/v1/machines/{self.consumer_id}/delegation-consumptions"),
+            data=b"", method="GET",
+        )
+        request.add_header(
+            "SLA-Auth",
+            make_sla_auth(
+                self.server, None, PUBLIC_KEY_SEED_B, self.consumer_id,
+                "GET",
+                f"/v1/machines/{self.consumer_id}/delegation-consumptions",
+                b"", 1,
+            ),
+        )
+        with urlopen(request, timeout=5) as response:
+            audit = json.load(response)
+        record = audit["consumptions"][0]
+        self.assertEqual(
+            list(record),
+            ["eventSeq", "delegationId", "operation", "capabilityVersion",
+             "resource", "requestDigest", "createdAt"],
+        )
+        self.assertEqual(record["delegationId"], "del-ev-1")
+        self.assertEqual(record["operation"], "evidence.write")
+        self.assertIsNone(record["capabilityVersion"])
+        self.assertEqual(record["resource"], "/v1/disputes/dispute-1/evidence")
+        self.assertGreater(record["createdAt"], 0)
 
 
 class EvidenceProofTests(unittest.TestCase):
@@ -8198,10 +8794,6 @@ class SlaAuthTests(unittest.TestCase):
                          (409, {"error": "conflict"}))
 
 
-DELEGATE_SEED = b"\x09" * 32
-DELEGATE_PUBLIC = _ed25519_public_key(DELEGATE_SEED).hex()
-
-
 class DelegationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -9141,6 +9733,7 @@ class DelegationTests(unittest.TestCase):
                 "revoked",
                 "operation",
                 "capabilityVersion",
+                "disputeId",
             ],
         )
         self.assertEqual(first["delegatePublicKey"], DELEGATE_PUBLIC)
@@ -10009,3 +10602,83 @@ class DelegationScopeMigrationTests(unittest.TestCase):
         finally:
             connection.close()
 
+
+class DelegationDisputeMigrationTests(unittest.TestCase):
+    # 旧库 machine_delegations 无 dispute_id 列且缺少一次性标记：
+    # 迁移补可空列并保持既有委托 dispute_id 为 NULL，仅执行一次。
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.database_path = str(Path(self.temporary.name) / "service.db")
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_dispute_column_added_once_and_legacy_rows_null(self) -> None:
+        from sla_network.database import connect as database_connect
+
+        producer = machine_id(PUBLIC_KEY_A)
+        now = int(time.time() * 1000)
+        connection = database_connect(self.database_path)
+        try:
+            # 能力授权与无范围凭证各一条，含 dispute_id 新列写入。
+            connection.execute(
+                "INSERT INTO machine_delegations"
+                "(id, issuer_machine_id, delegate_public_key, expires_at_ms,"
+                " issued_key_version, revoked, consumed, created_at_ms,"
+                " operation, capability_version, dispute_id)"
+                " VALUES (?, ?, ?, ?, 1, 0, 0, ?, 'capability.write', 0, NULL)",
+                ("d-cap", producer, DELEGATE_PUBLIC, now + 1000, now),
+            )
+            connection.execute(
+                "INSERT INTO machine_delegations"
+                "(id, issuer_machine_id, delegate_public_key, expires_at_ms,"
+                " issued_key_version, revoked, consumed, created_at_ms,"
+                " operation, capability_version, dispute_id)"
+                " VALUES (?, ?, ?, ?, 1, 0, 1, ?, NULL, NULL, NULL)",
+                ("d-legacy", producer, DELEGATE_PUBLIC, now + 1000, now),
+            )
+            # 回退为旧表结构并移除一次性标记。
+            connection.execute(
+                "ALTER TABLE machine_delegations DROP COLUMN dispute_id"
+            )
+            connection.execute(
+                "DELETE FROM schema_metadata WHERE key = 'delegation_dispute_added'"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        connection = database_connect(self.database_path)
+        try:
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(machine_delegations)")
+            }
+            self.assertIn("dispute_id", columns)
+            rows = connection.execute(
+                "SELECT id, operation, capability_version, dispute_id"
+                " FROM machine_delegations ORDER BY id"
+            ).fetchall()
+            self.assertEqual(
+                [tuple(row) for row in rows],
+                [
+                    ("d-cap", "capability.write", 0, None),
+                    ("d-legacy", None, None, None),
+                ],
+            )
+            marker = connection.execute(
+                "SELECT 1 FROM schema_metadata WHERE key = 'delegation_dispute_added'"
+            ).fetchone()
+            self.assertIsNotNone(marker)
+        finally:
+            connection.close()
+
+        # 重启后不重复迁移：既有数据保持不变。
+        connection = database_connect(self.database_path)
+        try:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM machine_delegations"
+            ).fetchone()[0]
+            self.assertEqual(count, 2)
+        finally:
+            connection.close()

@@ -114,10 +114,21 @@ DELEGATION_FIELDS = {
     "operation",
     "capabilityVersion",
 }
+DELEGATION_DISPUTE_FIELDS = {
+    "id",
+    "delegatePublicKey",
+    "expiresAt",
+    "operation",
+    "disputeId",
+}
 DELEGATION_MAX_TTL_MS = 86_400_000
-# 最小权限：当前委托仅允许能力写入；路径资源为标准机器能力路径。
+# 最小权限：能力写入或单笔争议证据提交；路径资源分别为能力路径与争议证据路径。
 DELEGATION_OPERATION_CAPABILITY_WRITE = "capability.write"
-DELEGATION_OPERATIONS = {DELEGATION_OPERATION_CAPABILITY_WRITE}
+DELEGATION_OPERATION_EVIDENCE_WRITE = "evidence.write"
+DELEGATION_OPERATIONS = {
+    DELEGATION_OPERATION_CAPABILITY_WRITE,
+    DELEGATION_OPERATION_EVIDENCE_WRITE,
+}
 
 
 class SlaAuth(NamedTuple):
@@ -1227,6 +1238,7 @@ class Handler(BaseHTTPRequestHandler):
                 " d.issued_key_version AS issued_key_version,"
                 " d.operation AS operation,"
                 " d.capability_version AS capability_version,"
+                " d.dispute_id AS dispute_id,"
                 " e.event_seq AS issued_seq,"
                 " EXISTS (SELECT 1 FROM delegation_events AS c"
                 " WHERE c.delegation_id = d.id AND c.type = 'consumed'"
@@ -1253,9 +1265,10 @@ class Handler(BaseHTTPRequestHandler):
                     "issuedKeyVersion": row["issued_key_version"],
                     "consumed": bool(row["consumed_in_cut"]),
                     "revoked": bool(row["revoked_in_cut"]),
-                    # 最小权限范围追加在项尾；升级前凭证两项均为 null。
+                    # 最小权限范围追加在项尾；升级前凭证三项均为 null。
                     "operation": row["operation"],
                     "capabilityVersion": row["capability_version"],
+                    "disputeId": row["dispute_id"],
                 }
                 for row in page
             ]
@@ -1673,13 +1686,14 @@ class Handler(BaseHTTPRequestHandler):
         path: str,
         body_digest: str,
         requested_operation: str,
-        requested_capability_version: int,
+        requested_scope: Any,
     ) -> None:
-        # 次序：委托存在、范围（路径机器、操作、能力版本），时间窗口，
+        # 次序：委托存在、范围（路径机器、操作、能力版本或争议标识），时间窗口，
         # 再判过期/已用/已撤销/签发版本失效与代理公钥严格验签。
         delegation = database.execute(
             "SELECT issuer_machine_id, delegate_public_key, expires_at_ms,"
-            " issued_key_version, revoked, consumed, operation, capability_version"
+            " issued_key_version, revoked, consumed, operation, capability_version,"
+            " dispute_id"
             " FROM machine_delegations WHERE id = ?",
             (auth.machine_id,),
         ).fetchone()
@@ -1687,13 +1701,19 @@ class Handler(BaseHTTPRequestHandler):
             raise AuthRejected(HTTPStatus.UNAUTHORIZED, "invalid_authentication")
         if delegation["issuer_machine_id"] != expected_machine:
             raise AuthRejected(HTTPStatus.FORBIDDEN, "forbidden")
-        # 最小权限范围：操作与能力版本须与凭证一致，任一不符为 403，
-        # 且不消费凭证、随机数或事件序号。升级前凭证范围列为 NULL，
-        # 继续按原有无范围语义消费。
-        if delegation["operation"] is not None:
+        # 最小权限范围：操作须与凭证一致；能力授权比对 capabilityVersion，
+        # 单笔争议授权比对 disputeId。任一不符为 403，且不消费凭证、随机数或事件序号。
+        # 升级前凭证范围列为 NULL：仅保留原能力声明语义，不获得证据权限。
+        if requested_operation == DELEGATION_OPERATION_EVIDENCE_WRITE:
+            if (
+                delegation["operation"] != DELEGATION_OPERATION_EVIDENCE_WRITE
+                or delegation["dispute_id"] != requested_scope
+            ):
+                raise AuthRejected(HTTPStatus.FORBIDDEN, "forbidden")
+        elif delegation["operation"] is not None:
             if delegation["operation"] != requested_operation:
                 raise AuthRejected(HTTPStatus.FORBIDDEN, "forbidden")
-            if delegation["capability_version"] != requested_capability_version:
+            if delegation["capability_version"] != requested_scope:
                 raise AuthRejected(HTTPStatus.FORBIDDEN, "forbidden")
         now_ms = int(datetime.now(UTC).timestamp() * 1000)
         if abs(auth.request_time_ms - now_ms) > SLA_AUTH_SKEW_MS:
@@ -2160,7 +2180,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def _read_delegation_object(self, body: bytes) -> dict[str, Any] | None:
         parsed = self._read_json_object(body)
-        if parsed is None or set(parsed) != DELEGATION_FIELDS:
+        if parsed is None:
+            return None
+        keys = set(parsed)
+        capability_scope = keys == DELEGATION_FIELDS
+        dispute_scope = keys == DELEGATION_DISPUTE_FIELDS
+        # 五字段恰含一种范围标识：capabilityVersion 与 disputeId 缺失、重复、
+        # 混用或同时出现均为非法正文。
+        if not capability_scope and not dispute_scope:
             return None
         delegation_id = parsed["id"]
         if (
@@ -2181,13 +2208,26 @@ class Handler(BaseHTTPRequestHandler):
         now_ms = int(datetime.now(UTC).timestamp() * 1000)
         if not now_ms < expires_at <= now_ms + DELEGATION_MAX_TTL_MS:
             return None
-        # 最小权限范围：操作当前仅接受 capability.write。
+        # 最小权限范围：操作须与范围标识严格对应，不得混用。
         operation = parsed["operation"]
         if not isinstance(operation, str) or operation not in DELEGATION_OPERATIONS:
             return None
-        # 能力版本为 0..2147483646 的非布尔整数。
-        if not _bounded_int(parsed["capabilityVersion"], 0, 2147483646):
-            return None
+        if capability_scope:
+            if operation != DELEGATION_OPERATION_CAPABILITY_WRITE:
+                return None
+            # 能力版本为 0..2147483646 的非布尔整数。
+            if not _bounded_int(parsed["capabilityVersion"], 0, 2147483646):
+                return None
+        else:
+            if operation != DELEGATION_OPERATION_EVIDENCE_WRITE:
+                return None
+            # disputeId 沿用争议标识格式 [a-z0-9-]{1,64}。
+            dispute_id = parsed["disputeId"]
+            if (
+                not isinstance(dispute_id, str)
+                or TEMPLATE_ID_PATTERN.fullmatch(dispute_id) is None
+            ):
+                return None
         return parsed
 
     def _apply_delegation(
@@ -2238,13 +2278,14 @@ class Handler(BaseHTTPRequestHandler):
                     return HTTPStatus.CONFLICT, {"error": "conflict"}
                 created_at_ms = int(datetime.now(UTC).timestamp() * 1000)
                 # 原子保存签发密钥版本与最小权限范围：代理使用时该版本须仍为最新
-                # 有效版本，操作与能力版本须与凭证范围一致。
+                # 有效版本，操作与能力版本/争议标识须与凭证范围一致。
+                is_evidence_scope = "disputeId" in fields
                 database.execute(
                     "INSERT INTO machine_delegations"
                     "(id, issuer_machine_id, delegate_public_key, expires_at_ms,"
                     " issued_key_version, revoked, consumed, created_at_ms,"
-                    " operation, capability_version)"
-                    " VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?)",
+                    " operation, capability_version, dispute_id)"
+                    " VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)",
                     (
                         fields["id"],
                         auth.machine_id,
@@ -2253,7 +2294,8 @@ class Handler(BaseHTTPRequestHandler):
                         auth.key_version,
                         created_at_ms,
                         fields["operation"],
-                        fields["capabilityVersion"],
+                        None if is_evidence_scope else fields["capabilityVersion"],
+                        fields["disputeId"] if is_evidence_scope else None,
                     ),
                 )
                 # 签发事件与委托、幂等结果、随机数同事务追加，序号全库唯一递增。
@@ -3817,13 +3859,23 @@ class Handler(BaseHTTPRequestHandler):
         if legacy is not None:
             self._json(legacy[0], legacy[1])
             return
-        auth = self._parse_sla_auth()
+        # 非旧记录重放：认证结构必须合法，且先于资源与业务检查。
+        # 可用单值 SLA-Delegation 替代 SLA-Auth，两者并存即非法。
+        sla_auth_values = self.headers.get_all(SLA_AUTH_HEADER)
+        delegation_values = self.headers.get_all(SLA_DELEGATION_HEADER)
+        if sla_auth_values and delegation_values:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        delegation = bool(delegation_values)
+        auth = (
+            self._parse_sla_delegation() if delegation else self._parse_sla_auth()
+        )
         if auth is None:
             self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
         body_digest = hashlib.sha256(raw_body).hexdigest()
         status, payload = self._apply_evidence(
-            idempotency_key, dispute_id, fields, auth, body_digest
+            idempotency_key, dispute_id, fields, auth, body_digest, delegation
         )
         self._json(status, payload)
 
@@ -3858,6 +3910,7 @@ class Handler(BaseHTTPRequestHandler):
         fields: dict[str, Any],
         auth: SlaAuth,
         body_digest: str,
+        delegation: bool,
     ) -> tuple[HTTPStatus, dict[str, Any]]:
         request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
         standard_path = urlsplit(self.path).path
@@ -3898,10 +3951,22 @@ class Handler(BaseHTTPRequestHandler):
                     database.execute("ROLLBACK")
                     return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
                 try:
-                    # 认证机器标识须等于正文 actorId（参与方身份），再验时间、密钥、签名、随机数。
-                    self._verify_request_auth(
-                        database, auth, fields["actorId"], standard_path, body_digest
-                    )
+                    # 认证机器标识须等于正文 actorId（参与方身份），再验时间、密钥、签名、随机数；
+                    # 代理凭证改按委托记录与代理公钥校验，并须绑定本争议。
+                    if delegation:
+                        self._verify_delegation_auth(
+                            database,
+                            auth,
+                            fields["actorId"],
+                            standard_path,
+                            body_digest,
+                            DELEGATION_OPERATION_EVIDENCE_WRITE,
+                            dispute_id,
+                        )
+                    else:
+                        self._verify_request_auth(
+                            database, auth, fields["actorId"], standard_path, body_digest
+                        )
                     self._check_request_nonce(database, auth)
                 except AuthRejected as rejected:
                     database.execute("ROLLBACK")
@@ -3959,6 +4024,24 @@ class Handler(BaseHTTPRequestHandler):
                         auth.signature,
                     ),
                 )
+                # 只有首次证据成功才原子写入随机数；任何失败均不推进证据或事件序号。
+                if delegation:
+                    # 代理凭证一次性：消费标记与证据序号、幂等结果、随机数同事务提交；
+                    # 失败或同键重放均不消费凭证。
+                    database.execute(
+                        "UPDATE machine_delegations SET consumed = 1 WHERE id = ?",
+                        (auth.machine_id,),
+                    )
+                    # 成功消费事件同事务追加并保存标准路径与原始正文 SHA-256 摘要；
+                    # 已裁决、重复证据等失败路径不到达此处，不推进事件序号。
+                    self._append_delegation_event(
+                        database,
+                        auth.machine_id,
+                        "consumed",
+                        int(datetime.now(UTC).timestamp() * 1000),
+                        standard_path,
+                        body_digest,
+                    )
                 self._consume_request_nonce(database, auth)
                 database.execute("COMMIT")
                 return HTTPStatus.CREATED, payload
