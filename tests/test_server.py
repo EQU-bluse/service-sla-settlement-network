@@ -254,6 +254,9 @@ def seed_for_actor(actor_id: str) -> bytes:
 _SLA_AUTH_PATH_MACHINE = re.compile(r"^/v1/machines/([0-9a-f]{64})/capabilities$")
 _SLA_AUTH_CONFIRMATION = re.compile(r"^/v1/slas/([^/]+)/confirmations$")
 _SLA_AUTH_EVIDENCE = re.compile(r"^/v1/disputes/([^/]+)/evidence$")
+_SLA_AUTH_EVIDENCE_SNAPSHOT = re.compile(
+    r"^/v1/disputes/([^/]+)/evidence-snapshots$"
+)
 
 
 def _sla_auth_actor(path: str, body: bytes) -> str | None:
@@ -263,6 +266,7 @@ def _sla_auth_actor(path: str, body: bytes) -> str | None:
     if (
         _SLA_AUTH_CONFIRMATION.fullmatch(path) is not None
         or _SLA_AUTH_EVIDENCE.fullmatch(path) is not None
+        or _SLA_AUTH_EVIDENCE_SNAPSHOT.fullmatch(path) is not None
         or path == "/v1/evidence-proofs"
     ):
         try:
@@ -7166,6 +7170,946 @@ class DelegationEvidenceTests(_EvidenceScenario, unittest.TestCase):
         self.assertIsNone(record["evidenceSeq"])
         self.assertEqual(record["resource"], "/v1/disputes/dispute-1/evidence")
         self.assertGreater(record["createdAt"], 0)
+
+
+class EvidenceSnapshotTests(_EvidenceScenario, unittest.TestCase):
+    # 证据快照：POST 创建不可变快照，GET 集合与单笔审计读取。
+    def snapshot_body(self, actor: str | None = None) -> dict[str, object]:
+        return {"actorId": actor if actor is not None else self.consumer_id}
+
+    def post_snapshot(
+        self,
+        dispute_id: str = "dispute-1",
+        payload: object | None = None,
+        key: str | None = "snap-1",
+    ) -> tuple[int, bytes]:
+        if payload is None:
+            payload = self.snapshot_body()
+        return self.post_json(
+            f"/v1/disputes/{dispute_id}/evidence-snapshots", payload, key
+        )
+
+    def post_snapshot_raw(
+        self,
+        path: str,
+        body: bytes,
+        key: str | None,
+        *,
+        seed: bytes | None = None,
+        actor: str | None = None,
+        nonce: str | None = None,
+        request_time_ms: int | None = None,
+        auth: str | None = None,
+        delegation: str | None = None,
+    ) -> tuple[int, bytes]:
+        request = Request(self.url(path), data=body, method="POST")
+        if key is not None:
+            request.add_header("Idempotency-Key", key)
+        if delegation is not None:
+            request.add_header("SLA-Delegation", delegation)
+        elif auth is not None:
+            request.add_header("SLA-Auth", auth)
+        elif seed is not None:
+            request.add_header(
+                "SLA-Auth",
+                make_sla_auth(
+                    self.server,
+                    key,
+                    seed,
+                    actor,
+                    "POST",
+                    urlsplit(path).path,
+                    body,
+                    1,
+                    request_time_ms=request_time_ms,
+                    nonce=nonce,
+                ),
+            )
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def get_snapshot(
+        self,
+        path: str,
+        *,
+        seed: bytes | None = None,
+        actor: str | None = None,
+        nonce: str | None = None,
+        request_time_ms: int | None = None,
+        auth: str | None = None,
+        omit_auth: bool = False,
+    ) -> tuple[int, bytes]:
+        # 快照审计读取为 GET 且无正文；标准路径不含查询串，摘要按空字节计算。
+        request = Request(self.url(path), data=b"", method="GET")
+        if not omit_auth:
+            if auth is None:
+                # GET 审计无幂等键：每次调用都是独立请求，须分配独立随机数；
+                # 显式传入 nonce 的用例才可验证重放与“失败不消费”语义。
+                if nonce is None:
+                    nonce = f"nonce-snap-audit-{time.time_ns()}"
+                auth = make_sla_auth(
+                    self.server,
+                    None,
+                    seed if seed is not None else PUBLIC_KEY_SEED_B,
+                    actor if actor is not None else self.consumer_id,
+                    "GET",
+                    urlsplit(path).path,
+                    b"",
+                    1,
+                    request_time_ms=request_time_ms,
+                    nonce=nonce,
+                )
+            request.add_header("SLA-Auth", auth)
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def add_evidence(
+        self,
+        evidence_id: str,
+        digest: str,
+        key: str,
+        *,
+        actor: str | None = None,
+        observed_at: int | None = None,
+    ) -> int:
+        status, body = self.post_evidence(
+            payload=self.evidence_body(
+                evidenceId=evidence_id,
+                digest=digest,
+                actorId=actor if actor is not None else self.consumer_id,
+                observedAt=self.start * 1000 if observed_at is None else observed_at,
+            ),
+            key=key,
+        )
+        self.assertEqual(status, 201, body)
+        return json.loads(body)["evidenceSeq"]
+
+    def add_proof(self, evidence_seq: int, seed: bytes, digest: str, key: str) -> int:
+        actor = machine_id(_ed25519_public_key(seed).hex())
+        message = (
+            f"proof-v1\ndispute-1\n{evidence_seq}\n{digest}\n{actor}"
+        ).encode("utf-8")
+        status, body = self.post_json(
+            "/v1/evidence-proofs",
+            {
+                "evidenceSeq": evidence_seq,
+                "actorId": actor,
+                "signature": _ed25519_sign(seed, message).hex(),
+            },
+            key,
+        )
+        self.assertEqual(status, 201, body)
+        return json.loads(body)["proofSeq"]
+
+    # ---- POST 创建 ----
+
+    def test_snapshot_created_empty_evidence_with_ordered_body(self) -> None:
+        status, body = self.post_snapshot()
+        self.assertEqual(status, 201)
+        payload = json.loads(body)
+        self.assertEqual(
+            list(payload),
+            [
+                "snapshotSeq",
+                "evidenceSeqBound",
+                "proofSeqBound",
+                "digest",
+                "createdBy",
+                "createdAt",
+                "evidence",
+            ],
+        )
+        self.assertEqual(payload["snapshotSeq"], 1)
+        self.assertEqual(payload["evidenceSeqBound"], 0)
+        self.assertEqual(payload["proofSeqBound"], 0)
+        self.assertEqual(payload["createdBy"], self.consumer_id)
+        self.assertIsInstance(payload["createdAt"], int)
+        self.assertGreaterEqual(payload["createdAt"], 0)
+        self.assertEqual(payload["evidence"], [])
+        document = {
+            "disputeId": "dispute-1",
+            "evidenceSeqBound": 0,
+            "proofSeqBound": 0,
+            "evidence": [],
+        }
+        self.assertEqual(
+            payload["digest"],
+            hashlib.sha256(
+                json.dumps(document, separators=(",", ":")).encode()
+            ).hexdigest(),
+        )
+
+    def test_snapshot_contains_evidence_and_proofs_in_global_order(self) -> None:
+        first_seq = self.add_evidence("ev-a", "aa" * 32, "ev-a-k")
+        second_seq = self.add_evidence(
+            "ev-b", "bb" * 32, "ev-b-k", actor=self.machine_id, observed_at=2000
+        )
+        proof_first = self.add_proof(first_seq, PUBLIC_KEY_SEED_B, "aa" * 32, "pf-a")
+        proof_second = self.add_proof(
+            second_seq, PRODUCER_SEED, "bb" * 32, "pf-b"
+        )
+        status, body = self.post_snapshot(
+            payload=self.snapshot_body(self.machine_id), key="snap-full"
+        )
+        self.assertEqual(status, 201)
+        payload = json.loads(body)
+        self.assertEqual(payload["snapshotSeq"], 1)
+        self.assertEqual(payload["evidenceSeqBound"], 2)
+        self.assertEqual(payload["proofSeqBound"], 2)
+        evidence = payload["evidence"]
+        self.assertEqual(
+            [list(item) for item in evidence],
+            [
+                [
+                    "evidenceSeq",
+                    "evidenceId",
+                    "actorId",
+                    "observedAt",
+                    "digest",
+                    "proofs",
+                ],
+                [
+                    "evidenceSeq",
+                    "evidenceId",
+                    "actorId",
+                    "observedAt",
+                    "digest",
+                    "proofs",
+                ],
+            ],
+        )
+        self.assertEqual(
+            [item["evidenceSeq"] for item in evidence], [first_seq, second_seq]
+        )
+        self.assertEqual(evidence[1]["evidenceId"], "ev-b")
+        self.assertEqual(evidence[1]["actorId"], self.machine_id)
+        self.assertEqual(evidence[1]["observedAt"], 2000)
+        first_proofs = evidence[0]["proofs"]
+        self.assertEqual(
+            [list(item) for item in first_proofs],
+            [["proofSeq", "actorId", "signature", "verified", "createdAt"]],
+        )
+        self.assertEqual(first_proofs[0]["proofSeq"], proof_first)
+        self.assertEqual(first_proofs[0]["actorId"], self.consumer_id)
+        self.assertIs(first_proofs[0]["verified"], True)
+        self.assertEqual(len(first_proofs[0]["signature"]), 128)
+        second_proofs = evidence[1]["proofs"]
+        self.assertEqual(second_proofs[0]["proofSeq"], proof_second)
+        self.assertEqual(second_proofs[0]["actorId"], self.machine_id)
+        # 摘要覆盖争议标识、两个上界与证据数组的紧凑 JSON。
+        document = {
+            "disputeId": "dispute-1",
+            "evidenceSeqBound": 2,
+            "proofSeqBound": 2,
+            "evidence": evidence,
+        }
+        document_bytes = json.dumps(document, separators=(",", ":")).encode("utf-8")
+        self.assertEqual(
+            hashlib.sha256(document_bytes).hexdigest(), payload["digest"]
+        )
+
+    def test_later_evidence_and_proofs_do_not_change_old_snapshot(self) -> None:
+        self.add_evidence("ev-a", "aa" * 32, "ev-a-k")
+        status, first = self.post_snapshot(key="snap-1")
+        self.assertEqual(status, 201)
+        first_payload = json.loads(first)
+        self.add_evidence("ev-b", "bb" * 32, "ev-b-k", actor=self.machine_id)
+        self.add_proof(1, PUBLIC_KEY_SEED_B, "aa" * 32, "pf-late")
+        status, single = self.get_snapshot(
+            "/v1/disputes/dispute-1/evidence-snapshots/1",
+            seed=PRODUCER_SEED,
+            actor=self.machine_id,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(single, first)
+        self.assertEqual(json.loads(single), first_payload)
+
+    def test_both_parties_may_create_snapshots(self) -> None:
+        status, body = self.post_snapshot(
+            payload=self.snapshot_body(self.consumer_id), key="snap-c"
+        )
+        self.assertEqual(status, 201, body)
+        status, body = self.post_snapshot(
+            payload=self.snapshot_body(self.machine_id), key="snap-p"
+        )
+        self.assertEqual(status, 201, body)
+        self.assertEqual([json.loads(body)["snapshotSeq"]], [2])
+
+    def test_replay_same_key_returns_first_bytes(self) -> None:
+        status, first = self.post_snapshot()
+        self.assertEqual(status, 201)
+        status, replay = self.post_snapshot()
+        self.assertEqual(status, 201)
+        self.assertEqual(replay, first)
+
+    def test_replay_survives_restart(self) -> None:
+        status, first = self.post_snapshot()
+        self.assertEqual(status, 201)
+        self.restart()
+        status, replay = self.post_snapshot()
+        self.assertEqual(status, 201)
+        self.assertEqual(replay, first)
+        status, body = self.get_snapshot(
+            "/v1/disputes/dispute-1/evidence-snapshots/1"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body, first)
+
+    def test_same_key_different_body_path_or_auth_conflicts(self) -> None:
+        status, _ = self.post_snapshot()
+        self.assertEqual(status, 201)
+        # 同键异正文冲突，且先于争议查询。
+        status, body = self.post_snapshot(
+            payload=self.snapshot_body(self.machine_id)
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+        # 同键异路径冲突，即使争议不存在也先判幂等记录。
+        status, body = self.post_snapshot(dispute_id="dispute-other")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+        # 同键更换认证五段（异随机数）同样冲突。
+        raw = json.dumps(self.snapshot_body()).encode()
+        status, body = self.post_snapshot_raw(
+            "/v1/disputes/dispute-1/evidence-snapshots",
+            raw,
+            "snap-1",
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+            nonce="nonce-replay-other-0000000001",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_missing_or_invalid_dispute_is_not_found(self) -> None:
+        for dispute_id in ("missing", quote("BAD ID"), "x%2Fy"):
+            status, body = self.post_snapshot(
+                dispute_id=dispute_id, key="snap-missing"
+            )
+            self.assertEqual(status, 404, dispute_id)
+            self.assertEqual(json.loads(body), {"error": "not_found"})
+
+    def test_actor_must_be_party_and_match_auth_machine(self) -> None:
+        status, _ = self.post_json(
+            "/v1/machines", {"publicKey": PUBLIC_KEY_C}, "register-3"
+        )
+        self.assertEqual(status, 201)
+        stranger = machine_id(PUBLIC_KEY_C)
+        raw = json.dumps(self.snapshot_body(stranger)).encode()
+        status, body = self.post_snapshot_raw(
+            "/v1/disputes/dispute-1/evidence-snapshots",
+            raw,
+            "snap-stranger",
+            seed=PUBLIC_KEY_SEED_C,
+            actor=stranger,
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body), {"error": "forbidden"})
+        # 正文 actorId 与认证机器不一致：生产方密钥签消费方身份。
+        raw = json.dumps(self.snapshot_body(self.consumer_id)).encode()
+        status, body = self.post_snapshot_raw(
+            "/v1/disputes/dispute-1/evidence-snapshots",
+            raw,
+            "snap-mismatch",
+            seed=PRODUCER_SEED,
+            actor=self.machine_id,
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body), {"error": "forbidden"})
+
+    def test_resolved_dispute_rejects_creation_but_allows_reads(self) -> None:
+        status, first = self.post_snapshot()
+        self.assertEqual(status, 201)
+        status, _ = self.post_json(
+            "/v1/disputes/dispute-1/resolution",
+            {"decision": "release"},
+            "resolve-1",
+        )
+        self.assertEqual(status, 200)
+        status, body = self.post_snapshot(key="snap-late")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "already_resolved"})
+        status, payload = self.get_snapshot(
+            "/v1/disputes/dispute-1/evidence-snapshots/1"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, first)
+
+    def test_invalid_requests(self) -> None:
+        valid = self.snapshot_body()
+        cases = [
+            b"",
+            b"{not json",
+            json.dumps({}).encode(),
+            json.dumps({"actorId": valid["actorId"], "extra": 1}).encode(),
+            json.dumps({"actorId": "zz"}).encode(),
+            json.dumps({"actorId": valid["actorId"].upper()}).encode(),
+            json.dumps({"actorId": 1}).encode(),
+        ]
+        for index, bad in enumerate(cases):
+            status, body = self.post_snapshot_raw(
+                "/v1/disputes/dispute-1/evidence-snapshots",
+                bad,
+                f"bad-{index}",
+                seed=PUBLIC_KEY_SEED_B,
+                actor=self.consumer_id,
+            )
+            self.assertEqual(status, 400, bad)
+            self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        # 缺少幂等头。
+        status, body = self.post_snapshot_raw(
+            "/v1/disputes/dispute-1/evidence-snapshots",
+            json.dumps(valid).encode(),
+            None,
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+        )
+        self.assertEqual(status, 400)
+        # 查询参数非法，先于一切资源查询。
+        request = Request(
+            self.url("/v1/disputes/dispute-1/evidence-snapshots?x=1"),
+            data=json.dumps(valid).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "snap-query")
+        add_sla_auth(request, self.server)
+        with self.assertRaises(HTTPError) as context:
+            urlopen(request, timeout=5)
+        self.assertEqual(context.exception.code, 400)
+        self.assertEqual(
+            json.loads(context.exception.read()), {"error": "invalid_request"}
+        )
+        # 缺少认证头。
+        status, body = self.post_snapshot_raw(
+            "/v1/disputes/dispute-1/evidence-snapshots",
+            json.dumps(valid).encode(),
+            "snap-no-auth",
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        # 携带代理头同样非法。
+        status, body = self.post_snapshot_raw(
+            "/v1/disputes/dispute-1/evidence-snapshots",
+            json.dumps(valid).encode(),
+            "snap-delegation",
+            delegation="del-1;0;0;nonce-delegation-00000000;" + "ab" * 64,
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+
+    def test_stale_request_is_401(self) -> None:
+        raw = json.dumps(self.snapshot_body()).encode()
+        stale = int(time.time() * 1000) - 301_000
+        status, body = self.post_snapshot_raw(
+            "/v1/disputes/dispute-1/evidence-snapshots",
+            raw,
+            "snap-stale",
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+            request_time_ms=stale,
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(body), {"error": "stale_request"})
+
+    def test_nonce_replay_detected_and_failure_does_not_consume(self) -> None:
+        raw = json.dumps(self.snapshot_body()).encode()
+        # 异键复用有效随机数：第二次为 replay_detected。
+        status, _ = self.post_snapshot_raw(
+            "/v1/disputes/dispute-1/evidence-snapshots",
+            raw,
+            "snap-nonce-1",
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+            nonce="nonce-snap-fixed-0000000001",
+        )
+        self.assertEqual(status, 201)
+        status, body = self.post_snapshot_raw(
+            "/v1/disputes/dispute-1/evidence-snapshots",
+            raw,
+            "snap-nonce-2",
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+            nonce="nonce-snap-fixed-0000000001",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "replay_detected"})
+        # 失败（已裁决，位于随机数检查之后、提交之前）不消费随机数：
+        # 同随机数第二次仍为 already_resolved 而非 replay_detected；
+        # 随后同一随机数用于成功的审计读取，证明未被占用。
+        status, _ = self.post_json(
+            "/v1/disputes/dispute-1/resolution",
+            {"decision": "release"},
+            "resolve-snap",
+        )
+        self.assertEqual(status, 200)
+        fixed_nonce = "nonce-snap-resolved-000001"
+        for _ in range(2):
+            status, body = self.post_snapshot_raw(
+                "/v1/disputes/dispute-1/evidence-snapshots",
+                raw,
+                "snap-resolved",
+                seed=PUBLIC_KEY_SEED_B,
+                actor=self.consumer_id,
+                nonce=fixed_nonce,
+            )
+            self.assertEqual(status, 409)
+            self.assertEqual(json.loads(body), {"error": "already_resolved"})
+        status, body = self.get_snapshot(
+            "/v1/disputes/dispute-1/evidence-snapshots/1", nonce=fixed_nonce
+        )
+        self.assertEqual(status, 200, body)
+
+    def test_global_snapshot_sequence_spans_disputes(self) -> None:
+        status, body = self.post_snapshot(key="snap-d1")
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(body)["snapshotSeq"], 1)
+        self.create_second_dispute()
+        status, body = self.post_json(
+            "/v1/disputes/dispute-2/evidence-snapshots",
+            {"actorId": self.consumer_id},
+            "snap-d2",
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(body)["snapshotSeq"], 2)
+        # 失败请求不推进序号。
+        status, _ = self.post_json(
+            "/v1/disputes/missing/evidence-snapshots",
+            {"actorId": self.consumer_id},
+            "snap-missing",
+        )
+        self.assertEqual(status, 404)
+        status, body = self.post_snapshot(key="snap-d1-again")
+        self.assertEqual(json.loads(body)["snapshotSeq"], 3)
+
+    def test_concurrent_distinct_keys_get_unique_sequences(self) -> None:
+        results: list[int] = []
+        lock = threading.Lock()
+
+        def create(index: int) -> None:
+            status, body = self.post_snapshot(key=f"race-{index}")
+            with lock:
+                results.append(
+                    json.loads(body)["snapshotSeq"] if status == 201 else -1
+                )
+
+        threads = [threading.Thread(target=create, args=(i,)) for i in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual(sorted(results), [1, 2, 3, 4, 5, 6, 7, 8])
+
+    def test_concurrent_same_key_replays_single_snapshot(self) -> None:
+        bodies: list[bytes] = []
+        lock = threading.Lock()
+
+        def create() -> None:
+            status, body = self.post_snapshot(key="same-snap")
+            with lock:
+                bodies.append(body)
+                self.assertEqual(status, 201)
+
+        threads = [threading.Thread(target=create) for _ in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual(len(bodies), 6)
+        self.assertTrue(all(body == bodies[0] for body in bodies))
+        self.assertEqual(json.loads(bodies[0])["snapshotSeq"], 1)
+
+    # ---- GET 单笔 ----
+
+    def test_get_single_snapshot_returns_creation_object(self) -> None:
+        status, first = self.post_snapshot()
+        self.assertEqual(status, 201)
+        status, body = self.get_snapshot(
+            "/v1/disputes/dispute-1/evidence-snapshots/1"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body, first)
+
+    def test_get_single_allows_either_party_only(self) -> None:
+        status, _ = self.post_snapshot()
+        self.assertEqual(status, 201)
+        status, body = self.get_snapshot(
+            "/v1/disputes/dispute-1/evidence-snapshots/1",
+            seed=PRODUCER_SEED,
+            actor=self.machine_id,
+        )
+        self.assertEqual(status, 200, body)
+        status, _ = self.post_json(
+            "/v1/machines", {"publicKey": PUBLIC_KEY_C}, "register-3"
+        )
+        self.assertEqual(status, 201)
+        status, body = self.get_snapshot(
+            "/v1/disputes/dispute-1/evidence-snapshots/1",
+            seed=PUBLIC_KEY_SEED_C,
+            actor=machine_id(PUBLIC_KEY_C),
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body), {"error": "forbidden"})
+
+    def test_get_single_invalid_or_missing_refs_are_404(self) -> None:
+        status, _ = self.post_snapshot()
+        self.assertEqual(status, 201)
+        for seq_text in ("0", "01", "abc", "-1"):
+            status, body = self.get_snapshot(
+                f"/v1/disputes/dispute-1/evidence-snapshots/{seq_text}"
+            )
+            self.assertEqual(status, 404, seq_text)
+            self.assertEqual(json.loads(body), {"error": "not_found"})
+        status, body = self.get_snapshot(
+            "/v1/disputes/dispute-1/evidence-snapshots/99"
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+        status, body = self.get_snapshot(
+            "/v1/disputes/missing/evidence-snapshots/1"
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+
+    def test_get_single_rejects_query_params_and_bad_auth_structure(self) -> None:
+        status, _ = self.post_snapshot()
+        self.assertEqual(status, 201)
+        # 查询参数非法先于认证结构与争议查询。
+        request = Request(
+            self.url("/v1/disputes/dispute-1/evidence-snapshots/1?x=1"),
+            data=b"",
+            method="GET",
+        )
+        with self.assertRaises(HTTPError) as context:
+            urlopen(request, timeout=5)
+        self.assertEqual(context.exception.code, 400)
+        self.assertEqual(
+            json.loads(context.exception.read()), {"error": "invalid_request"}
+        )
+        # 缺少认证头。
+        status, body = self.get_snapshot(
+            "/v1/disputes/dispute-1/evidence-snapshots/1", omit_auth=True
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        # 携带代理头同样非法（快照读取仅接受单一 SLA-Auth）。
+        request = Request(
+            self.url("/v1/disputes/dispute-1/evidence-snapshots/1"),
+            data=b"",
+            method="GET",
+        )
+        request.add_header(
+            "SLA-Delegation", "del-1;0;0;nonce-delegation-00000000;" + "ab" * 64
+        )
+        with self.assertRaises(HTTPError) as context:
+            urlopen(request, timeout=5)
+        self.assertEqual(context.exception.code, 400)
+        self.assertEqual(
+            json.loads(context.exception.read()), {"error": "invalid_request"}
+        )
+        # 参数错误先于争议查询：不存在争议 + 非法参数仍为 400。
+        request = Request(
+            self.url("/v1/disputes/missing/evidence-snapshots/1?limit=0"),
+            data=b"",
+            method="GET",
+        )
+        with self.assertRaises(HTTPError) as context:
+            urlopen(request, timeout=5)
+        self.assertEqual(context.exception.code, 400)
+
+    def test_get_single_nonce_consumed_only_on_success(self) -> None:
+        status, _ = self.post_snapshot()
+        self.assertEqual(status, 201)
+        # 成功读取消费随机数：同随机数再次读取为 replay_detected。
+        path = "/v1/disputes/dispute-1/evidence-snapshots/1"
+        status, body = self.get_snapshot(
+            path, nonce="nonce-snap-get-success-000001"
+        )
+        self.assertEqual(status, 200, body)
+        status, body = self.get_snapshot(
+            path, nonce="nonce-snap-get-success-000001"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "replay_detected"})
+        # 失败（游标 cut 超前，位于随机数检查之后、提交之前）不消费随机数：
+        # 同一随机数两次均为 400 而非第二次变 409；随后不带游标即成功。
+        fixed_nonce = "nonce-snap-get-failed-0000001"
+        for _ in range(2):
+            status, body = self.get_snapshot(
+                "/v1/disputes/dispute-1/evidence-snapshots?cursor=99:1",
+                nonce=fixed_nonce,
+            )
+            self.assertEqual(status, 400)
+            self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        status, body = self.get_snapshot(path, nonce=fixed_nonce)
+        self.assertEqual(status, 200, body)
+
+    # ---- GET 集合 ----
+
+    def test_get_collection_empty_and_ordered_pages(self) -> None:
+        path = "/v1/disputes/dispute-1/evidence-snapshots"
+        status, body = self.get_snapshot(path)
+        self.assertEqual(status, 200)
+        empty = json.loads(body)
+        self.assertEqual(list(empty), ["snapshots", "nextCursor"])
+        self.assertEqual(empty, {"snapshots": [], "nextCursor": None})
+        first_status, first_body = self.post_snapshot(key="snap-col-1")
+        self.assertEqual(first_status, 201)
+        self.post_snapshot(
+            payload=self.snapshot_body(self.machine_id), key="snap-col-2"
+        )
+        status, body = self.get_snapshot(path)
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual([item["snapshotSeq"] for item in payload["snapshots"]], [1, 2])
+        self.assertIsNone(payload["nextCursor"])
+        self.assertEqual(payload["snapshots"][0], json.loads(first_body))
+
+    def test_get_collection_pagination_and_cursor_isolation(self) -> None:
+        self.post_snapshot(key="snap-page-1")
+        self.post_snapshot(key="snap-page-2")
+        status, first_page = self.get_snapshot(
+            "/v1/disputes/dispute-1/evidence-snapshots?limit=1"
+        )
+        self.assertEqual(status, 200)
+        first_payload = json.loads(first_page)
+        self.assertEqual(
+            [item["snapshotSeq"] for item in first_payload["snapshots"]], [1]
+        )
+        self.assertEqual(first_payload["nextCursor"], "2:1")
+        # 旧 cut 期间新增快照（含其他争议）不进入续页。
+        self.create_second_dispute()
+        status, other = self.post_json(
+            "/v1/disputes/dispute-2/evidence-snapshots",
+            {"actorId": self.consumer_id},
+            "snap-other",
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(other)["snapshotSeq"], 3)
+        status, second_page = self.get_snapshot(
+            "/v1/disputes/dispute-1/evidence-snapshots?limit=1"
+            f"&cursor={first_payload['nextCursor']}"
+        )
+        self.assertEqual(status, 200)
+        second_payload = json.loads(second_page)
+        self.assertEqual(
+            [item["snapshotSeq"] for item in second_payload["snapshots"]], [2]
+        )
+        self.assertIsNone(second_payload["nextCursor"])
+        # 续页在 cut=2 下到尾；新首页才取新 cut，且只含本争议快照。
+        status, fresh = self.get_snapshot(
+            "/v1/disputes/dispute-1/evidence-snapshots"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["snapshotSeq"] for item in json.loads(fresh)["snapshots"]],
+            [1, 2],
+        )
+
+    def test_get_collection_cursor_stable_across_restart(self) -> None:
+        for index in range(3):
+            status, _ = self.post_snapshot(key=f"snap-restart-{index}")
+            self.assertEqual(status, 201)
+        status, page = self.get_snapshot(
+            "/v1/disputes/dispute-1/evidence-snapshots?limit=2"
+        )
+        self.assertEqual(status, 200)
+        cursor = json.loads(page)["nextCursor"]
+        self.assertEqual(cursor, "3:2")
+        self.restart()
+        status, page = self.get_snapshot(
+            "/v1/disputes/dispute-1/evidence-snapshots?limit=2"
+            f"&cursor={cursor}"
+        )
+        self.assertEqual(status, 200)
+        payload = json.loads(page)
+        self.assertEqual(
+            [item["snapshotSeq"] for item in payload["snapshots"]], [3]
+        )
+        self.assertIsNone(payload["nextCursor"])
+
+    def test_get_collection_invalid_params_dispute_and_party(self) -> None:
+        self.post_snapshot()
+        for query in (
+            "limit=0",
+            "limit=101",
+            "limit=01",
+            "limit=1&limit=2",
+            "unknown=1",
+            "cursor=1",
+            "cursor=x:1",
+            "cursor=1:y",
+            "cursor=01:1",
+        ):
+            status, body = self.get_snapshot(
+                f"/v1/disputes/dispute-1/evidence-snapshots?{query}"
+            )
+            self.assertEqual(status, 400, query)
+            self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        # 参数错误先于争议查询。
+        status, body = self.get_snapshot(
+            "/v1/disputes/missing/evidence-snapshots?limit=0"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        # 争议不存在 404。
+        status, body = self.get_snapshot(
+            "/v1/disputes/missing/evidence-snapshots"
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+        # 非参与方 403。
+        status, _ = self.post_json(
+            "/v1/machines", {"publicKey": PUBLIC_KEY_C}, "register-3"
+        )
+        self.assertEqual(status, 201)
+        status, body = self.get_snapshot(
+            "/v1/disputes/dispute-1/evidence-snapshots",
+            seed=PUBLIC_KEY_SEED_C,
+            actor=machine_id(PUBLIC_KEY_C),
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body), {"error": "forbidden"})
+        # 缺少认证头 400，先于争议查询。
+        status, body = self.get_snapshot(
+            "/v1/disputes/missing/evidence-snapshots", omit_auth=True
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        # 携带代理头同样非法。
+        request = Request(
+            self.url("/v1/disputes/dispute-1/evidence-snapshots"),
+            data=b"",
+            method="GET",
+        )
+        request.add_header(
+            "SLA-Delegation", "del-1;0;0;nonce-delegation-00000001;" + "ab" * 64
+        )
+        with self.assertRaises(HTTPError) as context:
+            urlopen(request, timeout=5)
+        self.assertEqual(context.exception.code, 400)
+        self.assertEqual(
+            json.loads(context.exception.read()), {"error": "invalid_request"}
+        )
+
+    def test_get_collection_bad_cut_or_anchor_is_400(self) -> None:
+        self.post_snapshot()
+        self.create_second_dispute()
+        status, _ = self.post_json(
+            "/v1/disputes/dispute-2/evidence-snapshots",
+            {"actorId": self.consumer_id},
+            "snap-other",
+        )
+        self.assertEqual(status, 201)
+        # cut 超前。
+        status, body = self.get_snapshot(
+            "/v1/disputes/dispute-1/evidence-snapshots?cursor=99:1"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        # 锚点不存在。
+        status, body = self.get_snapshot(
+            "/v1/disputes/dispute-1/evidence-snapshots?cursor=2:9"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        # 锚点属于其他争议。
+        status, body = self.get_snapshot(
+            "/v1/disputes/dispute-1/evidence-snapshots?cursor=2:2"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+
+
+class EvidenceSnapshotStorageMigrationTests(unittest.TestCase):
+    # 旧库仅新增快照存储与序号状态，不改动既有争议、证据、证明、幂等与事件。
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.database_path = str(Path(self.temporary.name) / "service.db")
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_existing_data_untouched_when_snapshot_tables_recreated(self) -> None:
+        from sla_network.database import connect as database_connect
+
+        connection = database_connect(self.database_path)
+        try:
+            connection.execute(
+                "INSERT INTO disputes"
+                "(id, settlement_seq, claimant_id, payer_id, payee_id,"
+                " amount_micros, state)"
+                " VALUES ('dispute-legacy', 1, ?, ?, ?, 1000, 'open')",
+                ("a" * 64, "a" * 64, "b" * 64),
+            )
+            connection.execute(
+                "INSERT INTO dispute_evidences"
+                "(evidence_seq, dispute_id, evidence_id, actor_id,"
+                " observed_at_ms, digest)"
+                " VALUES (1, 'dispute-legacy', 'ev-legacy', ?, 0, ?)",
+                ("a" * 64, "ab" * 32),
+            )
+            connection.execute(
+                "INSERT INTO dispute_evidence_proofs"
+                "(proof_seq, evidence_seq, actor_id, signature, verified,"
+                " created_at_ms)"
+                " VALUES (1, 1, ?, ?, 1, 0)",
+                ("a" * 64, "cd" * 64),
+            )
+            # 模拟旧库：移除新快照表与索引，其余对象保持不变。
+            connection.execute("DROP TABLE dispute_evidence_snapshots")
+            connection.execute(
+                "DROP TABLE dispute_evidence_snapshot_idempotency_records"
+            )
+            connection.execute(
+                "DROP INDEX IF EXISTS idx_dispute_evidence_snapshots_dispute_seq"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        connection = database_connect(self.database_path)
+        try:
+            # 既有争议、证据、证明原样保留。
+            dispute = connection.execute(
+                "SELECT id, state FROM disputes WHERE id = 'dispute-legacy'"
+            ).fetchone()
+            self.assertEqual(tuple(dispute), ("dispute-legacy", "open"))
+            evidence = connection.execute(
+                "SELECT evidence_seq, evidence_id, digest FROM dispute_evidences"
+                " WHERE dispute_id = 'dispute-legacy'"
+            ).fetchone()
+            self.assertEqual(tuple(evidence), (1, "ev-legacy", "ab" * 32))
+            proof = connection.execute(
+                "SELECT proof_seq, signature FROM dispute_evidence_proofs"
+                " WHERE evidence_seq = 1"
+            ).fetchone()
+            self.assertEqual(tuple(proof), (1, "cd" * 64))
+            # 新快照存储存在且为空，序号从 1 起。
+            count = connection.execute(
+                "SELECT COUNT(*) AS c FROM dispute_evidence_snapshots"
+            ).fetchone()["c"]
+            self.assertEqual(count, 0)
+            connection.execute(
+                "INSERT INTO dispute_evidence_snapshots"
+                "(snapshot_seq, dispute_id, evidence_seq_bound, proof_seq_bound,"
+                " digest, created_by, created_at_ms, document_json, response_json)"
+                " VALUES (1, 'dispute-legacy', 1, 1, ?, ?, 0, '{}', '{}')",
+                ("ef" * 32, "a" * 64),
+            )
+            row = connection.execute(
+                "SELECT snapshot_seq, evidence_seq_bound, proof_seq_bound"
+                " FROM dispute_evidence_snapshots"
+            ).fetchone()
+            self.assertEqual(tuple(row), (1, 1, 1))
+            connection.commit()
+        finally:
+            connection.close()
 
 
 class EvidenceProofTests(unittest.TestCase):

@@ -254,6 +254,29 @@ CREATE TABLE IF NOT EXISTS dispute_evidence_proof_idempotency_records (
     auth_nonce TEXT,
     auth_signature TEXT
 );
+CREATE TABLE IF NOT EXISTS dispute_evidence_snapshots (
+    snapshot_seq INTEGER PRIMARY KEY,
+    dispute_id TEXT NOT NULL,
+    evidence_seq_bound INTEGER NOT NULL,
+    proof_seq_bound INTEGER NOT NULL,
+    digest TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    document_json TEXT NOT NULL,
+    response_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS dispute_evidence_snapshot_idempotency_records (
+    key TEXT PRIMARY KEY,
+    dispute_id TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    response_json TEXT NOT NULL,
+    auth_machine_id TEXT,
+    auth_key_version INTEGER,
+    auth_request_time_ms INTEGER,
+    auth_nonce TEXT,
+    auth_signature TEXT
+);
 CREATE TABLE IF NOT EXISTS machine_delegations (
     id TEXT PRIMARY KEY,
     issuer_machine_id TEXT NOT NULL,
@@ -308,6 +331,8 @@ CREATE TABLE IF NOT EXISTS auth_nonce_records (
 );
 CREATE INDEX IF NOT EXISTS idx_dispute_evidences_dispute_seq
 ON dispute_evidences(dispute_id, evidence_seq);
+CREATE INDEX IF NOT EXISTS idx_dispute_evidence_snapshots_dispute_seq
+ON dispute_evidence_snapshots(dispute_id, snapshot_seq);
 CREATE INDEX IF NOT EXISTS idx_dispute_evidence_proofs_evidence_seq
 ON dispute_evidence_proofs(evidence_seq, proof_seq);
 CREATE INDEX IF NOT EXISTS idx_auth_nonce_records_machine_time
