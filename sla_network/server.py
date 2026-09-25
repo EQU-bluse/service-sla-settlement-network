@@ -45,6 +45,9 @@ DISPUTE_EVIDENCE_SNAPSHOTS_PATH_PATTERN = re.compile(
 DISPUTE_EVIDENCE_SNAPSHOT_ITEM_PATH_PATTERN = re.compile(
     r"/v1/disputes/([^/]+)/evidence-snapshots/([^/]+)"
 )
+DISPUTE_ADJUDICATION_PROPOSALS_PATH_PATTERN = re.compile(
+    r"/v1/disputes/([^/]+)/adjudication-proposals"
+)
 DISPUTE_RESOLUTION_PATH_PATTERN = re.compile(r"/v1/disputes/([^/]+)/resolution")
 EVIDENCE_PROOFS_PATH_PATTERN = re.compile(r"/v1/evidence/([^/]+)/proofs")
 CAPABILITY_FIELDS = {"expectedVersion", "name", "protocol", "region", "unit", "capacity"}
@@ -69,6 +72,12 @@ DISPUTE_FIELDS = {"id", "settlementSeq", "claimantId"}
 RESOLUTION_FIELDS = {"decision"}
 EVIDENCE_FIELDS = {"evidenceId", "actorId", "observedAt", "digest"}
 EVIDENCE_SNAPSHOT_FIELDS = {"actorId"}
+ADJUDICATION_PROPOSAL_FIELDS = {
+    "actorId",
+    "snapshotSeq",
+    "decision",
+    "reasonDigest",
+}
 EVIDENCE_PROOF_FIELDS = {"evidenceSeq", "actorId", "signature"}
 KEY_ROTATION_FIELDS = {
     "expectedVersion",
@@ -89,6 +98,7 @@ LEDGER_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTE_EVENTS_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTE_EVIDENCE_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTE_EVIDENCE_SNAPSHOTS_QUERY_PARAMS = {"limit", "cursor"}
+DISPUTE_ADJUDICATION_PROPOSALS_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTES_QUERY_PARAMS = {"accountId", "state", "limit", "cursor"}
 MACHINE_DELEGATIONS_QUERY_PARAMS = {"limit", "cursor"}
 DELEGATION_EVENTS_QUERY_PARAMS = {"limit", "cursor"}
@@ -289,6 +299,14 @@ class Handler(BaseHTTPRequestHandler):
         if snapshot_collection_match is not None:
             self._get_evidence_snapshots(
                 snapshot_collection_match.group(1), target.query
+            )
+            return
+        adjudication_match = (
+            DISPUTE_ADJUDICATION_PROPOSALS_PATH_PATTERN.fullmatch(target.path)
+        )
+        if adjudication_match is not None:
+            self._get_adjudication_proposals(
+                adjudication_match.group(1), target.query
             )
             return
         dispute_match = DISPUTE_PATH_PATTERN.fullmatch(target.path)
@@ -1552,6 +1570,14 @@ class Handler(BaseHTTPRequestHandler):
         )
         if snapshot_match is not None:
             self._create_evidence_snapshot(snapshot_match.group(1))
+            return
+        adjudication_match = (
+            DISPUTE_ADJUDICATION_PROPOSALS_PATH_PATTERN.fullmatch(
+                urlsplit(self.path).path
+            )
+        )
+        if adjudication_match is not None:
+            self._create_adjudication_proposal(adjudication_match.group(1))
             return
         resolution_match = DISPUTE_RESOLUTION_PATH_PATTERN.fullmatch(self.path)
         if resolution_match is not None:
@@ -4844,6 +4870,348 @@ class Handler(BaseHTTPRequestHandler):
                 f"{cut}:{page[-1]['snapshot_seq']}" if has_next else None
             )
             return {"snapshots": snapshots, "nextCursor": next_cursor}
+
+        status, error, payload = self._read_snapshot_get(
+            dispute_id, auth, build, HTTPStatus.BAD_REQUEST
+        )
+        if payload is None:
+            self._json(status, {"error": error})
+            return
+        self._json(status, payload)
+
+    def _create_adjudication_proposal(self, dispute_id: str) -> None:
+        idempotency_key = self.headers.get("Idempotency-Key")
+        if (
+            idempotency_key is None
+            or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None
+        ):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 创建提案不接受任何查询参数：参数校验先于体校验与争议查询。
+        if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        raw_body = self._read_raw_body()
+        fields = (
+            None
+            if raw_body is None
+            else self._read_adjudication_proposal_object(raw_body)
+        )
+        if fields is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 仅支持单一 SLA-Auth：头缺失、重复、结构非法或携带代理头均为非法请求，
+        # 且先于争议查询。
+        if self.headers.get_all(SLA_DELEGATION_HEADER):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        auth = self._parse_sla_auth()
+        if auth is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        body_digest = hashlib.sha256(raw_body).hexdigest()
+        status, payload = self._apply_adjudication_proposal(
+            idempotency_key, dispute_id, fields, auth, body_digest
+        )
+        self._json(status, payload)
+
+    def _read_adjudication_proposal_object(self, body: bytes) -> dict[str, Any] | None:
+        parsed = self._read_json_object(body)
+        if parsed is None or set(parsed) != ADJUDICATION_PROPOSAL_FIELDS:
+            return None
+        actor_id = parsed["actorId"]
+        if (
+            not isinstance(actor_id, str)
+            or PUBLIC_KEY_PATTERN.fullmatch(actor_id) is None
+        ):
+            return None
+        # snapshotSeq 为非布尔正整数（不设上界）；超界或缺失按引用不存在处理（404）。
+        if not isinstance(parsed["snapshotSeq"], int) or isinstance(
+            parsed["snapshotSeq"], bool
+        ):
+            return None
+        if parsed["snapshotSeq"] < 1:
+            return None
+        decision = parsed["decision"]
+        if not isinstance(decision, str) or decision not in DISPUTE_DECISIONS:
+            return None
+        reason_digest = parsed["reasonDigest"]
+        if (
+            not isinstance(reason_digest, str)
+            or PUBLIC_KEY_PATTERN.fullmatch(reason_digest) is None
+        ):
+            return None
+        return parsed
+
+    def _apply_adjudication_proposal(
+        self,
+        idempotency_key: str,
+        dispute_id: str,
+        fields: dict[str, Any],
+        auth: SlaAuth,
+        body_digest: str,
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+        standard_path = urlsplit(self.path).path
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                # 幂等判定先于资源查询：同键更换路径、正文或认证五段均冲突。
+                record = database.execute(
+                    "SELECT dispute_id, request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature"
+                    " FROM dispute_adjudication_idempotency_records WHERE key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    if (
+                        record["dispute_id"] == dispute_id
+                        and record["request_json"] == request_json
+                        and self._auth_record_matches(record, auth)
+                    ):
+                        return HTTPStatus(record["status"]), json.loads(
+                            record["response_json"]
+                        )
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                dispute = database.execute(
+                    "SELECT settlement_seq, payer_id, payee_id, amount_micros, state"
+                    " FROM disputes WHERE id = ?",
+                    (dispute_id,),
+                ).fetchone()
+                if dispute is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                # 快照为引用资源：缺失或跨争议引用均在参与方身份判定之前返回 404。
+                snapshot = None
+                if fields["snapshotSeq"] <= INT64_MAX:
+                    snapshot = database.execute(
+                        "SELECT 1 FROM dispute_evidence_snapshots"
+                        " WHERE dispute_id = ? AND snapshot_seq = ?",
+                        (dispute_id, fields["snapshotSeq"]),
+                    ).fetchone()
+                if snapshot is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                actor_id = fields["actorId"]
+                if actor_id not in (dispute["payer_id"], dispute["payee_id"]):
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
+                try:
+                    # 认证机器标识须等于正文 actorId（争议参与方），
+                    # 再依次校验时间、密钥、签名、随机数。
+                    self._verify_request_auth(
+                        database, auth, actor_id, standard_path, body_digest
+                    )
+                    self._check_request_nonce(database, auth)
+                except AuthRejected as rejected:
+                    database.execute("ROLLBACK")
+                    return rejected.status, {"error": rejected.error}
+                if dispute["state"] != "open":
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "already_resolved"}
+                # 同一参与方仅保留一份提案：异键再提为 proposal_exists。
+                own = database.execute(
+                    "SELECT 1 FROM dispute_adjudication_proposals"
+                    " WHERE dispute_id = ? AND actor_id = ?",
+                    (dispute_id, actor_id),
+                ).fetchone()
+                if own is not None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "proposal_exists"}
+                peer = database.execute(
+                    "SELECT decision, snapshot_seq FROM dispute_adjudication_proposals"
+                    " WHERE dispute_id = ? AND actor_id <> ?",
+                    (dispute_id, actor_id),
+                ).fetchone()
+                decision = fields["decision"]
+                amount = dispute["amount_micros"]
+                # 双方引用同一快照且决定一致时原子执行既有 release/refund 裁决。
+                resolved = (
+                    peer is not None
+                    and peer["snapshot_seq"] == fields["snapshotSeq"]
+                    and peer["decision"] == decision
+                )
+                if resolved and decision == "refund":
+                    balance_record = database.execute(
+                        "SELECT balance_micros FROM ledger_accounts"
+                        " WHERE account_id = ?",
+                        (dispute["payee_id"],),
+                    ).fetchone()
+                    payee_balance = (
+                        balance_record["balance_micros"]
+                        if balance_record is not None
+                        else 0
+                    )
+                    # 退款校验总余额；不足时第二份提案及其他副作用均不保存。
+                    if payee_balance < amount:
+                        database.execute("ROLLBACK")
+                        return HTTPStatus.CONFLICT, {"error": "insufficient_funds"}
+                # 全库唯一持久递增加提案序号：取写锁后取最大序号 + 1（空表 1）。
+                proposal_seq = database.execute(
+                    "SELECT COALESCE(MAX(proposal_seq), 0) + 1 AS next_seq"
+                    " FROM dispute_adjudication_proposals"
+                ).fetchone()["next_seq"]
+                created_at_ms = int(datetime.now(UTC).timestamp() * 1000)
+                if resolved:
+                    result = "resolved"
+                    if decision == "refund":
+                        payee_after = self._adjust_account(
+                            database, dispute["payee_id"], -amount
+                        )
+                        payer_after = self._adjust_account(
+                            database, dispute["payer_id"], amount
+                        )
+                        self._record_entry(
+                            database, "dispute_refund", dispute["settlement_seq"],
+                            dispute["payee_id"], -amount, payee_after, created_at_ms,
+                        )
+                        self._record_entry(
+                            database, "dispute_refund", dispute["settlement_seq"],
+                            dispute["payer_id"], amount, payer_after, created_at_ms,
+                        )
+                    new_state = "refunded" if decision == "refund" else "released"
+                    database.execute(
+                        "UPDATE disputes SET state = ? WHERE id = ?",
+                        (new_state, dispute_id),
+                    )
+                    next_record = database.execute(
+                        "SELECT COALESCE(MAX(event_seq), 0) + 1 AS next_seq"
+                        " FROM dispute_events"
+                    ).fetchone()
+                    event_seq = next_record["next_seq"]
+                    database.execute(
+                        "INSERT INTO dispute_events"
+                        "(event_seq, dispute_id, type, created_at_ms)"
+                        " VALUES (?, ?, ?, ?)",
+                        (event_seq, dispute_id, new_state, created_at_ms),
+                    )
+                    stored_amount: int | None = amount
+                else:
+                    # 首方提案冻结快照摘要并等待；快照或决定不同则分歧，
+                    # 争议保持 open 与资金冻结。
+                    result = "pending" if peer is None else "disagreement"
+                    stored_amount = None
+                payload = {
+                    "proposalSeq": proposal_seq,
+                    "result": result,
+                    "decision": decision,
+                    "amount": stored_amount,
+                    "createdAt": created_at_ms,
+                }
+                response_json = json.dumps(payload, separators=(",", ":"))
+                database.execute(
+                    "INSERT INTO dispute_adjudication_proposals"
+                    "(proposal_seq, dispute_id, actor_id, snapshot_seq, decision,"
+                    " reason_digest, result, amount_micros, created_at_ms)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        proposal_seq,
+                        dispute_id,
+                        actor_id,
+                        fields["snapshotSeq"],
+                        decision,
+                        fields["reasonDigest"],
+                        result,
+                        stored_amount,
+                        created_at_ms,
+                    ),
+                )
+                database.execute(
+                    "INSERT INTO dispute_adjudication_idempotency_records"
+                    "(key, dispute_id, request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        dispute_id,
+                        request_json,
+                        int(HTTPStatus.CREATED),
+                        response_json,
+                        auth.machine_id,
+                        auth.key_version,
+                        auth.request_time_ms,
+                        auth.nonce,
+                        auth.signature,
+                    ),
+                )
+                # 提案、冻结摘要、幂等结果、随机数与资金和生命周期事件同事务提交；
+                # 任何失败路径都不到达此处，不消费随机数、不推进序号。
+                self._consume_request_nonce(database, auth)
+                database.execute("COMMIT")
+                return HTTPStatus.CREATED, payload
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+
+    def _get_adjudication_proposals(self, dispute_id: str, query: str) -> None:
+        # limit、cursor=cut:lastSeq 的格式、缺省值与校验次序沿用快照集合读取，
+        # 仅序号改为 proposalSeq。
+        parsed = self._parse_evaluation_query(
+            query, DISPUTE_ADJUDICATION_PROPOSALS_QUERY_PARAMS
+        )
+        if parsed is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        limit, cursor = parsed
+        if self.headers.get_all(SLA_DELEGATION_HEADER):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        auth = self._parse_sla_auth()
+        if auth is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+
+        def build(database: Any) -> dict[str, Any] | None:
+            # 首页以读事务起点的全库最大提案序号冻结 cut；空库为 0。
+            max_record = database.execute(
+                "SELECT MAX(proposal_seq) AS current_max"
+                " FROM dispute_adjudication_proposals"
+            ).fetchone()
+            current_max = max_record["current_max"] or 0
+            if cursor is None:
+                cut = current_max
+                last_seq = 0
+            else:
+                cut, last_seq = cursor
+                if cut > current_max:
+                    return None
+                # 锚点须属于目标争议且在当前快照内；属于其他争议或不存在均非法。
+                anchor = database.execute(
+                    "SELECT 1 FROM dispute_adjudication_proposals"
+                    " WHERE dispute_id = ? AND proposal_seq = ? AND proposal_seq <= ?",
+                    (dispute_id, last_seq, cut),
+                ).fetchone()
+                if anchor is None:
+                    return None
+            # 提案为不可变记录：结果与金额取创建时存储值，按全局序号升序分页；
+            # 冻结的快照摘要仍可经既有快照读取入口查看。
+            rows = database.execute(
+                "SELECT proposal_seq, result, decision, amount_micros, created_at_ms"
+                " FROM dispute_adjudication_proposals"
+                " WHERE dispute_id = ? AND proposal_seq <= ? AND proposal_seq > ?"
+                " ORDER BY proposal_seq ASC"
+                " LIMIT ?",
+                (dispute_id, cut, last_seq, limit + 1),
+            ).fetchall()
+            has_next = len(rows) > limit
+            page = rows[:limit]
+            proposals = [
+                {
+                    "proposalSeq": row["proposal_seq"],
+                    "result": row["result"],
+                    "decision": row["decision"],
+                    "amount": row["amount_micros"],
+                    "createdAt": row["created_at_ms"],
+                }
+                for row in page
+            ]
+            next_cursor = (
+                f"{cut}:{page[-1]['proposal_seq']}" if has_next else None
+            )
+            return {"proposals": proposals, "nextCursor": next_cursor}
 
         status, error, payload = self._read_snapshot_get(
             dispute_id, auth, build, HTTPStatus.BAD_REQUEST
