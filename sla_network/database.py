@@ -288,6 +288,12 @@ CREATE TABLE IF NOT EXISTS delegation_revocation_idempotency_records (
     auth_nonce TEXT,
     auth_signature TEXT
 );
+CREATE TABLE IF NOT EXISTS delegation_events (
+    event_seq INTEGER PRIMARY KEY,
+    delegation_id TEXT NOT NULL,
+    type TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS auth_nonce_records (
     machine_id TEXT NOT NULL,
     nonce TEXT NOT NULL,
@@ -312,6 +318,8 @@ DISPUTE_EVENT_MARKER = "dispute_events_backfilled"
 DISPUTE_EVENT_INDEX = "idx_dispute_events_dispute_seq"
 MACHINE_KEYS_MARKER = "machine_keys_backfilled"
 SLA_AUTH_MARKER = "sla_auth_added"
+DELEGATION_EVENT_MARKER = "delegation_events_backfilled"
+DELEGATION_EVENT_INDEX = "idx_delegation_events_delegation_seq"
 
 AUTH_IDEMPOTENCY_TABLES = (
     "capability_idempotency_records",
@@ -619,6 +627,63 @@ def _add_sla_auth(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _backfill_delegation_events(connection: sqlite3.Connection) -> None:
+    # 仅在一次性迁移（含空库首次连接）时取写锁；BEGIN IMMEDIATE 串行并发首启。
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        if (
+            connection.execute(
+                "SELECT 1 FROM schema_metadata WHERE key = ?",
+                (DELEGATION_EVENT_MARKER,),
+            ).fetchone()
+            is not None
+        ):
+            # 其他连接已完成迁移，直接释放写锁，不再补事件。
+            connection.execute("COMMIT")
+            return
+        # 旧库没有 delegation_events 表（新库由 SCHEMA 创建），单事务内补齐：
+        # 先按委托 rowid 升序为每张委托补一条 issued，再依现有 consumed/revoked
+        # 标记紧随补 consumed/revoked；时间一律记零，不改动委托与幂等等既有数据。
+        event_seq = 0
+        rows = connection.execute(
+            "SELECT rowid AS rid, id, consumed, revoked FROM machine_delegations"
+            " ORDER BY rowid ASC"
+        ).fetchall()
+        for row in rows:
+            event_seq += 1
+            connection.execute(
+                "INSERT INTO delegation_events(event_seq, delegation_id, type,"
+                " created_at_ms) VALUES (?, ?, 'issued', 0)",
+                (event_seq, row["id"]),
+            )
+            if row["consumed"]:
+                event_seq += 1
+                connection.execute(
+                    "INSERT INTO delegation_events(event_seq, delegation_id, type,"
+                    " created_at_ms) VALUES (?, ?, 'consumed', 0)",
+                    (event_seq, row["id"]),
+                )
+            if row["revoked"]:
+                event_seq += 1
+                connection.execute(
+                    "INSERT INTO delegation_events(event_seq, delegation_id, type,"
+                    " created_at_ms) VALUES (?, ?, 'revoked', 0)",
+                    (event_seq, row["id"]),
+                )
+        connection.execute(
+            "INSERT INTO schema_metadata(key, value) VALUES (?, '1')",
+            (DELEGATION_EVENT_MARKER,),
+        )
+        connection.execute(
+            f"CREATE INDEX IF NOT EXISTS {DELEGATION_EVENT_INDEX}"
+            " ON delegation_events(delegation_id, event_seq)"
+        )
+        connection.execute("COMMIT")
+    except BaseException:
+        connection.execute("ROLLBACK")
+        raise
+
+
 def connect(path: str) -> sqlite3.Connection:
     database = Path(path)
     database.parent.mkdir(parents=True, exist_ok=True)
@@ -693,6 +758,23 @@ def connect(path: str) -> sqlite3.Connection:
         is None
     ):
         _add_sla_auth(connection)
+    if (
+        connection.execute(
+            "SELECT 1 FROM schema_metadata WHERE key = ?",
+            (DELEGATION_EVENT_MARKER,),
+        ).fetchone()
+        is None
+    ):
+        _backfill_delegation_events(connection)
+    # 委托按签发事件序号分页：事件表 join 委托后需 (issuer, issued_seq) 索引。
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_delegation_events_delegation_seq"
+        " ON delegation_events(delegation_id, event_seq)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_machine_delegations_issuer"
+        " ON machine_delegations(issuer_machine_id, id)"
+    )
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_settlements_sla_seq"
         " ON settlements(sla_id, settlement_seq)"
