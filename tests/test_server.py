@@ -10449,6 +10449,999 @@ class ArbitrationTests(_EvidenceScenario, unittest.TestCase):
         )
 
 
+class AuditCheckpointTests(_EvidenceScenario, unittest.TestCase):
+    # 只读全库审计：--auditor 机器创建/读取一致性检查点；快照冻结账本上界，
+    # 逐账户重放并核对资金守恒、冻结、升级托管与仲裁结果。
+    AUDITOR_SEED = ARBITRATOR_SEED
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.auditor_id = machine_id(ARBITRATOR_PUBLIC)
+        # 审计机器同时承担终局仲裁角色，便于在同一机器上构造升级/仲裁场景。
+        self.server.auditors = frozenset({self.auditor_id})
+        self.server.arbitrators = frozenset({self.auditor_id})
+        status, _ = self.post_json(
+            "/v1/machines", {"publicKey": ARBITRATOR_PUBLIC}, "register-auditor"
+        )
+        self.assertEqual(status, 201)
+        # 场景终态：消费者余额 99000；生产者持有争议冻结 1000；清算 -100000。
+        self.producer_balance = 1000
+        self.consumer_balance = 99000
+        self.clearing_balance = -100000
+
+    def restart(self) -> None:
+        super().restart()
+        self.server.auditors = frozenset({self.auditor_id})
+        self.server.arbitrators = frozenset({self.auditor_id})
+
+    def checkpoint_path(self) -> str:
+        return "/v1/audit-checkpoints"
+
+    def post_checkpoint_raw(
+        self,
+        path: str,
+        body: bytes,
+        key: str | None,
+        *,
+        seed: bytes | None = None,
+        actor: str | None = None,
+        nonce: str | None = None,
+        request_time_ms: int | None = None,
+        auth_header: str | None = None,
+        delegation: str | None = None,
+        omit_auth: bool = False,
+    ) -> tuple[int, bytes]:
+        request = Request(self.url(path), data=body, method="POST")
+        if key is not None:
+            request.add_header("Idempotency-Key", key)
+        if delegation is not None:
+            request.add_header("SLA-Delegation", delegation)
+        elif not omit_auth:
+            request.add_header(
+                "SLA-Auth",
+                auth_header
+                if auth_header is not None
+                else make_sla_auth(
+                    self.server,
+                    key,
+                    seed if seed is not None else self.AUDITOR_SEED,
+                    actor if actor is not None else self.auditor_id,
+                    "POST",
+                    urlsplit(path).path,
+                    body,
+                    1,
+                    request_time_ms=request_time_ms,
+                    nonce=nonce,
+                ),
+            )
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def post_checkpoint(
+        self, key: str = "audit-1", *, body: bytes = b"{}", **kwargs: object
+    ) -> tuple[int, bytes]:
+        return self.post_checkpoint_raw(
+            self.checkpoint_path(), body, key, **kwargs  # type: ignore[arg-type]
+        )
+
+    def get_checkpoint(
+        self,
+        path: str,
+        *,
+        seed: bytes | None = None,
+        actor: str | None = None,
+        nonce: str | None = None,
+        auth_header: str | None = None,
+        omit_auth: bool = False,
+    ) -> tuple[int, bytes]:
+        request = Request(self.url(path), data=b"", method="GET")
+        if not omit_auth and auth_header is None:
+            # 每次读取分配独立随机数（成功读取会消费随机数）。
+            nonce = nonce or f"nonce-audit-get-{time.time_ns()}"
+            auth_header = make_sla_auth(
+                self.server,
+                None,
+                seed if seed is not None else self.AUDITOR_SEED,
+                actor if actor is not None else self.auditor_id,
+                "GET",
+                urlsplit(path).path,
+                b"",
+                1,
+                nonce=nonce,
+            )
+        if not omit_auth:
+            request.add_header("SLA-Auth", auth_header)
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    @staticmethod
+    def document_for(payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: payload[key]
+            for key in (
+                "entrySeqBound",
+                "consistent",
+                "accounts",
+                "disputes",
+                "escalations",
+                "arbitrations",
+                "clearing",
+                "differences",
+            )
+        }
+
+    def escalate_dispute(self) -> None:
+        # 复用终局仲裁场景：快照、两份分歧提案、回拨时间后升级。
+        status, body = self.post_json(
+            "/v1/disputes/dispute-1/evidence-snapshots",
+            {"actorId": self.consumer_id},
+            "audit-snap",
+        )
+        self.assertEqual(status, 201, body)
+        snapshot_seq = json.loads(body)["snapshotSeq"]
+        status, _ = self.post_json(
+            "/v1/disputes/dispute-1/adjudication-proposals",
+            {
+                "actorId": self.consumer_id,
+                "snapshotSeq": snapshot_seq,
+                "decision": "refund",
+                "reasonDigest": "cd" * 32,
+            },
+            "audit-prop-c",
+        )
+        self.assertEqual(status, 201)
+        status, _ = self.post_json(
+            "/v1/disputes/dispute-1/adjudication-proposals",
+            {
+                "actorId": self.machine_id,
+                "snapshotSeq": snapshot_seq,
+                "decision": "release",
+                "reasonDigest": "de" * 32,
+            },
+            "audit-prop-p",
+        )
+        self.assertEqual(status, 201)
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            connection.execute(
+                "UPDATE dispute_adjudication_proposals"
+                " SET created_at_ms = created_at_ms - 90000000"
+                " WHERE dispute_id = 'dispute-1'"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        status, body = self.post_json(
+            "/v1/disputes/dispute-1/escalations",
+            {"actorId": self.consumer_id},
+            "audit-esc",
+        )
+        self.assertEqual(status, 201, body)
+
+    def arbitrate_dispute(self, decision: str = "release", key: str = "audit-arb") -> None:
+        body = json.dumps({"decision": decision}).encode()
+        status, response = self.post_checkpoint_raw(
+            "/v1/disputes/dispute-1/arbitrations",
+            body,
+            key,
+        )
+        self.assertEqual(status, 201, response)
+
+    # ---- 创建：成功路径与摘要 ----
+
+    def test_create_checkpoint_consistent_snapshot(self) -> None:
+        status, body = self.post_checkpoint()
+        self.assertEqual(status, 201, body)
+        payload = json.loads(body)
+        self.assertEqual(
+            list(payload),
+            [
+                "checkpointSeq",
+                "entrySeqBound",
+                "digest",
+                "createdBy",
+                "createdAt",
+                "consistent",
+                "accounts",
+                "disputes",
+                "escalations",
+                "arbitrations",
+                "clearing",
+                "differences",
+            ],
+        )
+        self.assertEqual(payload["checkpointSeq"], 1)
+        self.assertEqual(payload["entrySeqBound"], 4)
+        self.assertEqual(payload["createdBy"], self.auditor_id)
+        self.assertIs(payload["consistent"], True)
+        self.assertIsInstance(payload["createdAt"], int)
+        self.assertGreaterEqual(payload["createdAt"], 0)
+        # 紧凑 JSON 且无尾换行。
+        self.assertEqual(
+            body, json.dumps(payload, separators=(",", ":")).encode()
+        )
+        accounts = {item["accountId"]: item for item in payload["accounts"]}
+        self.assertEqual(
+            [item["accountId"] for item in payload["accounts"]],
+            sorted(accounts),
+        )
+        self.assertEqual(
+            [list(item) for item in payload["accounts"]],
+            [
+                [
+                    "accountId",
+                    "storedBalance",
+                    "replayedBalance",
+                    "frozen",
+                    "availableBalance",
+                ]
+            ]
+            * len(accounts),
+        )
+        self.assertEqual(
+            accounts[self.consumer_id],
+            {
+                "accountId": self.consumer_id,
+                "storedBalance": self.consumer_balance,
+                "replayedBalance": self.consumer_balance,
+                "frozen": 0,
+                "availableBalance": self.consumer_balance,
+            },
+        )
+        # open 争议按收款账户冻结 1000，可用余额为存储余额扣冻结与零的较大值。
+        self.assertEqual(
+            accounts[self.machine_id],
+            {
+                "accountId": self.machine_id,
+                "storedBalance": self.producer_balance,
+                "replayedBalance": self.producer_balance,
+                "frozen": 1000,
+                "availableBalance": 0,
+            },
+        )
+        self.assertEqual(
+            accounts["external:clearing"]["storedBalance"], self.clearing_balance
+        )
+        self.assertEqual(len(payload["disputes"]), 1)
+        self.assertEqual(payload["disputes"][0]["disputeId"], "dispute-1")
+        self.assertEqual(payload["disputes"][0]["state"], "open")
+        self.assertEqual(payload["escalations"], [])
+        self.assertEqual(payload["arbitrations"], [])
+        self.assertEqual(payload["differences"], [])
+        clearing = payload["clearing"]
+        self.assertEqual(clearing["storedBalance"], self.clearing_balance)
+        self.assertEqual(clearing["escrowLiability"], 0)
+        self.assertEqual(clearing["depositTotal"], 100000)
+        self.assertEqual(clearing["expectedBalance"], self.clearing_balance)
+        # 摘要为审计内容紧凑 JSON 的 SHA-256 小写值。
+        document_bytes = json.dumps(
+            self.document_for(payload), separators=(",", ":")
+        ).encode()
+        self.assertEqual(
+            payload["digest"], hashlib.sha256(document_bytes).hexdigest()
+        )
+        self.assertRegex(payload["digest"], r"[0-9a-f]{64}")
+
+    def test_escalation_and_arbitration_accounting(self) -> None:
+        self.escalate_dispute()
+        status, body = self.post_checkpoint("audit-esc-cp")
+        self.assertEqual(status, 201, body)
+        payload = json.loads(body)
+        self.assertIs(payload["consistent"], True, body)
+        # 升级把 1000 自生产者划入清算：未仲裁升级金额计为清算负债。
+        accounts = {item["accountId"]: item for item in payload["accounts"]}
+        self.assertEqual(accounts[self.machine_id]["storedBalance"], 0)
+        self.assertEqual(accounts[self.machine_id]["frozen"], 0)
+        self.assertEqual(
+            accounts["external:clearing"]["storedBalance"], -99000
+        )
+        self.assertEqual(payload["clearing"]["escrowLiability"], 1000)
+        self.assertEqual(payload["disputes"][0]["state"], "escalated")
+        self.assertEqual(len(payload["escalations"]), 1)
+        escalation = payload["escalations"][0]
+        self.assertEqual(
+            list(escalation),
+            ["escalationSeq", "disputeId", "amount", "arbitrated"],
+        )
+        self.assertEqual(escalation["escalationSeq"], 1)
+        self.assertIs(escalation["arbitrated"], False)
+
+        self.arbitrate_dispute()
+        status, body = self.post_checkpoint("audit-arb-cp")
+        self.assertEqual(status, 201, body)
+        payload = json.loads(body)
+        self.assertIs(payload["consistent"], True, body)
+        accounts = {item["accountId"]: item for item in payload["accounts"]}
+        # release：清算划出 1000 归还生产者；托管负债清零。
+        self.assertEqual(accounts[self.machine_id]["storedBalance"], 1000)
+        self.assertEqual(
+            accounts["external:clearing"]["storedBalance"], -100000
+        )
+        self.assertEqual(payload["clearing"]["escrowLiability"], 0)
+        self.assertEqual(payload["disputes"][0]["state"], "released")
+        self.assertEqual(payload["escalations"][0]["arbitrated"], True)
+        self.assertEqual(len(payload["arbitrations"]), 1)
+        arbitration = payload["arbitrations"][0]
+        self.assertEqual(
+            list(arbitration),
+            [
+                "arbitrationSeq",
+                "escalationSeq",
+                "disputeId",
+                "arbitratorId",
+                "decision",
+                "amount",
+            ],
+        )
+        self.assertEqual(arbitration["arbitrationSeq"], 1)
+        self.assertEqual(arbitration["escalationSeq"], 1)
+        self.assertEqual(arbitration["decision"], "release")
+        self.assertEqual(arbitration["amount"], 1000)
+
+    def test_inconsistent_state_is_persisted_without_repair(self) -> None:
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            connection.execute(
+                "UPDATE ledger_accounts SET balance_micros = 99001"
+                " WHERE account_id = ?",
+                (self.consumer_id,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        status, body = self.post_checkpoint("audit-bad")
+        self.assertEqual(status, 201, body)
+        payload = json.loads(body)
+        self.assertIs(payload["consistent"], False)
+        differences = payload["differences"]
+        self.assertEqual(len(differences), 1)
+        difference = differences[0]
+        self.assertEqual(
+            list(difference),
+            [
+                "accountId",
+                "type",
+                "entrySeq",
+                "referenceSeq",
+                "expected",
+                "actual",
+            ],
+        )
+        self.assertEqual(difference["accountId"], self.consumer_id)
+        self.assertEqual(difference["type"], "balance_mismatch")
+        self.assertIsNone(difference["entrySeq"])
+        self.assertIsNone(difference["referenceSeq"])
+        self.assertEqual(difference["expected"], 99000)
+        self.assertEqual(difference["actual"], 99001)
+        # 业务数据未被修正。
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            stored = connection.execute(
+                "SELECT balance_micros FROM ledger_accounts WHERE account_id = ?",
+                (self.consumer_id,),
+            ).fetchone()[0]
+            self.assertEqual(stored, 99001)
+        finally:
+            connection.close()
+        # 后续检查点继续报告同一差异。
+        status, body = self.post_checkpoint("audit-bad-2")
+        self.assertEqual(status, 201)
+        self.assertIs(json.loads(body)["consistent"], False)
+
+    def test_checkpoint_sequences_advance_and_survive_restart(self) -> None:
+        status, first = self.post_checkpoint("audit-seq-1")
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(first)["checkpointSeq"], 1)
+        status, second = self.post_checkpoint("audit-seq-2")
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(second)["checkpointSeq"], 2)
+        self.restart()
+        status, body = self.get_checkpoint("/v1/audit-checkpoints/1")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, first)
+        status, third = self.post_checkpoint("audit-seq-3")
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(third)["checkpointSeq"], 3)
+
+    # ---- 幂等、随机数与并发 ----
+
+    def test_same_key_replays_first_bytes(self) -> None:
+        status, first = self.post_checkpoint("audit-replay")
+        self.assertEqual(status, 201)
+        status, replay = self.post_checkpoint("audit-replay")
+        self.assertEqual(status, 201)
+        self.assertEqual(replay, first)
+
+    def test_same_key_different_auth_conflicts(self) -> None:
+        status, _ = self.post_checkpoint("audit-conflict")
+        self.assertEqual(status, 201)
+        status, body = self.post_checkpoint(
+            "audit-conflict", nonce=f"nonce-other-{time.time_ns()}"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_replay_survives_restart(self) -> None:
+        status, first = self.post_checkpoint("audit-restart-key")
+        self.assertEqual(status, 201)
+        self.restart()
+        status, replay = self.post_checkpoint("audit-restart-key")
+        self.assertEqual(status, 201)
+        self.assertEqual(replay, first)
+
+    def test_nonce_replay_is_replay_detected_and_does_not_advance_seq(self) -> None:
+        shared_nonce = f"nonce-audit-shared-{time.time_ns()}"
+        status, first = self.post_checkpoint(
+            "audit-nonce-a", nonce=shared_nonce
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(first)["checkpointSeq"], 1)
+        status, body = self.post_checkpoint(
+            "audit-nonce-b", nonce=shared_nonce
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "replay_detected"})
+        status, third = self.post_checkpoint("audit-nonce-c")
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(third)["checkpointSeq"], 2)
+
+    def test_concurrent_distinct_keys_both_succeed_with_dense_seqs(self) -> None:
+        results: list[tuple[int, bytes]] = []
+        lock = threading.Lock()
+
+        def create(index: int) -> None:
+            outcome = self.post_checkpoint(f"audit-race-{index}")
+            with lock:
+                results.append(outcome)
+
+        threads = [
+            threading.Thread(target=create, args=(index,)) for index in range(4)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual([status for status, _ in results], [201] * 4)
+        self.assertEqual(
+            sorted(json.loads(body)["checkpointSeq"] for _, body in results),
+            [1, 2, 3, 4],
+        )
+
+    def test_concurrent_same_key_replays_single_result(self) -> None:
+        results: list[tuple[int, bytes]] = []
+        lock = threading.Lock()
+
+        def create() -> None:
+            outcome = self.post_checkpoint("audit-same-race")
+            with lock:
+                results.append(outcome)
+
+        threads = [threading.Thread(target=create) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual([status for status, _ in results], [201] * 4)
+        first = results[0][1]
+        self.assertTrue(all(body == first for _, body in results))
+
+    # ---- 请求校验与授权 ----
+
+    def test_invalid_requests(self) -> None:
+        for index, body in enumerate(
+            (
+                b"",
+                b"{",
+                b"[]",
+                b'{"a":1}',
+                b" ",
+            )
+        ):
+            request = Request(
+                self.url("/v1/audit-checkpoints"), data=body, method="POST"
+            )
+            request.add_header("Idempotency-Key", f"audit-bad-body-{index}")
+            request.add_header(
+                "SLA-Auth",
+                make_sla_auth(
+                    self.server,
+                    f"audit-bad-body-{index}",
+                    self.AUDITOR_SEED,
+                    self.auditor_id,
+                    "POST",
+                    "/v1/audit-checkpoints",
+                    body,
+                    1,
+                ),
+            )
+            try:
+                with urlopen(request, timeout=5) as response:
+                    status, raw = response.status, response.read()
+            except HTTPError as error:
+                status, raw = error.code, error.read()
+            self.assertEqual(status, 400, body)
+            self.assertEqual(json.loads(raw), {"error": "invalid_request"})
+        for key in (None, "", "bad key", "x" * 65):
+            request = Request(
+                self.url("/v1/audit-checkpoints"), data=b"{}", method="POST"
+            )
+            if key is not None:
+                request.add_header("Idempotency-Key", key)
+            request.add_header(
+                "SLA-Auth",
+                make_sla_auth(
+                    self.server,
+                    key,
+                    self.AUDITOR_SEED,
+                    self.auditor_id,
+                    "POST",
+                    "/v1/audit-checkpoints",
+                    b"{}",
+                    1,
+                ),
+            )
+            try:
+                with urlopen(request, timeout=5) as response:
+                    status, raw = response.status, response.read()
+            except HTTPError as error:
+                status, raw = error.code, error.read()
+            self.assertEqual(status, 400, key)
+            self.assertEqual(json.loads(raw), {"error": "invalid_request"})
+        # 查询参数一律拒绝。
+        status, body = self.post_checkpoint_raw(
+            "/v1/audit-checkpoints?x=1",
+            b"{}",
+            "audit-bad-query",
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        # 缺失、畸形认证头或代理头均为非法请求。
+        status, _ = self.post_checkpoint("audit-no-auth", omit_auth=True)
+        self.assertEqual(status, 400)
+        status, _ = self.post_checkpoint(
+            "audit-bad-auth", auth_header="bad"
+        )
+        self.assertEqual(status, 400)
+        status, _ = self.post_checkpoint(
+            "audit-delegation",
+            delegation="d;0;0;nonce-delegation-audit-01;" + "ab" * 64,
+        )
+        self.assertEqual(status, 400)
+
+    def test_unconfigured_auditor_is_forbidden(self) -> None:
+        self.server.auditors = frozenset()
+        status, body = self.post_checkpoint(
+            "audit-no-config",
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body), {"error": "forbidden"})
+        status, body = self.get_checkpoint(
+            "/v1/audit-checkpoints",
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body), {"error": "forbidden"})
+        status, body = self.get_checkpoint(
+            "/v1/audit-checkpoints/1",
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+        )
+        self.assertEqual(status, 403)
+
+    def test_non_auditor_machine_is_forbidden(self) -> None:
+        status, body = self.post_checkpoint(
+            "audit-stranger",
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body), {"error": "forbidden"})
+
+    def test_stale_and_invalid_authentication(self) -> None:
+        status, body = self.post_checkpoint(
+            "audit-stale",
+            request_time_ms=int(time.time() * 1000) - 301000,
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(body), {"error": "stale_request"})
+        ts = int(time.time() * 1000)
+        bad_header = (
+            f"{self.auditor_id};1;{ts};nonce-audit-bad-sig-01;" + "00" * 64
+        )
+        status, body = self.post_checkpoint(
+            "audit-bad-sig", auth_header=bad_header
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(body), {"error": "invalid_authentication"})
+        # 配置但未登记的审计机器：授权通过后验签失败。
+        ghost_seed = b"\x04" * 32
+        ghost_id = machine_id(_ed25519_public_key(ghost_seed).hex())
+        self.server.auditors = frozenset({ghost_id})
+        status, body = self.post_checkpoint(
+            "audit-ghost", seed=ghost_seed, actor=ghost_id
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(body), {"error": "invalid_authentication"})
+
+    # ---- 集合读取 ----
+
+    def test_get_collection_returns_summaries(self) -> None:
+        status, first = self.post_checkpoint("audit-list-1")
+        self.assertEqual(status, 201)
+        status, _ = self.post_checkpoint("audit-list-2")
+        self.assertEqual(status, 201)
+        status, body = self.get_checkpoint("/v1/audit-checkpoints")
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertEqual(list(payload), ["checkpoints", "nextCursor"])
+        self.assertIsNone(payload["nextCursor"])
+        self.assertEqual(len(payload["checkpoints"]), 2)
+        item = payload["checkpoints"][0]
+        self.assertEqual(
+            list(item),
+            ["checkpointSeq", "entrySeqBound", "digest", "createdBy", "createdAt"],
+        )
+        self.assertEqual(item["checkpointSeq"], 1)
+        self.assertEqual(item["digest"], json.loads(first)["digest"])
+        self.assertEqual(item["createdBy"], self.auditor_id)
+
+    def test_get_collection_pagination(self) -> None:
+        for index in range(3):
+            status, _ = self.post_checkpoint(f"audit-page-{index}")
+            self.assertEqual(status, 201)
+        status, body = self.get_checkpoint("/v1/audit-checkpoints?limit=2")
+        self.assertEqual(status, 200)
+        first_page = json.loads(body)
+        self.assertEqual(
+            [item["checkpointSeq"] for item in first_page["checkpoints"]],
+            [1, 2],
+        )
+        self.assertEqual(first_page["nextCursor"], "3:2")
+        status, body = self.get_checkpoint(
+            f"/v1/audit-checkpoints?limit=2&cursor={first_page['nextCursor']}"
+        )
+        self.assertEqual(status, 200)
+        second_page = json.loads(body)
+        self.assertEqual(
+            [item["checkpointSeq"] for item in second_page["checkpoints"]],
+            [3],
+        )
+        self.assertIsNone(second_page["nextCursor"])
+
+    def test_collection_cut_isolates_later_checkpoints(self) -> None:
+        status, _ = self.post_checkpoint("audit-cut-1")
+        self.assertEqual(status, 201)
+        status, _ = self.post_checkpoint("audit-cut-2")
+        self.assertEqual(status, 201)
+        status, body = self.get_checkpoint(
+            "/v1/audit-checkpoints?cursor=1:1"
+        )
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(payload["checkpoints"], [])
+        self.assertIsNone(payload["nextCursor"])
+
+    def test_collection_invalid_queries(self) -> None:
+        status, _ = self.post_checkpoint("audit-query-1")
+        self.assertEqual(status, 201)
+        for query in (
+            "limit=0",
+            "limit=101",
+            "limit=01",
+            "limit=1&limit=2",
+            "unknown=1",
+            "cursor=1",
+            "cursor=x:1",
+            "cursor=1:y",
+            "cursor=01:1",
+        ):
+            status, body = self.get_checkpoint(
+                f"/v1/audit-checkpoints?{query}"
+            )
+            self.assertEqual(status, 400, query)
+            self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        # 超前上界或不存在的锚点为非法请求。
+        status, body = self.get_checkpoint(
+            "/v1/audit-checkpoints?cursor=999:1"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        status, body = self.get_checkpoint(
+            "/v1/audit-checkpoints?cursor=1:5"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+
+    def test_collection_requires_auditor_and_auth(self) -> None:
+        status, body = self.get_checkpoint(
+            "/v1/audit-checkpoints",
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body), {"error": "forbidden"})
+        status, body = self.get_checkpoint(
+            "/v1/audit-checkpoints", omit_auth=True
+        )
+        self.assertEqual(status, 400)
+        status, _ = self.get_checkpoint(
+            "/v1/audit-checkpoints",
+            auth_header="bad",
+        )
+        self.assertEqual(status, 400)
+        self.server.auditors = frozenset()
+        status, _ = self.get_checkpoint("/v1/audit-checkpoints")
+        self.assertEqual(status, 403)
+
+    def test_collection_nonce_consumed_only_on_success(self) -> None:
+        status, _ = self.post_checkpoint("audit-get-nonce")
+        self.assertEqual(status, 201)
+        nonce = f"nonce-audit-get-{time.time_ns()}"
+        status, first = self.get_checkpoint(
+            "/v1/audit-checkpoints", nonce=nonce
+        )
+        self.assertEqual(status, 200)
+        status, body = self.get_checkpoint(
+            "/v1/audit-checkpoints", nonce=nonce
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "replay_detected"})
+        # 失败的读取不消费随机数：同一五段可再次失败。
+        failed_nonce = f"nonce-audit-get-fail-{time.time_ns()}"
+        header = make_sla_auth(
+            self.server,
+            None,
+            self.AUDITOR_SEED,
+            self.auditor_id,
+            "GET",
+            "/v1/audit-checkpoints",
+            b"",
+            1,
+            nonce=failed_nonce,
+        )
+        for _ in range(2):
+            status, _ = self.get_checkpoint(
+                "/v1/audit-checkpoints?cursor=999:1", auth_header=header
+            )
+            self.assertEqual(status, 400)
+
+    # ---- 单笔读取 ----
+
+    def test_get_item_returns_full_checkpoint(self) -> None:
+        status, first = self.post_checkpoint("audit-item-1")
+        self.assertEqual(status, 201)
+        status, body = self.get_checkpoint("/v1/audit-checkpoints/1")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, first)
+
+    def test_get_item_invalid_or_missing_is_not_found(self) -> None:
+        status, _ = self.post_checkpoint("audit-item-missing")
+        self.assertEqual(status, 201)
+        for seq_text in ("01", "0", "abc", "999"):
+            status, body = self.get_checkpoint(
+                f"/v1/audit-checkpoints/{seq_text}"
+            )
+            self.assertEqual(status, 404, seq_text)
+            self.assertEqual(json.loads(body), {"error": "not_found"})
+
+    def test_get_item_rejects_query_params_and_non_auditor(self) -> None:
+        status, _ = self.post_checkpoint("audit-item-auth")
+        self.assertEqual(status, 201)
+        status, body = self.get_checkpoint(
+            "/v1/audit-checkpoints/1?x=1"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        status, body = self.get_checkpoint(
+            "/v1/audit-checkpoints/1",
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+        )
+        self.assertEqual(status, 403)
+        status, _ = self.get_checkpoint(
+            "/v1/audit-checkpoints/1", omit_auth=True
+        )
+        self.assertEqual(status, 400)
+
+    def test_get_item_nonce_consumed_only_on_success(self) -> None:
+        status, _ = self.post_checkpoint("audit-item-nonce")
+        self.assertEqual(status, 201)
+        nonce = f"nonce-audit-item-{time.time_ns()}"
+        status, _ = self.get_checkpoint(
+            "/v1/audit-checkpoints/1", nonce=nonce
+        )
+        self.assertEqual(status, 200)
+        status, body = self.get_checkpoint(
+            "/v1/audit-checkpoints/1", nonce=nonce
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "replay_detected"})
+        missing_nonce = f"nonce-audit-item-missing-{time.time_ns()}"
+        for _ in range(2):
+            status, _ = self.get_checkpoint(
+                "/v1/audit-checkpoints/999", nonce=missing_nonce
+            )
+            self.assertEqual(status, 404)
+
+    def test_empty_database_checkpoint(self) -> None:
+        # 全新库：无任何业务分录时检查点仍一致，仅含零余额清算账户。
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        server = ApiServer(("127.0.0.1", 0), Handler)
+        server.database_path = str(Path(temporary.name) / "empty.db")
+        server.auditors = frozenset({self.auditor_id})
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        register = Request(
+            f"http://127.0.0.1:{server.server_port}/v1/machines",
+            data=json.dumps({"publicKey": ARBITRATOR_PUBLIC}).encode(),
+            method="POST",
+        )
+        register.add_header("Idempotency-Key", "register-empty-auditor")
+        with urlopen(register, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        body = b"{}"
+        nonce = f"nonce-empty-{time.time_ns()}"
+        ts = int(time.time() * 1000)
+        digest = hashlib.sha256(body).hexdigest()
+        message = (
+            f"request-auth-v1\nPOST\n/v1/audit-checkpoints\n{digest}\n"
+            f"{ts}\n{nonce}\n1\n{self.auditor_id}"
+        ).encode()
+        header = (
+            f"{self.auditor_id};1;{ts};{nonce};"
+            + _ed25519_sign(self.AUDITOR_SEED, message).hex()
+        )
+        request = Request(
+            f"http://127.0.0.1:{server.server_port}/v1/audit-checkpoints",
+            data=body,
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "empty-cp")
+        request.add_header("SLA-Auth", header)
+        with urlopen(request, timeout=5) as response:
+            status = response.status
+            raw = response.read()
+        self.assertEqual(status, 201, raw)
+        payload = json.loads(raw)
+        self.assertIs(payload["consistent"], True)
+        self.assertEqual(payload["entrySeqBound"], 0)
+        self.assertEqual(
+            [item["accountId"] for item in payload["accounts"]],
+            ["external:clearing"],
+        )
+        self.assertEqual(
+            payload["accounts"][0]["storedBalance"], 0
+        )
+        self.assertEqual(payload["differences"], [])
+
+
+class AuditorCliTests(unittest.TestCase):
+    # --auditor 启动参数：格式非法退出码 2；合法或省略时服务照常运行。
+
+    def test_invalid_auditor_format_exits_with_code_2(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "-m", "sla_network", "--auditor", "not-a-machine"],
+            capture_output=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 2)
+
+    def test_valid_auditor_flag_starts_service(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            probe = socket.socket()
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+            probe.close()
+            process = subprocess.Popen(
+                [
+                    sys.executable, "-m", "sla_network",
+                    "--host", "127.0.0.1",
+                    "--port", str(port),
+                    "--database", str(Path(directory) / "service.db"),
+                    "--auditor", machine_id(PUBLIC_KEY_C),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                for _ in range(50):
+                    try:
+                        with urlopen(
+                            f"http://127.0.0.1:{port}/health", timeout=1
+                        ) as response:
+                            self.assertEqual(response.status, 200)
+                            break
+                    except OSError:
+                        if process.poll() is not None:
+                            self.fail("service exited before serving")
+                        time.sleep(0.1)
+                else:
+                    self.fail("service did not start")
+            finally:
+                process.terminate()
+                process.wait(timeout=10)
+
+
+class AuditStorageMigrationTests(unittest.TestCase):
+    # 旧库升级仅新增审计存储与序号状态，不改动资金、争议、仲裁等历史记录。
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.database_path = str(Path(self.temporary.name) / "service.db")
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_old_database_keeps_history_and_gains_audit_storage(self) -> None:
+        from sla_network.database import connect as database_connect
+
+        connection = database_connect(self.database_path)
+        try:
+            connection.execute(
+                "INSERT INTO machines(id, public_key) VALUES (?, ?)",
+                ("a" * 64, "aa" * 32),
+            )
+            connection.execute(
+                "INSERT INTO ledger_accounts(account_id, balance_micros)"
+                " VALUES ('external:clearing', -7)",
+            )
+            connection.execute(
+                "INSERT INTO disputes"
+                "(id, settlement_seq, claimant_id, payer_id, payee_id,"
+                " amount_micros, state)"
+                " VALUES ('dispute-legacy', 1, ?, ?, ?, 1000, 'open')",
+                ("a" * 64, "a" * 64, "b" * 64),
+            )
+            # 模拟旧库：移除审计表与索引，其余对象保持不变。
+            connection.execute("DROP TABLE audit_checkpoints")
+            connection.execute(
+                "DROP TABLE audit_checkpoint_idempotency_records"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        connection = database_connect(self.database_path)
+        try:
+            # 历史记录原样保留。
+            clearing = connection.execute(
+                "SELECT balance_micros FROM ledger_accounts"
+                " WHERE account_id = 'external:clearing'"
+            ).fetchone()
+            self.assertEqual(tuple(clearing), (-7,))
+            dispute = connection.execute(
+                "SELECT id, state FROM disputes WHERE id = 'dispute-legacy'"
+            ).fetchone()
+            self.assertEqual(tuple(dispute), ("dispute-legacy", "open"))
+            # 审计存储存在且为空，序号自 1 起。
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM audit_checkpoints"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM audit_checkpoint_idempotency_records"
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            connection.close()
+
+
 class ArbitratorCliTests(unittest.TestCase):
     # --arbitrator 启动参数：格式非法退出码 2；合法或省略时服务照常运行。
     def test_invalid_arbitrator_format_exits_with_code_2(self) -> None:

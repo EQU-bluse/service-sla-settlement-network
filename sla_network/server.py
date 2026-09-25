@@ -57,6 +57,7 @@ DISPUTE_ARBITRATIONS_PATH_PATTERN = re.compile(
 )
 DISPUTE_RESOLUTION_PATH_PATTERN = re.compile(r"/v1/disputes/([^/]+)/resolution")
 EVIDENCE_PROOFS_PATH_PATTERN = re.compile(r"/v1/evidence/([^/]+)/proofs")
+AUDIT_CHECKPOINT_ITEM_PATH_PATTERN = re.compile(r"/v1/audit-checkpoints/([^/]+)")
 CAPABILITY_FIELDS = {"expectedVersion", "name", "protocol", "region", "unit", "capacity"}
 SLA_TEMPLATE_FIELDS = {
     "id",
@@ -109,6 +110,7 @@ DISPUTES_QUERY_PARAMS = {"accountId", "state", "limit", "cursor"}
 MACHINE_DELEGATIONS_QUERY_PARAMS = {"limit", "cursor"}
 DELEGATION_EVENTS_QUERY_PARAMS = {"limit", "cursor"}
 DELEGATION_CONSUMPTIONS_QUERY_PARAMS = {"limit", "cursor"}
+AUDIT_CHECKPOINTS_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTE_SNAPSHOT_STATES = {"open", "released", "refunded", "escalated"}
 ESCALATION_DELAY_MS = 86_400_000
 TELEMETRY_TIME_MAX = 2147483648000
@@ -188,6 +190,8 @@ class ApiServer(ThreadingHTTPServer):
     database_path: str
     # 启动时 --arbitrator 配置的终局仲裁机器集合；缺省为空（仲裁写入口不可达）。
     arbitrators: frozenset = frozenset()
+    # 启动时 --auditor 配置的审计机器集合；缺省为空（审计写入口一律 403）。
+    auditors: frozenset = frozenset()
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -329,6 +333,17 @@ class Handler(BaseHTTPRequestHandler):
         dispute_match = DISPUTE_PATH_PATTERN.fullmatch(target.path)
         if dispute_match is not None:
             self._get_dispute(dispute_match.group(1), target.query)
+            return
+        checkpoint_item_match = AUDIT_CHECKPOINT_ITEM_PATH_PATTERN.fullmatch(
+            target.path
+        )
+        if checkpoint_item_match is not None:
+            self._get_audit_checkpoint(
+                checkpoint_item_match.group(1), target.query
+            )
+            return
+        if target.path == "/v1/audit-checkpoints":
+            self._get_audit_checkpoints(target.query)
             return
         sla_match = SLA_PATH_PATTERN.fullmatch(target.path)
         if sla_match is not None:
@@ -1627,6 +1642,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if urlsplit(self.path).path == "/v1/delegations":
             self._create_delegation()
+            return
+        if urlsplit(self.path).path == "/v1/audit-checkpoints":
+            self._create_audit_checkpoint()
             return
         delegation_revocation_match = DELEGATION_PATH_PATTERN.fullmatch(
             urlsplit(self.path).path
@@ -6059,6 +6077,842 @@ class Handler(BaseHTTPRequestHandler):
                 database.execute("ROLLBACK")
                 raise
 
+    # ---- 只读全库审计检查点 ----
+
+    def _create_audit_checkpoint(self) -> None:
+        idempotency_key = self.headers.get("Idempotency-Key")
+        if (
+            idempotency_key is None
+            or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None
+        ):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 审计创建拒绝查询参数：参数校验先于体校验与认证结构。
+        if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 正文必须恰为空对象（重复键等非法 JSON 同样拒绝）。
+        raw_body = self._read_raw_body()
+        parsed = None if raw_body is None else self._read_json_object(raw_body)
+        if parsed is None or parsed:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 仅接受单一 SLA-Auth：代理头、缺失、重复或结构非法均为非法请求。
+        if self.headers.get_all(SLA_DELEGATION_HEADER):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        auth = self._parse_sla_auth()
+        if auth is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        body_digest = hashlib.sha256(raw_body).hexdigest()
+        status, payload = self._apply_audit_checkpoint(auth, body_digest, idempotency_key)
+        self._json(status, payload)
+
+    @staticmethod
+    def _audit_difference(
+        account_id: str,
+        difference_type: str,
+        entry_seq: int | None,
+        reference_seq: int | None,
+        expected: Any = None,
+        actual: Any = None,
+    ) -> dict[str, Any]:
+        return {
+            "accountId": account_id,
+            "type": difference_type,
+            "entrySeq": entry_seq,
+            "referenceSeq": reference_seq,
+            "expected": expected,
+            "actual": actual,
+        }
+
+    @staticmethod
+    def _audit_pair_delta(pair: list[dict[str, Any]]) -> int:
+        return sum(entry["delta_micros"] for entry in pair)
+
+    def _audit_entry_attribution(
+        self,
+        differences: list[dict[str, Any]],
+        account_id: str,
+        entry_seq: int,
+        settlement: Any,
+        evaluations: dict[int, Any],
+        sla_ids: set[str],
+    ) -> None:
+        # 结算须关联到存在的 SLA，且评估归属同一 SLA。
+        evaluation = evaluations.get(settlement["evaluation_seq"])
+        if (
+            settlement["sla_id"] not in sla_ids
+            or evaluation is None
+            or evaluation["sla_id"] != settlement["sla_id"]
+        ):
+            differences.append(
+                self._audit_difference(
+                    account_id,
+                    "entry_attribution",
+                    entry_seq,
+                    settlement["settlement_seq"],
+                    settlement["sla_id"],
+                    None if evaluation is None else evaluation["sla_id"],
+                )
+            )
+
+    def _build_audit_document(
+        self, database: Any, entry_seq_bound: int
+    ) -> dict[str, Any]:
+        # 在写事务内冻结账本上界、账户余额、争议冻结额、升级托管额与仲裁结果。
+        differences: list[dict[str, Any]] = []
+
+        deposits = {
+            row["deposit_seq"]: row
+            for row in database.execute(
+                "SELECT deposit_seq, machine_id, amount_micros FROM fund_deposits"
+            ).fetchall()
+        }
+        settlements = {
+            row["settlement_seq"]: row
+            for row in database.execute(
+                "SELECT settlement_seq, sla_id, evaluation_seq, result,"
+                " amount_micros, payer_id, payee_id FROM settlements"
+            ).fetchall()
+        }
+        evaluations = {
+            row["evaluation_seq"]: row
+            for row in database.execute(
+                "SELECT evaluation_seq, sla_id FROM sla_evaluation_idempotency_records"
+            ).fetchall()
+        }
+        sla_ids = {row["id"] for row in database.execute("SELECT id FROM slas")}
+        disputes_by_id: dict[str, Any] = {}
+        disputes_by_settlement: dict[int, Any] = {}
+        for row in database.execute(
+            "SELECT id, settlement_seq, claimant_id, payer_id, payee_id,"
+            " amount_micros, state FROM disputes"
+        ).fetchall():
+            disputes_by_id[row["id"]] = row
+            disputes_by_settlement[row["settlement_seq"]] = row
+        escalations = {
+            row["escalation_seq"]: row
+            for row in database.execute(
+                "SELECT escalation_seq, dispute_id, amount_micros"
+                " FROM dispute_escalations"
+            ).fetchall()
+        }
+        arbitrations = {
+            row["arbitration_seq"]: row
+            for row in database.execute(
+                "SELECT arbitration_seq, escalation_seq, dispute_id,"
+                " arbitrator_id, decision, amount_micros FROM dispute_arbitrations"
+            ).fetchall()
+        }
+
+        entries = [
+            dict(row)
+            for row in database.execute(
+                "SELECT entry_seq, kind, reference_seq, account_id, delta_micros,"
+                " balance_after_micros FROM ledger_entries"
+                " WHERE entry_seq <= ? ORDER BY entry_seq ASC",
+                (entry_seq_bound,),
+            ).fetchall()
+        ]
+        stored_balances = {
+            row["account_id"]: row["balance_micros"]
+            for row in database.execute(
+                "SELECT account_id, balance_micros FROM ledger_accounts"
+            ).fetchall()
+        }
+
+        # 每个 open 争议按收款账户计入冻结。
+        frozen_by_account: dict[str, int] = {}
+        for dispute in disputes_by_id.values():
+            if dispute["state"] == "open":
+                frozen_by_account[dispute["payee_id"]] = (
+                    frozen_by_account.get(dispute["payee_id"], 0)
+                    + dispute["amount_micros"]
+                )
+
+        account_ids = set(stored_balances) | {
+            entry["account_id"] for entry in entries
+        }
+        # 外部清算账户即使尚无任何分录也参与核对（余额取零）。
+        account_ids.add(CLEARING_ACCOUNT_ID)
+        entries_by_account: dict[str, list[dict[str, Any]]] = {
+            account_id: [] for account_id in account_ids
+        }
+        for entry in entries:
+            entries_by_account.setdefault(entry["account_id"], []).append(entry)
+
+        # 逐账户重放上界内分录：累计值、每步余额，并与存储余额核对。
+        accounts: list[dict[str, Any]] = []
+        for account_id in sorted(account_ids):
+            account_entries = entries_by_account.get(account_id, [])
+            running = 0
+            for entry in account_entries:
+                expected_balance = running + entry["delta_micros"]
+                if entry["balance_after_micros"] != expected_balance:
+                    differences.append(
+                        self._audit_difference(
+                            account_id,
+                            "step_balance_mismatch",
+                            entry["entry_seq"],
+                            entry["reference_seq"],
+                            expected_balance,
+                            entry["balance_after_micros"],
+                        )
+                    )
+                running = expected_balance
+            stored = stored_balances.get(account_id, 0)
+            if running != stored:
+                differences.append(
+                    self._audit_difference(
+                        account_id, "balance_mismatch", None, None, running, stored
+                    )
+                )
+            frozen = frozen_by_account.get(account_id, 0)
+            accounts.append(
+                {
+                    "accountId": account_id,
+                    "storedBalance": stored,
+                    "replayedBalance": running,
+                    "frozen": frozen,
+                    "availableBalance": max(0, stored - frozen),
+                }
+            )
+
+        # 逐笔核对方向、业务引用、SLA 与评估归属，并按 (kind, referenceSeq)
+        # 归集分录以便成对守恒核对。
+        pairs: dict[tuple[str, int], list[dict[str, Any]]] = {}
+        for entry in entries:
+            pairs.setdefault((entry["kind"], entry["reference_seq"]), []).append(entry)
+            account_id = entry["account_id"]
+            kind = entry["kind"]
+            reference_seq = entry["reference_seq"]
+            entry_seq = entry["entry_seq"]
+            delta = entry["delta_micros"]
+
+            if kind == "deposit":
+                deposit = deposits.get(reference_seq)
+                if deposit is None or account_id not in (
+                    deposit["machine_id"],
+                    CLEARING_ACCOUNT_ID,
+                ):
+                    differences.append(
+                        self._audit_difference(
+                            account_id, "entry_reference", entry_seq, reference_seq
+                        )
+                    )
+                    continue
+                expected_delta = (
+                    deposit["amount_micros"]
+                    if account_id == deposit["machine_id"]
+                    else -deposit["amount_micros"]
+                )
+                if delta != expected_delta:
+                    differences.append(
+                        self._audit_difference(
+                            account_id, "entry_direction", entry_seq, reference_seq,
+                            expected_delta, delta,
+                        )
+                    )
+                continue
+
+            if kind == "settlement":
+                settlement = settlements.get(reference_seq)
+                if settlement is None or account_id not in (
+                    settlement["payer_id"],
+                    settlement["payee_id"],
+                ):
+                    differences.append(
+                        self._audit_difference(
+                            account_id, "entry_reference", entry_seq, reference_seq
+                        )
+                    )
+                    continue
+                expected_delta = (
+                    -settlement["amount_micros"]
+                    if account_id == settlement["payer_id"]
+                    else settlement["amount_micros"]
+                )
+                if delta != expected_delta:
+                    differences.append(
+                        self._audit_difference(
+                            account_id, "entry_direction", entry_seq, reference_seq,
+                            expected_delta, delta,
+                        )
+                    )
+                self._audit_entry_attribution(
+                    differences, account_id, entry_seq, settlement,
+                    evaluations, sla_ids,
+                )
+                continue
+
+            if kind == "dispute_refund":
+                settlement = settlements.get(reference_seq)
+                dispute = disputes_by_settlement.get(reference_seq)
+                if (
+                    settlement is None
+                    or dispute is None
+                    or dispute["state"] != "refunded"
+                    or account_id not in (dispute["payer_id"], dispute["payee_id"])
+                ):
+                    differences.append(
+                        self._audit_difference(
+                            account_id, "entry_reference", entry_seq, reference_seq
+                        )
+                    )
+                    continue
+                expected_delta = (
+                    settlement["amount_micros"]
+                    if account_id == dispute["payer_id"]
+                    else -settlement["amount_micros"]
+                )
+                if delta != expected_delta:
+                    differences.append(
+                        self._audit_difference(
+                            account_id, "entry_direction", entry_seq, reference_seq,
+                            expected_delta, delta,
+                        )
+                    )
+                self._audit_entry_attribution(
+                    differences, account_id, entry_seq, settlement,
+                    evaluations, sla_ids,
+                )
+                continue
+
+            if kind == "dispute_escalation":
+                escalation = escalations.get(reference_seq)
+                dispute = (
+                    None if escalation is None
+                    else disputes_by_id.get(escalation["dispute_id"])
+                )
+                if (
+                    escalation is None
+                    or dispute is None
+                    or account_id not in (dispute["payee_id"], CLEARING_ACCOUNT_ID)
+                ):
+                    differences.append(
+                        self._audit_difference(
+                            account_id, "entry_reference", entry_seq, reference_seq
+                        )
+                    )
+                    continue
+                expected_delta = (
+                    -escalation["amount_micros"]
+                    if account_id == dispute["payee_id"]
+                    else escalation["amount_micros"]
+                )
+                if delta != expected_delta:
+                    differences.append(
+                        self._audit_difference(
+                            account_id, "entry_direction", entry_seq, reference_seq,
+                            expected_delta, delta,
+                        )
+                    )
+                settlement = settlements.get(dispute["settlement_seq"])
+                if settlement is not None:
+                    self._audit_entry_attribution(
+                        differences, account_id, entry_seq, settlement,
+                        evaluations, sla_ids,
+                    )
+                else:
+                    differences.append(
+                        self._audit_difference(
+                            account_id, "entry_attribution", entry_seq, reference_seq
+                        )
+                    )
+                continue
+
+            if kind == "dispute_arbitration":
+                arbitration = arbitrations.get(reference_seq)
+                dispute = (
+                    None if arbitration is None
+                    else disputes_by_id.get(arbitration["dispute_id"])
+                )
+                if arbitration is None or dispute is None:
+                    differences.append(
+                        self._audit_difference(
+                            account_id, "entry_reference", entry_seq, reference_seq
+                        )
+                    )
+                    continue
+                recipient_id = (
+                    dispute["payee_id"]
+                    if arbitration["decision"] == "release"
+                    else dispute["payer_id"]
+                )
+                expected_state = (
+                    "released"
+                    if arbitration["decision"] == "release"
+                    else "refunded"
+                )
+                if (
+                    dispute["state"] != expected_state
+                    or account_id not in (CLEARING_ACCOUNT_ID, recipient_id)
+                ):
+                    differences.append(
+                        self._audit_difference(
+                            account_id, "entry_reference", entry_seq, reference_seq
+                        )
+                    )
+                    continue
+                expected_delta = (
+                    -arbitration["amount_micros"]
+                    if account_id == CLEARING_ACCOUNT_ID
+                    else arbitration["amount_micros"]
+                )
+                if delta != expected_delta:
+                    differences.append(
+                        self._audit_difference(
+                            account_id, "entry_direction", entry_seq, reference_seq,
+                            expected_delta, delta,
+                        )
+                    )
+                settlement = settlements.get(dispute["settlement_seq"])
+                if settlement is not None:
+                    self._audit_entry_attribution(
+                        differences, account_id, entry_seq, settlement,
+                        evaluations, sla_ids,
+                    )
+                else:
+                    differences.append(
+                        self._audit_difference(
+                            account_id, "entry_attribution", entry_seq, reference_seq
+                        )
+                    )
+                continue
+
+            # 未知分录种类：业务引用无法核对。
+            differences.append(
+                self._audit_difference(
+                    account_id, "entry_reference", entry_seq, reference_seq
+                )
+            )
+
+        # 资金分录成对守恒：每个 (kind, referenceSeq) 恰两条且金额和为零。
+        for (kind, reference_seq), pair in pairs.items():
+            if len(pair) != 2:
+                for entry in pair:
+                    differences.append(
+                        self._audit_difference(
+                            entry["account_id"], "entry_unpaired",
+                            entry["entry_seq"], reference_seq, 2, len(pair),
+                        )
+                    )
+                continue
+            total = self._audit_pair_delta(pair)
+            if total != 0:
+                anchor = sorted(pair, key=lambda item: item["entry_seq"])[0]
+                differences.append(
+                    self._audit_difference(
+                        anchor["account_id"], "entry_pair_amount",
+                        anchor["entry_seq"], reference_seq, 0, total,
+                    )
+                )
+
+        disputes_document = [
+            {
+                "disputeId": row["id"],
+                "state": row["state"],
+                "amount": row["amount_micros"],
+                "claimantId": row["claimant_id"],
+                "payerId": row["payer_id"],
+                "payeeId": row["payee_id"],
+                "settlementSeq": row["settlement_seq"],
+            }
+            for row in (
+                disputes_by_id[key] for key in sorted(disputes_by_id)
+            )
+        ]
+
+        # 未仲裁 escalated 金额计为清算负债：与升级记录及争议状态交叉核对。
+        escrow_liability = sum(
+            dispute["amount_micros"]
+            for dispute in disputes_by_id.values()
+            if dispute["state"] == "escalated"
+        )
+        recorded_escrow = 0
+        arbitrated_dispute_ids = {
+            arbitration["dispute_id"] for arbitration in arbitrations.values()
+        }
+        escalations_document = []
+        for escalation_seq in sorted(escalations):
+            escalation = escalations[escalation_seq]
+            dispute = disputes_by_id.get(escalation["dispute_id"])
+            if dispute is None:
+                differences.append(
+                    self._audit_difference(
+                        CLEARING_ACCOUNT_ID, "escalation_dispute_missing",
+                        None, escalation_seq,
+                    )
+                )
+                continue
+            if dispute["state"] == "escalated":
+                recorded_escrow += escalation["amount_micros"]
+                if escalation["amount_micros"] != dispute["amount_micros"]:
+                    differences.append(
+                        self._audit_difference(
+                            CLEARING_ACCOUNT_ID, "escrow_amount_mismatch",
+                            None, escalation_seq,
+                            dispute["amount_micros"], escalation["amount_micros"],
+                        )
+                    )
+            escalations_document.append(
+                {
+                    "escalationSeq": escalation_seq,
+                    "disputeId": escalation["dispute_id"],
+                    "amount": escalation["amount_micros"],
+                    "arbitrated": escalation["dispute_id"]
+                    in arbitrated_dispute_ids,
+                }
+            )
+        if escrow_liability != recorded_escrow:
+            differences.append(
+                self._audit_difference(
+                    CLEARING_ACCOUNT_ID, "escrow_record_mismatch",
+                    None, None, escrow_liability, recorded_escrow,
+                )
+            )
+
+        # 冻结仲裁结果，并核对仲裁与升级的归属。
+        arbitrations_document = []
+        for arbitration_seq in sorted(arbitrations):
+            arbitration = arbitrations[arbitration_seq]
+            escalation = escalations.get(arbitration["escalation_seq"])
+            if (
+                escalation is None
+                or escalation["dispute_id"] != arbitration["dispute_id"]
+            ):
+                differences.append(
+                    self._audit_difference(
+                        CLEARING_ACCOUNT_ID, "arbitration_escalation_mismatch",
+                        None, arbitration_seq,
+                    )
+                )
+            arbitrations_document.append(
+                {
+                    "arbitrationSeq": arbitration_seq,
+                    "escalationSeq": arbitration["escalation_seq"],
+                    "disputeId": arbitration["dispute_id"],
+                    "arbitratorId": arbitration["arbitrator_id"],
+                    "decision": arbitration["decision"],
+                    "amount": arbitration["amount_micros"],
+                }
+            )
+
+        # 外部清算账户持有的是系统入金的反向镜像与升级托管：
+        # 余额 = 未仲裁升级托管 − 累计入金；结算与退款只在机器账户间转移。
+        deposit_total = sum(
+            deposit["amount_micros"] for deposit in deposits.values()
+        )
+        clearing_balance = stored_balances.get(CLEARING_ACCOUNT_ID, 0)
+        expected_clearing = recorded_escrow - deposit_total
+        if clearing_balance != expected_clearing:
+            differences.append(
+                self._audit_difference(
+                    CLEARING_ACCOUNT_ID, "clearing_balance_mismatch",
+                    None, None, expected_clearing, clearing_balance,
+                )
+            )
+        clearing_document = {
+            "accountId": CLEARING_ACCOUNT_ID,
+            "storedBalance": clearing_balance,
+            "depositTotal": deposit_total,
+            "escrowLiability": recorded_escrow,
+            "expectedBalance": expected_clearing,
+        }
+
+        # 差异项按账户、类型、引用序号（再按分录序号）稳定排序。
+        differences.sort(
+            key=lambda item: (
+                item["accountId"],
+                item["type"],
+                item["referenceSeq"] is None,
+                item["referenceSeq"] if item["referenceSeq"] is not None else 0,
+                item["entrySeq"] is None,
+                item["entrySeq"] if item["entrySeq"] is not None else 0,
+            )
+        )
+
+        return {
+            "entrySeqBound": entry_seq_bound,
+            "consistent": not differences,
+            "accounts": accounts,
+            "disputes": disputes_document,
+            "escalations": escalations_document,
+            "arbitrations": arbitrations_document,
+            "clearing": clearing_document,
+            "differences": differences,
+        }
+
+    def _apply_audit_checkpoint(
+        self,
+        auth: SlaAuth,
+        body_digest: str,
+        idempotency_key: str,
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        request_json = "{}"
+        standard_path = "/v1/audit-checkpoints"
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                # 幂等判定先于授权与认证：同键更换正文或认证五段均冲突。
+                record = database.execute(
+                    "SELECT request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature"
+                    " FROM audit_checkpoint_idempotency_records WHERE key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    if (
+                        record["request_json"] == request_json
+                        and self._auth_record_matches(record, auth)
+                    ):
+                        return HTTPStatus(record["status"]), json.loads(
+                            record["response_json"]
+                        )
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                # 认证机器须为启动时配置的审计机器；未获审计授权一律 403。
+                if auth.machine_id not in self.server.auditors:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
+                try:
+                    self._verify_request_principal(
+                        database, auth, standard_path, body_digest
+                    )
+                    self._check_request_nonce(database, auth)
+                except AuthRejected as rejected:
+                    database.execute("ROLLBACK")
+                    return rejected.status, {"error": rejected.error}
+                # 冻结账本上界：取写锁后全库最大分录序号（空库为 0）；
+                # 并发写入只能完整落在上界一侧。
+                entry_seq_bound = database.execute(
+                    "SELECT COALESCE(MAX(entry_seq), 0) AS bound"
+                    " FROM ledger_entries"
+                ).fetchone()["bound"]
+                document = self._build_audit_document(database, entry_seq_bound)
+                document_bytes = json.dumps(
+                    document, ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
+                digest = hashlib.sha256(document_bytes).hexdigest()
+                # 全库唯一持久递增检查点序号：取最大序号 + 1（空表 1）。
+                checkpoint_seq = database.execute(
+                    "SELECT COALESCE(MAX(checkpoint_seq), 0) + 1 AS next_seq"
+                    " FROM audit_checkpoints"
+                ).fetchone()["next_seq"]
+                created_at_ms = int(datetime.now(UTC).timestamp() * 1000)
+                # 即使存在差异也返回 201 并保存不一致结论；审计不修正业务数据。
+                payload = {
+                    "checkpointSeq": checkpoint_seq,
+                    "entrySeqBound": entry_seq_bound,
+                    "digest": digest,
+                    "createdBy": auth.machine_id,
+                    "createdAt": created_at_ms,
+                    "consistent": document["consistent"],
+                    "accounts": document["accounts"],
+                    "disputes": document["disputes"],
+                    "escalations": document["escalations"],
+                    "arbitrations": document["arbitrations"],
+                    "clearing": document["clearing"],
+                    "differences": document["differences"],
+                }
+                response_json = json.dumps(payload, separators=(",", ":"))
+                database.execute(
+                    "INSERT INTO audit_checkpoints"
+                    "(checkpoint_seq, entry_seq_bound, digest, created_by,"
+                    " created_at_ms, document_json, response_json)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        checkpoint_seq,
+                        entry_seq_bound,
+                        digest,
+                        auth.machine_id,
+                        created_at_ms,
+                        document_bytes.decode("utf-8"),
+                        response_json,
+                    ),
+                )
+                database.execute(
+                    "INSERT INTO audit_checkpoint_idempotency_records"
+                    "(key, request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        request_json,
+                        int(HTTPStatus.CREATED),
+                        response_json,
+                        auth.machine_id,
+                        auth.key_version,
+                        auth.request_time_ms,
+                        auth.nonce,
+                        auth.signature,
+                    ),
+                )
+                # 检查点、幂等结果与随机数同一事务原子持久化；
+                # 重放、失败或并发败者不推进序号。
+                self._consume_request_nonce(database, auth)
+                database.execute("COMMIT")
+                return HTTPStatus.CREATED, payload
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+
+    def _audit_collection_page(
+        self, database: Any, cut: int, last_seq: int, limit: int
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        rows = database.execute(
+            "SELECT checkpoint_seq, entry_seq_bound, digest, created_by, created_at_ms"
+            " FROM audit_checkpoints"
+            " WHERE checkpoint_seq <= ? AND checkpoint_seq > ?"
+            " ORDER BY checkpoint_seq ASC LIMIT ?",
+            (cut, last_seq, limit + 1),
+        ).fetchall()
+        has_next = len(rows) > limit
+        page = rows[:limit]
+        checkpoints = [
+            {
+                "checkpointSeq": row["checkpoint_seq"],
+                "entrySeqBound": row["entry_seq_bound"],
+                "digest": row["digest"],
+                "createdBy": row["created_by"],
+                "createdAt": row["created_at_ms"],
+            }
+            for row in page
+        ]
+        next_cursor = f"{cut}:{page[-1]['checkpoint_seq']}" if has_next else None
+        return checkpoints, next_cursor
+
+    def _get_audit_checkpoints(self, query: str) -> None:
+        # 集合分页沿用评估历史的 limit 与 cursor=cut:lastSeq。
+        parsed = self._parse_evaluation_query(query, AUDIT_CHECKPOINTS_QUERY_PARAMS)
+        if parsed is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        limit, cursor = parsed
+        if self.headers.get_all(SLA_DELEGATION_HEADER):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        auth = self._parse_sla_auth()
+        if auth is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        body_digest = hashlib.sha256(b"").hexdigest()
+        standard_path = "/v1/audit-checkpoints"
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                if auth.machine_id not in self.server.auditors:
+                    database.execute("ROLLBACK")
+                    self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                    return
+                try:
+                    self._verify_request_principal(
+                        database, auth, standard_path, body_digest
+                    )
+                    self._check_request_nonce(database, auth)
+                except AuthRejected as rejected:
+                    database.execute("ROLLBACK")
+                    self._json(rejected.status, {"error": rejected.error})
+                    return
+                current_max = database.execute(
+                    "SELECT COALESCE(MAX(checkpoint_seq), 0) AS current_max"
+                    " FROM audit_checkpoints"
+                ).fetchone()["current_max"]
+                if cursor is None:
+                    cut, last_seq = current_max, 0
+                else:
+                    cut, last_seq = cursor
+                    if cut > current_max:
+                        database.execute("ROLLBACK")
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                        )
+                        return
+                    anchor = database.execute(
+                        "SELECT 1 FROM audit_checkpoints"
+                        " WHERE checkpoint_seq = ? AND checkpoint_seq <= ?",
+                        (last_seq, cut),
+                    ).fetchone()
+                    if anchor is None:
+                        database.execute("ROLLBACK")
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                        )
+                        return
+                checkpoints, next_cursor = self._audit_collection_page(
+                    database, cut, last_seq, limit
+                )
+                # 仅成功读取才消费随机数。
+                self._consume_request_nonce(database, auth)
+                database.execute("COMMIT")
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+        self._json(
+            HTTPStatus.OK,
+            {"checkpoints": checkpoints, "nextCursor": next_cursor},
+        )
+
+    def _get_audit_checkpoint(self, seq_text: str, query: str) -> None:
+        # 单笔读取不接受任何查询参数：参数校验先于认证结构。
+        if parse_qsl(query, keep_blank_values=True):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 序号须为无前导零十进制正整数；非法按不存在处理。
+        checkpoint_seq: int | None = None
+        if DECIMAL_PATTERN.fullmatch(seq_text) is not None:
+            value = int(seq_text)
+            if 1 <= value <= INT64_MAX:
+                checkpoint_seq = value
+        if self.headers.get_all(SLA_DELEGATION_HEADER):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        auth = self._parse_sla_auth()
+        if auth is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        body_digest = hashlib.sha256(b"").hexdigest()
+        standard_path = f"/v1/audit-checkpoints/{seq_text}"
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                if auth.machine_id not in self.server.auditors:
+                    database.execute("ROLLBACK")
+                    self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                    return
+                try:
+                    self._verify_request_principal(
+                        database, auth, standard_path, body_digest
+                    )
+                    self._check_request_nonce(database, auth)
+                except AuthRejected as rejected:
+                    database.execute("ROLLBACK")
+                    self._json(rejected.status, {"error": rejected.error})
+                    return
+                record = None
+                if checkpoint_seq is not None:
+                    record = database.execute(
+                        "SELECT response_json FROM audit_checkpoints"
+                        " WHERE checkpoint_seq = ?",
+                        (checkpoint_seq,),
+                    ).fetchone()
+                if record is None:
+                    database.execute("ROLLBACK")
+                    self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                    return
+                payload = json.loads(record["response_json"])
+                # 仅成功读取才在同一事务消费随机数。
+                self._consume_request_nonce(database, auth)
+                database.execute("COMMIT")
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+        self._json(HTTPStatus.OK, payload)
+
     def log_message(self, format: str, *args: object) -> None:
         return
 
@@ -6068,8 +6922,10 @@ def serve(
     port: int,
     database_path: str,
     arbitrators: Iterable[str] = (),
+    auditors: Iterable[str] = (),
 ) -> None:
     server = ApiServer((host, port), Handler)
     server.database_path = database_path
     server.arbitrators = frozenset(arbitrators)
+    server.auditors = frozenset(auditors)
     server.serve_forever()

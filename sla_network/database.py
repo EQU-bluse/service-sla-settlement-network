@@ -351,6 +351,26 @@ CREATE TABLE IF NOT EXISTS dispute_arbitration_idempotency_records (
     auth_nonce TEXT,
     auth_signature TEXT
 );
+CREATE TABLE IF NOT EXISTS audit_checkpoints (
+    checkpoint_seq INTEGER PRIMARY KEY,
+    entry_seq_bound INTEGER NOT NULL,
+    digest TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    document_json TEXT NOT NULL,
+    response_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS audit_checkpoint_idempotency_records (
+    key TEXT PRIMARY KEY,
+    request_json TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    response_json TEXT NOT NULL,
+    auth_machine_id TEXT,
+    auth_key_version INTEGER,
+    auth_request_time_ms INTEGER,
+    auth_nonce TEXT,
+    auth_signature TEXT
+);
 CREATE TABLE IF NOT EXISTS machine_delegations (
     id TEXT PRIMARY KEY,
     issuer_machine_id TEXT NOT NULL,
