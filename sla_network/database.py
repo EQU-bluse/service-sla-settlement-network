@@ -262,7 +262,9 @@ CREATE TABLE IF NOT EXISTS machine_delegations (
     issued_key_version INTEGER NOT NULL,
     revoked INTEGER NOT NULL DEFAULT 0,
     consumed INTEGER NOT NULL DEFAULT 0,
-    created_at_ms INTEGER NOT NULL
+    created_at_ms INTEGER NOT NULL,
+    operation TEXT,
+    capability_version INTEGER
 );
 CREATE TABLE IF NOT EXISTS delegation_idempotency_records (
     key TEXT PRIMARY KEY,
@@ -292,7 +294,9 @@ CREATE TABLE IF NOT EXISTS delegation_events (
     event_seq INTEGER PRIMARY KEY,
     delegation_id TEXT NOT NULL,
     type TEXT NOT NULL,
-    created_at_ms INTEGER NOT NULL
+    created_at_ms INTEGER NOT NULL,
+    standard_path TEXT,
+    request_digest TEXT
 );
 CREATE TABLE IF NOT EXISTS auth_nonce_records (
     machine_id TEXT NOT NULL,
@@ -320,6 +324,7 @@ MACHINE_KEYS_MARKER = "machine_keys_backfilled"
 SLA_AUTH_MARKER = "sla_auth_added"
 DELEGATION_EVENT_MARKER = "delegation_events_backfilled"
 DELEGATION_EVENT_INDEX = "idx_delegation_events_delegation_seq"
+DELEGATION_SCOPE_MARKER = "delegation_scope_added"
 
 AUTH_IDEMPOTENCY_TABLES = (
     "capability_idempotency_records",
@@ -684,6 +689,57 @@ def _backfill_delegation_events(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _add_delegation_scope(connection: sqlite3.Connection) -> None:
+    # 仅在一次性迁移（含空库首次连接）时取写锁；BEGIN IMMEDIATE 串行并发首启。
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        if (
+            connection.execute(
+                "SELECT 1 FROM schema_metadata WHERE key = ?",
+                (DELEGATION_SCOPE_MARKER,),
+            ).fetchone()
+            is not None
+        ):
+            # 其他连接已完成迁移，直接释放写锁。
+            connection.execute("COMMIT")
+            return
+        # 最小权限范围（operation/capability_version）与消费审计元数据
+        # （standard_path/request_digest）对旧行一律保持 NULL：
+        # 旧凭证按无范围语义消费，旧事件业务元数据对外呈现为 null。
+        delegation_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(machine_delegations)")
+        }
+        if "operation" not in delegation_columns:
+            connection.execute(
+                "ALTER TABLE machine_delegations ADD COLUMN operation TEXT"
+            )
+        if "capability_version" not in delegation_columns:
+            connection.execute(
+                "ALTER TABLE machine_delegations ADD COLUMN capability_version INTEGER"
+            )
+        event_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(delegation_events)")
+        }
+        if "standard_path" not in event_columns:
+            connection.execute(
+                "ALTER TABLE delegation_events ADD COLUMN standard_path TEXT"
+            )
+        if "request_digest" not in event_columns:
+            connection.execute(
+                "ALTER TABLE delegation_events ADD COLUMN request_digest TEXT"
+            )
+        connection.execute(
+            "INSERT INTO schema_metadata(key, value) VALUES (?, '1')",
+            (DELEGATION_SCOPE_MARKER,),
+        )
+        connection.execute("COMMIT")
+    except BaseException:
+        connection.execute("ROLLBACK")
+        raise
+
+
 def connect(path: str) -> sqlite3.Connection:
     database = Path(path)
     database.parent.mkdir(parents=True, exist_ok=True)
@@ -766,6 +822,14 @@ def connect(path: str) -> sqlite3.Connection:
         is None
     ):
         _backfill_delegation_events(connection)
+    if (
+        connection.execute(
+            "SELECT 1 FROM schema_metadata WHERE key = ?",
+            (DELEGATION_SCOPE_MARKER,),
+        ).fetchone()
+        is None
+    ):
+        _add_delegation_scope(connection)
     # 委托按签发事件序号分页：事件表 join 委托后需 (issuer, issued_seq) 索引。
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_delegation_events_delegation_seq"
