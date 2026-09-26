@@ -10834,6 +10834,102 @@ class AuditCheckpointTests(_EvidenceScenario, unittest.TestCase):
         self.assertEqual(status, 201)
         self.assertIs(json.loads(body)["consistent"], False)
 
+    def test_business_missing_both_entries_is_detected(self) -> None:
+        # 入金两侧分录同时消失：即使账本自身不再有该业务的任何痕迹，
+        # 反向推导仍须在机器账户与清算账户各报一条 entry_missing。
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            connection.execute(
+                "DELETE FROM ledger_entries WHERE kind='deposit' AND reference_seq=1"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        status, body = self.post_checkpoint("audit-missing-both")
+        self.assertEqual(status, 201, body)
+        payload = json.loads(body)
+        self.assertIs(payload["consistent"], False, body)
+        missing = [
+            item for item in payload["differences"] if item["type"] == "entry_missing"
+        ]
+        accounts = {item["accountId"]: item for item in missing}
+        self.assertEqual(
+            sorted(accounts), sorted((self.consumer_id, "external:clearing"))
+        )
+        for item in accounts.values():
+            self.assertIsNone(item["entrySeq"])
+            self.assertEqual(item["referenceSeq"], 1)
+            self.assertIsNone(item["actual"])
+        self.assertEqual(accounts[self.consumer_id]["expected"], 100000)
+        self.assertEqual(accounts["external:clearing"]["expected"], -100000)
+        # 不一致仍保存完整结果，且同键重放首次字节。
+        status, replay = self.post_checkpoint("audit-missing-both")
+        self.assertEqual(status, 201)
+        self.assertEqual(replay, body)
+
+    def test_business_missing_one_settlement_leg_is_detected(self) -> None:
+        # 结算仅缺收款方一侧：报一条 entry_missing，不因另一侧存在而守恒通过。
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            connection.execute(
+                "DELETE FROM ledger_entries WHERE kind='settlement'"
+                " AND reference_seq=1 AND account_id=?",
+                (self.machine_id,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        status, body = self.post_checkpoint("audit-missing-one")
+        self.assertEqual(status, 201, body)
+        payload = json.loads(body)
+        self.assertIs(payload["consistent"], False, body)
+        missing = [
+            item
+            for item in payload["differences"]
+            if item["type"] == "entry_missing" and item["referenceSeq"] == 1
+        ]
+        self.assertEqual(len(missing), 1, missing)
+        self.assertEqual(missing[0]["accountId"], self.machine_id)
+        self.assertIsNone(missing[0]["entrySeq"])
+        self.assertEqual(missing[0]["expected"], 1000)
+        self.assertIsNone(missing[0]["actual"])
+
+    def test_extra_duplicate_entry_is_detected(self) -> None:
+        # 收款方结算分录出现额外副本：额外副本报 entry_extra，结论不一致。
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            row = connection.execute(
+                "SELECT delta_micros, balance_after_micros, created_at_ms"
+                " FROM ledger_entries WHERE kind='settlement'"
+                " AND account_id=? ORDER BY entry_seq DESC LIMIT 1",
+                (self.machine_id,),
+            ).fetchone()
+            connection.execute(
+                "INSERT INTO ledger_entries"
+                "(kind, reference_seq, account_id, delta_micros,"
+                " balance_after_micros, created_at_ms)"
+                " VALUES ('settlement', 1, ?, ?, ?, ?)",
+                (
+                    self.machine_id,
+                    row[0],
+                    row[1],
+                    row[2],
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        status, body = self.post_checkpoint("audit-extra")
+        self.assertEqual(status, 201, body)
+        payload = json.loads(body)
+        self.assertIs(payload["consistent"], False, body)
+        extras = [
+            item for item in payload["differences"] if item["type"] == "entry_extra"
+        ]
+        self.assertEqual(len(extras), 1, extras)
+        self.assertEqual(extras[0]["accountId"], self.machine_id)
+        self.assertEqual(extras[0]["referenceSeq"], 1)
+
     def test_checkpoint_sequences_advance_and_survive_restart(self) -> None:
         status, first = self.post_checkpoint("audit-seq-1")
         self.assertEqual(status, 201)

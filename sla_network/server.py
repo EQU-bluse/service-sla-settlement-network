@@ -6128,19 +6128,15 @@ class Handler(BaseHTTPRequestHandler):
         }
 
     @staticmethod
-    def _audit_pair_delta(pair: list[dict[str, Any]]) -> int:
-        return sum(entry["delta_micros"] for entry in pair)
-
-    def _audit_entry_attribution(
-        self,
+    def _audit_settlement_attribution(
         differences: list[dict[str, Any]],
-        account_id: str,
-        entry_seq: int,
+        anchor_account: str,
+        reference_seq: int,
         settlement: Any,
         evaluations: dict[int, Any],
         sla_ids: set[str],
     ) -> None:
-        # 结算须关联到存在的 SLA，且评估归属同一 SLA。
+        # 结算须关联到存在的 SLA，且评估归属同一 SLA；每组业务只记一条稳定差异。
         evaluation = evaluations.get(settlement["evaluation_seq"])
         if (
             settlement["sla_id"] not in sla_ids
@@ -6148,14 +6144,14 @@ class Handler(BaseHTTPRequestHandler):
             or evaluation["sla_id"] != settlement["sla_id"]
         ):
             differences.append(
-                self._audit_difference(
-                    account_id,
-                    "entry_attribution",
-                    entry_seq,
-                    settlement["settlement_seq"],
-                    settlement["sla_id"],
-                    None if evaluation is None else evaluation["sla_id"],
-                )
+                {
+                    "accountId": anchor_account,
+                    "type": "entry_attribution",
+                    "entrySeq": None,
+                    "referenceSeq": reference_seq,
+                    "expected": settlement["sla_id"],
+                    "actual": None if evaluation is None else evaluation["sla_id"],
+                }
             )
 
     def _build_audit_document(
@@ -6167,7 +6163,8 @@ class Handler(BaseHTTPRequestHandler):
         deposits = {
             row["deposit_seq"]: row
             for row in database.execute(
-                "SELECT deposit_seq, machine_id, amount_micros FROM fund_deposits"
+                "SELECT deposit_seq, machine_id, amount_micros, reference"
+                " FROM fund_deposits"
             ).fetchall()
         }
         settlements = {
@@ -6185,13 +6182,11 @@ class Handler(BaseHTTPRequestHandler):
         }
         sla_ids = {row["id"] for row in database.execute("SELECT id FROM slas")}
         disputes_by_id: dict[str, Any] = {}
-        disputes_by_settlement: dict[int, Any] = {}
         for row in database.execute(
             "SELECT id, settlement_seq, claimant_id, payer_id, payee_id,"
             " amount_micros, state FROM disputes"
         ).fetchall():
             disputes_by_id[row["id"]] = row
-            disputes_by_settlement[row["settlement_seq"]] = row
         escalations = {
             row["escalation_seq"]: row
             for row in database.execute(
@@ -6280,233 +6275,206 @@ class Handler(BaseHTTPRequestHandler):
                 }
             )
 
-        # 逐笔核对方向、业务引用、SLA 与评估归属，并按 (kind, referenceSeq)
-        # 归集分录以便成对守恒核对。
-        pairs: dict[tuple[str, int], list[dict[str, Any]]] = {}
-        for entry in entries:
-            pairs.setdefault((entry["kind"], entry["reference_seq"]), []).append(entry)
-            account_id = entry["account_id"]
-            kind = entry["kind"]
-            reference_seq = entry["reference_seq"]
-            entry_seq = entry["entry_seq"]
-            delta = entry["delta_micros"]
+        # 业务驱动的完整性核对：从每笔已持久化资金业务反向推导其本应留下的
+        # 两条方向相反、金额守恒的分录。即使两侧分录全部消失也会产生差异，
+        # 而不是仅在账本自身成对守恒时才通过。
+        claimed_group_keys: set[tuple[str, int]] = set()
 
-            if kind == "deposit":
-                deposit = deposits.get(reference_seq)
-                if deposit is None or account_id not in (
-                    deposit["machine_id"],
-                    CLEARING_ACCOUNT_ID,
-                ):
-                    differences.append(
-                        self._audit_difference(
-                            account_id, "entry_reference", entry_seq, reference_seq
-                        )
-                    )
-                    continue
-                expected_delta = (
-                    deposit["amount_micros"]
-                    if account_id == deposit["machine_id"]
-                    else -deposit["amount_micros"]
-                )
-                if delta != expected_delta:
-                    differences.append(
-                        self._audit_difference(
-                            account_id, "entry_direction", entry_seq, reference_seq,
-                            expected_delta, delta,
-                        )
-                    )
-                continue
-
-            if kind == "settlement":
-                settlement = settlements.get(reference_seq)
-                if settlement is None or account_id not in (
-                    settlement["payer_id"],
-                    settlement["payee_id"],
-                ):
-                    differences.append(
-                        self._audit_difference(
-                            account_id, "entry_reference", entry_seq, reference_seq
-                        )
-                    )
-                    continue
-                expected_delta = (
-                    -settlement["amount_micros"]
-                    if account_id == settlement["payer_id"]
-                    else settlement["amount_micros"]
-                )
-                if delta != expected_delta:
-                    differences.append(
-                        self._audit_difference(
-                            account_id, "entry_direction", entry_seq, reference_seq,
-                            expected_delta, delta,
-                        )
-                    )
-                self._audit_entry_attribution(
-                    differences, account_id, entry_seq, settlement,
-                    evaluations, sla_ids,
-                )
-                continue
-
-            if kind == "dispute_refund":
-                settlement = settlements.get(reference_seq)
-                dispute = disputes_by_settlement.get(reference_seq)
+        def reconcile_group(
+            kind: str,
+            reference_seq: int,
+            expected_legs: list[tuple[str, int]],
+            settlement: Any,
+        ) -> None:
+            claimed_group_keys.add((kind, reference_seq))
+            group = [
+                entry
+                for entry in entries
+                if entry["kind"] == kind
+                and entry["reference_seq"] == reference_seq
+            ]
+            expected_accounts = {account for account, _ in expected_legs}
+            # 以账户匹配应有分录：账户错属或额外副本均落为多余分录。
+            matched: dict[str, dict[str, Any]] = {}
+            for entry in group:
                 if (
-                    settlement is None
-                    or dispute is None
-                    or dispute["state"] != "refunded"
-                    or account_id not in (dispute["payer_id"], dispute["payee_id"])
+                    entry["account_id"] not in expected_accounts
+                    or entry["account_id"] in matched
                 ):
                     differences.append(
                         self._audit_difference(
-                            account_id, "entry_reference", entry_seq, reference_seq
+                            entry["account_id"], "entry_extra",
+                            entry["entry_seq"], reference_seq,
                         )
                     )
                     continue
-                expected_delta = (
-                    settlement["amount_micros"]
-                    if account_id == dispute["payer_id"]
-                    else -settlement["amount_micros"]
-                )
-                if delta != expected_delta:
+                matched[entry["account_id"]] = entry
+            # 逐侧反向推导：一侧或两侧缺失、借贷方向颠倒、金额不等分别判差异。
+            for account_id, expected_delta in expected_legs:
+                entry = matched.get(account_id)
+                if entry is None:
                     differences.append(
                         self._audit_difference(
-                            account_id, "entry_direction", entry_seq, reference_seq,
-                            expected_delta, delta,
+                            account_id, "entry_missing", None, reference_seq,
+                            expected_delta, None,
                         )
                     )
-                self._audit_entry_attribution(
-                    differences, account_id, entry_seq, settlement,
-                    evaluations, sla_ids,
+                elif entry["delta_micros"] != expected_delta:
+                    differences.append(
+                        self._audit_difference(
+                            account_id, "entry_direction",
+                            entry["entry_seq"], reference_seq,
+                            expected_delta, entry["delta_micros"],
+                        )
+                    )
+            # 结算系分录还须核对 SLA 与评估归属，防止关联另一份协议或评估；
+            # 归属差异锚定其结算序号，保证能定位到对应业务。
+            if settlement is not None:
+                self._audit_settlement_attribution(
+                    differences, expected_legs[0][0],
+                    settlement["settlement_seq"],
+                    settlement, evaluations, sla_ids,
                 )
-                continue
 
-            if kind == "dispute_escalation":
-                escalation = escalations.get(reference_seq)
-                dispute = (
-                    None if escalation is None
-                    else disputes_by_id.get(escalation["dispute_id"])
-                )
-                if (
-                    escalation is None
-                    or dispute is None
-                    or account_id not in (dispute["payee_id"], CLEARING_ACCOUNT_ID)
-                ):
-                    differences.append(
-                        self._audit_difference(
-                            account_id, "entry_reference", entry_seq, reference_seq
-                        )
-                    )
-                    continue
-                expected_delta = (
-                    -escalation["amount_micros"]
-                    if account_id == dispute["payee_id"]
-                    else escalation["amount_micros"]
-                )
-                if delta != expected_delta:
-                    differences.append(
-                        self._audit_difference(
-                            account_id, "entry_direction", entry_seq, reference_seq,
-                            expected_delta, delta,
-                        )
-                    )
-                settlement = settlements.get(dispute["settlement_seq"])
-                if settlement is not None:
-                    self._audit_entry_attribution(
-                        differences, account_id, entry_seq, settlement,
-                        evaluations, sla_ids,
-                    )
-                else:
-                    differences.append(
-                        self._audit_difference(
-                            account_id, "entry_attribution", entry_seq, reference_seq
-                        )
-                    )
-                continue
-
-            if kind == "dispute_arbitration":
-                arbitration = arbitrations.get(reference_seq)
-                dispute = (
-                    None if arbitration is None
-                    else disputes_by_id.get(arbitration["dispute_id"])
-                )
-                if arbitration is None or dispute is None:
-                    differences.append(
-                        self._audit_difference(
-                            account_id, "entry_reference", entry_seq, reference_seq
-                        )
-                    )
-                    continue
-                recipient_id = (
-                    dispute["payee_id"]
-                    if arbitration["decision"] == "release"
-                    else dispute["payer_id"]
-                )
-                expected_state = (
-                    "released"
-                    if arbitration["decision"] == "release"
-                    else "refunded"
-                )
-                if (
-                    dispute["state"] != expected_state
-                    or account_id not in (CLEARING_ACCOUNT_ID, recipient_id)
-                ):
-                    differences.append(
-                        self._audit_difference(
-                            account_id, "entry_reference", entry_seq, reference_seq
-                        )
-                    )
-                    continue
-                expected_delta = (
-                    -arbitration["amount_micros"]
-                    if account_id == CLEARING_ACCOUNT_ID
-                    else arbitration["amount_micros"]
-                )
-                if delta != expected_delta:
-                    differences.append(
-                        self._audit_difference(
-                            account_id, "entry_direction", entry_seq, reference_seq,
-                            expected_delta, delta,
-                        )
-                    )
-                settlement = settlements.get(dispute["settlement_seq"])
-                if settlement is not None:
-                    self._audit_entry_attribution(
-                        differences, account_id, entry_seq, settlement,
-                        evaluations, sla_ids,
-                    )
-                else:
-                    differences.append(
-                        self._audit_difference(
-                            account_id, "entry_attribution", entry_seq, reference_seq
-                        )
-                    )
-                continue
-
-            # 未知分录种类：业务引用无法核对。
-            differences.append(
-                self._audit_difference(
-                    account_id, "entry_reference", entry_seq, reference_seq
-                )
+        # 入金：机器账户正额、外部清算账户等额反向，锚定机器、金额与原始引用。
+        for deposit_seq in sorted(deposits):
+            deposit = deposits[deposit_seq]
+            reconcile_group(
+                "deposit",
+                deposit_seq,
+                [
+                    (deposit["machine_id"], deposit["amount_micros"]),
+                    (CLEARING_ACCOUNT_ID, -deposit["amount_micros"]),
+                ],
+                None,
             )
 
-        # 资金分录成对守恒：每个 (kind, referenceSeq) 恰两条且金额和为零。
-        for (kind, reference_seq), pair in pairs.items():
-            if len(pair) != 2:
-                for entry in pair:
-                    differences.append(
-                        self._audit_difference(
-                            entry["account_id"], "entry_unpaired",
-                            entry["entry_seq"], reference_seq, 2, len(pair),
-                        )
-                    )
+        # 正金额结算：付款方负、收款方正；零金额待处理结算不产生分录，
+        # 若账本仍留同组分录，则由末尾的孤立分录核对发现。
+        for settlement_seq in sorted(settlements):
+            settlement = settlements[settlement_seq]
+            if settlement["result"] == "pending" or settlement["amount_micros"] == 0:
                 continue
-            total = self._audit_pair_delta(pair)
-            if total != 0:
-                anchor = sorted(pair, key=lambda item: item["entry_seq"])[0]
+            reconcile_group(
+                "settlement",
+                settlement_seq,
+                [
+                    (settlement["payer_id"], -settlement["amount_micros"]),
+                    (settlement["payee_id"], settlement["amount_micros"]),
+                ],
+                settlement,
+            )
+
+        # 争议退款须回指原结算：收款方负、付款方正，金额取原结算金额。
+        # 注意：经升级后由终局仲裁 refund 的争议状态也是 refunded，但其款项自
+        # 清算划出、只写 dispute_arbitration 分录，不得在此重复要求退款分录。
+        arbitrated_dispute_ids = {
+            arbitration["dispute_id"] for arbitration in arbitrations.values()
+        }
+        for dispute_id in sorted(disputes_by_id):
+            dispute = disputes_by_id[dispute_id]
+            if dispute["state"] != "refunded":
+                continue
+            if dispute_id in arbitrated_dispute_ids:
+                continue
+            settlement = settlements.get(dispute["settlement_seq"])
+            amount = (
+                dispute["amount_micros"] if settlement is None
+                else settlement["amount_micros"]
+            )
+            if settlement is None:
                 differences.append(
                     self._audit_difference(
-                        anchor["account_id"], "entry_pair_amount",
-                        anchor["entry_seq"], reference_seq, 0, total,
+                        dispute["payee_id"], "entry_attribution", None,
+                        dispute["settlement_seq"],
+                    )
+                )
+            reconcile_group(
+                "dispute_refund",
+                dispute["settlement_seq"],
+                [
+                    (dispute["payee_id"], -amount),
+                    (dispute["payer_id"], amount),
+                ],
+                settlement,
+            )
+
+        # 升级须回指原争议：冻结额自收款方划入外部清算。
+        for escalation_seq in sorted(escalations):
+            escalation = escalations[escalation_seq]
+            dispute = disputes_by_id.get(escalation["dispute_id"])
+            if dispute is None:
+                # 升级孤立于争议：无法推导两侧账户，仅占用组键避免重复报告，
+                # 错属升级由升级与争议的交叉核对差异捕获。
+                claimed_group_keys.add(("dispute_escalation", escalation_seq))
+                continue
+            settlement = settlements.get(dispute["settlement_seq"])
+            if settlement is None:
+                differences.append(
+                    self._audit_difference(
+                        dispute["payee_id"], "entry_attribution", None,
+                        dispute["settlement_seq"],
+                    )
+                )
+            reconcile_group(
+                "dispute_escalation",
+                escalation_seq,
+                [
+                    (dispute["payee_id"], -escalation["amount_micros"]),
+                    (CLEARING_ACCOUNT_ID, escalation["amount_micros"]),
+                ],
+                settlement,
+            )
+
+        # 仲裁须关联唯一升级、仲裁决定与最终收款账户，款项自清算划入收款方。
+        for arbitration_seq in sorted(arbitrations):
+            arbitration = arbitrations[arbitration_seq]
+            dispute = disputes_by_id.get(arbitration["dispute_id"])
+            if dispute is None:
+                # 仲裁孤立于争议：仅占用组键，错属仲裁由仲裁与升级交叉核对捕获。
+                claimed_group_keys.add(("dispute_arbitration", arbitration_seq))
+                continue
+            expected_state = (
+                "released" if arbitration["decision"] == "release" else "refunded"
+            )
+            if dispute["state"] != expected_state:
+                differences.append(
+                    self._audit_difference(
+                        CLEARING_ACCOUNT_ID, "arbitration_state_mismatch",
+                        None, arbitration_seq, expected_state, dispute["state"],
+                    )
+                )
+            recipient_id = (
+                dispute["payee_id"] if arbitration["decision"] == "release"
+                else dispute["payer_id"]
+            )
+            settlement = settlements.get(dispute["settlement_seq"])
+            if settlement is None:
+                differences.append(
+                    self._audit_difference(
+                        recipient_id, "entry_attribution", None,
+                        dispute["settlement_seq"],
+                    )
+                )
+            reconcile_group(
+                "dispute_arbitration",
+                arbitration_seq,
+                [
+                    (CLEARING_ACCOUNT_ID, -arbitration["amount_micros"]),
+                    (recipient_id, arbitration["amount_micros"]),
+                ],
+                settlement,
+            )
+
+        # 孤立分录：(kind, referenceSeq) 不对应任何已持久化业务——含引用序号
+        # 错误、分录种类错误、零金额待处理结算伪造的分录——不得因账本自身
+        # 成对守恒而放过。
+        for entry in entries:
+            if (entry["kind"], entry["reference_seq"]) not in claimed_group_keys:
+                differences.append(
+                    self._audit_difference(
+                        entry["account_id"], "entry_reference",
+                        entry["entry_seq"], entry["reference_seq"],
                     )
                 )
 
@@ -6532,9 +6500,6 @@ class Handler(BaseHTTPRequestHandler):
             if dispute["state"] == "escalated"
         )
         recorded_escrow = 0
-        arbitrated_dispute_ids = {
-            arbitration["dispute_id"] for arbitration in arbitrations.values()
-        }
         escalations_document = []
         for escalation_seq in sorted(escalations):
             escalation = escalations[escalation_seq]
