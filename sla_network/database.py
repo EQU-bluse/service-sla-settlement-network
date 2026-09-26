@@ -399,6 +399,32 @@ CREATE TABLE IF NOT EXISTS audit_comparison_chain (
     previous_chain_digest TEXT NOT NULL,
     chain_digest TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS audit_anchors (
+    anchor_seq INTEGER PRIMARY KEY,
+    comparison_seq INTEGER NOT NULL,
+    chain_digest TEXT NOT NULL,
+    auditor_id TEXT NOT NULL,
+    public_key TEXT NOT NULL,
+    key_version INTEGER NOT NULL,
+    request_time_ms INTEGER NOT NULL,
+    nonce TEXT NOT NULL,
+    body_digest TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    response_json TEXT NOT NULL,
+    UNIQUE (comparison_seq, auditor_id)
+);
+CREATE TABLE IF NOT EXISTS audit_anchor_idempotency_records (
+    key TEXT PRIMARY KEY,
+    request_json TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    response_json TEXT NOT NULL,
+    auth_machine_id TEXT,
+    auth_key_version INTEGER,
+    auth_request_time_ms INTEGER,
+    auth_nonce TEXT,
+    auth_signature TEXT
+);
 CREATE TABLE IF NOT EXISTS machine_delegations (
     id TEXT PRIMARY KEY,
     issuer_machine_id TEXT NOT NULL,

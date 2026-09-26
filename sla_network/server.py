@@ -87,6 +87,7 @@ ESCALATION_FIELDS = {"actorId"}
 ARBITRATION_FIELDS = {"decision"}
 EVIDENCE_PROOF_FIELDS = {"evidenceSeq", "actorId", "signature"}
 AUDIT_COMPARISON_FIELDS = {"fromCheckpointSeq", "toCheckpointSeq"}
+AUDIT_ANCHOR_FIELDS = {"comparisonSeq", "chainDigest"}
 KEY_ROTATION_FIELDS = {
     "expectedVersion",
     "publicKey",
@@ -115,6 +116,7 @@ DELEGATION_EVENTS_QUERY_PARAMS = {"limit", "cursor"}
 DELEGATION_CONSUMPTIONS_QUERY_PARAMS = {"limit", "cursor"}
 AUDIT_CHECKPOINTS_QUERY_PARAMS = {"limit", "cursor"}
 AUDIT_COMPARISONS_QUERY_PARAMS = {"limit", "cursor"}
+AUDIT_ANCHORS_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTE_SNAPSHOT_STATES = {"open", "released", "refunded", "escalated"}
 ESCALATION_DELAY_MS = 86_400_000
 TELEMETRY_TIME_MAX = 2147483648000
@@ -367,6 +369,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if target.path == "/v1/audit-chain":
             self._get_audit_chain(target.query)
+            return
+        if target.path == "/v1/audit-anchors":
+            self._get_audit_anchors(target.query)
             return
         sla_match = SLA_PATH_PATTERN.fullmatch(target.path)
         if sla_match is not None:
@@ -1671,6 +1676,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if urlsplit(self.path).path == "/v1/audit-comparisons":
             self._create_audit_comparison()
+            return
+        if urlsplit(self.path).path == "/v1/audit-anchors":
+            self._create_audit_anchor()
             return
         delegation_revocation_match = DELEGATION_PATH_PATTERN.fullmatch(
             urlsplit(self.path).path
@@ -7378,6 +7386,291 @@ class Handler(BaseHTTPRequestHandler):
         self._json(
             HTTPStatus.OK,
             {"entries": entries, "nextCursor": next_cursor, "head": head},
+        )
+
+    # ---- 比较链签名锚点 ----
+
+    def _create_audit_anchor(self) -> None:
+        idempotency_key = self.headers.get("Idempotency-Key")
+        if (
+            idempotency_key is None
+            or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None
+        ):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 锚点创建拒绝查询参数：参数校验先于体校验与认证结构。
+        if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 正文恰含 comparisonSeq,chainDigest（非布尔正整数与 64 位小写摘要，
+        # 键不得重复）；链位置不设数据库整数上限，超范围者按链节点不存在处理。
+        raw_body = self._read_raw_body()
+        fields = (
+            None
+            if raw_body is None
+            else self._read_audit_anchor_object(raw_body)
+        )
+        if fields is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 仅接受单一 SLA-Auth：代理头、缺失、重复或结构非法均为非法请求。
+        if self.headers.get_all(SLA_DELEGATION_HEADER):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        auth = self._parse_sla_auth()
+        if auth is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        body_digest = hashlib.sha256(raw_body).hexdigest()
+        status, payload = self._apply_audit_anchor(
+            fields, auth, body_digest, idempotency_key
+        )
+        self._json(status, payload)
+
+    def _read_audit_anchor_object(self, body: bytes) -> dict[str, Any] | None:
+        parsed = self._read_json_object(body)
+        if parsed is None or set(parsed) != AUDIT_ANCHOR_FIELDS:
+            return None
+        if not _positive_int(parsed["comparisonSeq"]):
+            return None
+        chain_digest = parsed["chainDigest"]
+        if (
+            not isinstance(chain_digest, str)
+            or PUBLIC_KEY_PATTERN.fullmatch(chain_digest) is None
+        ):
+            return None
+        return parsed
+
+    def _apply_audit_anchor(
+        self,
+        fields: dict[str, Any],
+        auth: SlaAuth,
+        body_digest: str,
+        idempotency_key: str,
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        comparison_seq = fields["comparisonSeq"]
+        chain_digest = fields["chainDigest"]
+        request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+        standard_path = "/v1/audit-anchors"
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                # 幂等判定先于授权与认证：同键更换正文或认证五段均冲突。
+                record = database.execute(
+                    "SELECT request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature"
+                    " FROM audit_anchor_idempotency_records WHERE key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    if (
+                        record["request_json"] == request_json
+                        and self._auth_record_matches(record, auth)
+                    ):
+                        return HTTPStatus(record["status"]), json.loads(
+                            record["response_json"]
+                        )
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                # 仅启动时配置的审计机器可创建锚点；未获审计授权一律 403。
+                if auth.machine_id not in self.server.auditors:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
+                try:
+                    self._verify_request_principal(
+                        database, auth, standard_path, body_digest
+                    )
+                    self._check_request_nonce(database, auth)
+                except AuthRejected as rejected:
+                    database.execute("ROLLBACK")
+                    return rejected.status, {"error": rejected.error}
+                # 目标链节点须已保存：序号超出 SQLite 整数存储范围时格式仍合法，
+                # 按不存在处理，不绑定参数；失败不落幂等记录、不消费随机数。
+                chain_row = None
+                if comparison_seq <= INT64_MAX:
+                    chain_row = database.execute(
+                        "SELECT chain_digest FROM audit_comparison_chain"
+                        " WHERE comparison_seq = ?",
+                        (comparison_seq,),
+                    ).fetchone()
+                if chain_row is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                # 请求摘要须等于保存的链摘要；错配冲突且不写任何记录。
+                if chain_row["chain_digest"] != chain_digest:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                # 同一审计机器对同一链位置仅可锚定一次；不同审计机器可分别签名。
+                duplicate = database.execute(
+                    "SELECT 1 FROM audit_anchors"
+                    " WHERE comparison_seq = ? AND auditor_id = ?",
+                    (comparison_seq, auth.machine_id),
+                ).fetchone()
+                if duplicate is not None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "anchor_exists"}
+                # 冻结签名公钥：验签通过即该机器该版本已登记，直接取回。
+                key_row = database.execute(
+                    "SELECT public_key FROM machine_keys"
+                    " WHERE machine_id = ? AND version = ?",
+                    (auth.machine_id, auth.key_version),
+                ).fetchone()
+                public_key = key_row["public_key"]
+                # 全库唯一持久递增锚点序号：取写锁后取最大序号 + 1（空表 1）。
+                anchor_seq = database.execute(
+                    "SELECT COALESCE(MAX(anchor_seq), 0) + 1 AS next_seq"
+                    " FROM audit_anchors"
+                ).fetchone()["next_seq"]
+                created_at_ms = int(datetime.now(UTC).timestamp() * 1000)
+                # 冻结审计机器、签名公钥、密钥版本、请求时间、随机数、正文摘要
+                # 与认证签名：可按请求认证规则重建待验字节并核对保存的链摘要。
+                payload = {
+                    "anchorSeq": anchor_seq,
+                    "comparisonSeq": comparison_seq,
+                    "chainDigest": chain_digest,
+                    "auditorId": auth.machine_id,
+                    "publicKey": public_key,
+                    "keyVersion": auth.key_version,
+                    "requestTime": auth.request_time_ms,
+                    "nonce": auth.nonce,
+                    "bodyDigest": body_digest,
+                    "signature": auth.signature,
+                    "createdAt": created_at_ms,
+                }
+                response_json = json.dumps(payload, separators=(",", ":"))
+                database.execute(
+                    "INSERT INTO audit_anchors"
+                    "(anchor_seq, comparison_seq, chain_digest, auditor_id,"
+                    " public_key, key_version, request_time_ms, nonce,"
+                    " body_digest, signature, created_at_ms, response_json)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        anchor_seq,
+                        comparison_seq,
+                        chain_digest,
+                        auth.machine_id,
+                        public_key,
+                        auth.key_version,
+                        auth.request_time_ms,
+                        auth.nonce,
+                        body_digest,
+                        auth.signature,
+                        created_at_ms,
+                        response_json,
+                    ),
+                )
+                database.execute(
+                    "INSERT INTO audit_anchor_idempotency_records"
+                    "(key, request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        request_json,
+                        int(HTTPStatus.CREATED),
+                        response_json,
+                        auth.machine_id,
+                        auth.key_version,
+                        auth.request_time_ms,
+                        auth.nonce,
+                        auth.signature,
+                    ),
+                )
+                # 锚点、幂等结果与随机数同一事务原子持久化；
+                # 失败、重放或并发败者不消费随机数、不推进锚点序号。
+                self._consume_request_nonce(database, auth)
+                database.execute("COMMIT")
+                return HTTPStatus.CREATED, payload
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+
+    def _audit_anchor_collection_page(
+        self, database: Any, cut: int, last_seq: int, limit: int
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        rows = database.execute(
+            "SELECT anchor_seq, response_json FROM audit_anchors"
+            " WHERE anchor_seq <= ? AND anchor_seq > ?"
+            " ORDER BY anchor_seq ASC LIMIT ?",
+            (cut, last_seq, limit + 1),
+        ).fetchall()
+        has_next = len(rows) > limit
+        page = rows[:limit]
+        anchors = [json.loads(row["response_json"]) for row in page]
+        next_cursor = f"{cut}:{page[-1]['anchor_seq']}" if has_next else None
+        return anchors, next_cursor
+
+    def _get_audit_anchors(self, query: str) -> None:
+        # 集合分页沿用审计比较列表的 limit 与 cursor=cut:lastSeq。
+        parsed = self._parse_evaluation_query(query, AUDIT_ANCHORS_QUERY_PARAMS)
+        if parsed is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        limit, cursor = parsed
+        if self.headers.get_all(SLA_DELEGATION_HEADER):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        auth = self._parse_sla_auth()
+        if auth is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        body_digest = hashlib.sha256(b"").hexdigest()
+        standard_path = "/v1/audit-anchors"
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                if auth.machine_id not in self.server.auditors:
+                    database.execute("ROLLBACK")
+                    self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                    return
+                try:
+                    self._verify_request_principal(
+                        database, auth, standard_path, body_digest
+                    )
+                    self._check_request_nonce(database, auth)
+                except AuthRejected as rejected:
+                    database.execute("ROLLBACK")
+                    self._json(rejected.status, {"error": rejected.error})
+                    return
+                current_max = database.execute(
+                    "SELECT COALESCE(MAX(anchor_seq), 0) AS current_max"
+                    " FROM audit_anchors"
+                ).fetchone()["current_max"]
+                if cursor is None:
+                    cut, last_seq = current_max, 0
+                else:
+                    cut, last_seq = cursor
+                    if cut > current_max:
+                        database.execute("ROLLBACK")
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                        )
+                        return
+                    anchor = database.execute(
+                        "SELECT 1 FROM audit_anchors"
+                        " WHERE anchor_seq = ? AND anchor_seq <= ?",
+                        (last_seq, cut),
+                    ).fetchone()
+                    if anchor is None:
+                        database.execute("ROLLBACK")
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                        )
+                        return
+                anchors, next_cursor = self._audit_anchor_collection_page(
+                    database, cut, last_seq, limit
+                )
+                # 仅成功读取才消费随机数；失败不消费随机数且不推进序号。
+                self._consume_request_nonce(database, auth)
+                database.execute("COMMIT")
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+        self._json(
+            HTTPStatus.OK,
+            {"anchors": anchors, "nextCursor": next_cursor},
         )
 
     def _audit_comparison_collection_page(

@@ -15,7 +15,7 @@ python3 -m sla_network --host 127.0.0.1 --port 8080 --database var/service-sla.d
 
 `--arbitrator` 可重复，配置有权终局仲裁的机器标识（`[0-9a-f]{64}`）；任一标识格式非法时进程以退出码 `2` 拒绝启动。省略该参数时服务照常运行，但不存在已配置仲裁机器，仲裁写入口对任何认证机器均返回 `403`/`forbidden`。
 
-`--auditor` 可重复，配置有权创建并读取全库审计检查点、检查点比较与比较链的机器标识（格式同 `--arbitrator`）；任一标识格式非法时进程同样以退出码 `2` 拒绝启动。省略该参数时服务照常运行，但不存在已配置审计机器，`POST /v1/audit-checkpoints`、`POST /v1/audit-comparisons` 与五个审计读取入口对任何认证机器均返回 `403`/`forbidden`。
+`--auditor` 可树，未授权返回 403。
 
 服务启动后提供：
 
