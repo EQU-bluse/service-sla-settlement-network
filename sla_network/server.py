@@ -13,7 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, NamedTuple
 from urllib.parse import parse_qsl, urlsplit
 
-from .database import connect
+from .database import AUDIT_CHAIN_GENESIS_PREVIOUS, audit_chain_digest, connect
 from .ed25519 import verify as ed25519_verify
 
 IDEMPOTENCY_KEY_PATTERN = re.compile(r"[A-Za-z0-9-]{1,64}")
@@ -115,6 +115,7 @@ DELEGATION_EVENTS_QUERY_PARAMS = {"limit", "cursor"}
 DELEGATION_CONSUMPTIONS_QUERY_PARAMS = {"limit", "cursor"}
 AUDIT_CHECKPOINTS_QUERY_PARAMS = {"limit", "cursor"}
 AUDIT_COMPARISONS_QUERY_PARAMS = {"limit", "cursor"}
+AUDIT_CHAIN_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTE_SNAPSHOT_STATES = {"open", "released", "refunded", "escalated"}
 ESCALATION_DELAY_MS = 86_400_000
 TELEMETRY_TIME_MAX = 2147483648000
@@ -211,6 +212,11 @@ def _bounded_int(value: Any, minimum: int, maximum: int) -> bool:
         and not isinstance(value, bool)
         and minimum <= value <= maximum
     )
+
+
+def _positive_int(value: Any) -> bool:
+    # 任意非布尔正整数；超出存储上限的格式合法值由调用方按不存在处理。
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -359,6 +365,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if target.path == "/v1/audit-comparisons":
             self._get_audit_comparisons(target.query)
+            return
+        if target.path == "/v1/audit-chain":
+            self._get_audit_chain(target.query)
             return
         sla_match = SLA_PATH_PATTERN.fullmatch(target.path)
         if sla_match is not None:
@@ -6998,10 +7007,9 @@ class Handler(BaseHTTPRequestHandler):
             return None
         from_seq = parsed["fromCheckpointSeq"]
         to_seq = parsed["toCheckpointSeq"]
-        # 正整数：非布尔、整类型且 >= 1（INT64 上界与路径序号一致）。
-        if not _bounded_int(from_seq, 1, INT64_MAX):
-            return None
-        if not _bounded_int(to_seq, 1, INT64_MAX):
+        # 接受任意非布尔正整数：格式合法但超出 64 位存储范围者按不存在处理（404），
+        # 不以数据库整数上限判为非法请求。
+        if not _positive_int(from_seq) or not _positive_int(to_seq):
             return None
         return parsed
 
@@ -7089,16 +7097,19 @@ class Handler(BaseHTTPRequestHandler):
                     database.execute("ROLLBACK")
                     return rejected.status, {"error": rejected.error}
                 # 仅读取两端冻结内容：先查存在性（任一缺失为 404），再判端点顺序。
-                from_record = database.execute(
-                    "SELECT response_json FROM audit_checkpoints"
-                    " WHERE checkpoint_seq = ?",
-                    (from_seq,),
-                ).fetchone()
-                to_record = database.execute(
-                    "SELECT response_json FROM audit_checkpoints"
-                    " WHERE checkpoint_seq = ?",
-                    (to_seq,),
-                ).fetchone()
+                # 超出 64 位存储范围但格式合法的序号无法绑定为 SQLite 整数，
+                # 直接按该端不存在处理（404/not_found），不抛出异常断连。
+                def lookup_checkpoint(seq: int) -> Any:
+                    if seq > INT64_MAX:
+                        return None
+                    return database.execute(
+                        "SELECT response_json FROM audit_checkpoints"
+                        " WHERE checkpoint_seq = ?",
+                        (seq,),
+                    ).fetchone()
+
+                from_record = lookup_checkpoint(from_seq)
+                to_record = lookup_checkpoint(to_seq)
                 if from_record is None or to_record is None:
                     database.execute("ROLLBACK")
                     return HTTPStatus.NOT_FOUND, {"error": "not_found"}
@@ -7158,6 +7169,28 @@ class Handler(BaseHTTPRequestHandler):
                     "createdAt": created_at_ms,
                 }
                 response_json = json.dumps(payload, separators=(",", ":"))
+                # 首次成功比较在原事务追加链记录：响应摘要取首次完整响应实际写出的
+                # 紧凑 UTF-8 无尾换行字节（与 _json 出线编码一致）之 SHA-256；
+                # 链摘要按 audit-chain-v1 文本计算，首项以前项摘要六十四个零起链
+                # （迁移已为旧比较补链）。
+                response_bytes = json.dumps(
+                    payload, ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
+                response_digest = hashlib.sha256(response_bytes).hexdigest()
+                previous_record = database.execute(
+                    "SELECT chain_digest FROM audit_comparison_chain"
+                    " WHERE comparison_seq < ?"
+                    " ORDER BY comparison_seq DESC LIMIT 1",
+                    (comparison_seq,),
+                ).fetchone()
+                previous_chain_digest = (
+                    previous_record["chain_digest"]
+                    if previous_record is not None
+                    else AUDIT_CHAIN_GENESIS_PREVIOUS
+                )
+                chain_digest = audit_chain_digest(
+                    comparison_seq, response_digest, previous_chain_digest
+                )
                 database.execute(
                     "INSERT INTO audit_comparisons"
                     "(comparison_seq, from_checkpoint_seq, to_checkpoint_seq,"
@@ -7173,6 +7206,17 @@ class Handler(BaseHTTPRequestHandler):
                         created_at_ms,
                         result_bytes.decode("utf-8"),
                         response_json,
+                    ),
+                )
+                database.execute(
+                    "INSERT INTO audit_comparison_chain"
+                    "(comparison_seq, response_digest, previous_chain_digest,"
+                    " chain_digest) VALUES (?, ?, ?, ?)",
+                    (
+                        comparison_seq,
+                        response_digest,
+                        previous_chain_digest,
+                        chain_digest,
                     ),
                 )
                 database.execute(
@@ -7343,6 +7387,114 @@ class Handler(BaseHTTPRequestHandler):
                 database.execute("ROLLBACK")
                 raise
         self._json(HTTPStatus.OK, payload)
+
+    def _get_audit_chain(self, query: str) -> None:
+        # 比较链分页：limit、cursor=cut:lastSeq 的格式、缺省值与错误次序
+        # 沿用比较列表；仅已配置审计机器可读。
+        parsed = self._parse_evaluation_query(query, AUDIT_CHAIN_QUERY_PARAMS)
+        if parsed is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        limit, cursor = parsed
+        if self.headers.get_all(SLA_DELEGATION_HEADER):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        auth = self._parse_sla_auth()
+        if auth is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        body_digest = hashlib.sha256(b"").hexdigest()
+        standard_path = "/v1/audit-chain"
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                if auth.machine_id not in self.server.auditors:
+                    database.execute("ROLLBACK")
+                    self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                    return
+                try:
+                    self._verify_request_principal(
+                        database, auth, standard_path, body_digest
+                    )
+                    self._check_request_nonce(database, auth)
+                except AuthRejected as rejected:
+                    database.execute("ROLLBACK")
+                    self._json(rejected.status, {"error": rejected.error})
+                    return
+                # 首页在写事务起点冻结最大比较序号；并发新增不进入旧 cut。
+                current_max = database.execute(
+                    "SELECT COALESCE(MAX(comparison_seq), 0) AS current_max"
+                    " FROM audit_comparison_chain"
+                ).fetchone()["current_max"]
+                if cursor is None:
+                    cut, last_seq = current_max, 0
+                else:
+                    cut, last_seq = cursor
+                    if cut > current_max:
+                        database.execute("ROLLBACK")
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                        )
+                        return
+                    anchor = database.execute(
+                        "SELECT 1 FROM audit_comparison_chain"
+                        " WHERE comparison_seq = ? AND comparison_seq <= ?",
+                        (last_seq, cut),
+                    ).fetchone()
+                    if anchor is None:
+                        database.execute("ROLLBACK")
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                        )
+                        return
+                rows = database.execute(
+                    "SELECT comparison_seq, response_digest,"
+                    " previous_chain_digest, chain_digest"
+                    " FROM audit_comparison_chain"
+                    " WHERE comparison_seq <= ? AND comparison_seq > ?"
+                    " ORDER BY comparison_seq ASC LIMIT ?",
+                    (cut, last_seq, limit + 1),
+                ).fetchall()
+                has_next = len(rows) > limit
+                page = rows[:limit]
+                entries = [
+                    {
+                        "comparisonSeq": row["comparison_seq"],
+                        "responseDigest": row["response_digest"],
+                        "previousChainDigest": row["previous_chain_digest"],
+                        "chainDigest": row["chain_digest"],
+                    }
+                    for row in page
+                ]
+                next_cursor = (
+                    f"{cut}:{page[-1]['comparison_seq']}" if has_next else None
+                )
+                # 头对象给出 cut 末项序号与链摘要；空历史（cut 内无记录）为 null。
+                head_row = database.execute(
+                    "SELECT comparison_seq, chain_digest"
+                    " FROM audit_comparison_chain"
+                    " WHERE comparison_seq <= ?"
+                    " ORDER BY comparison_seq DESC LIMIT 1",
+                    (cut,),
+                ).fetchone()
+                head = (
+                    None
+                    if head_row is None
+                    else {
+                        "comparisonSeq": head_row["comparison_seq"],
+                        "chainDigest": head_row["chain_digest"],
+                    }
+                )
+                # 仅成功读取才消费随机数；任何失败均不写链记录或改变现有数据。
+                self._consume_request_nonce(database, auth)
+                database.execute("COMMIT")
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+        self._json(
+            HTTPStatus.OK,
+            {"entries": entries, "nextCursor": next_cursor, "head": head},
+        )
 
     def log_message(self, format: str, *args: object) -> None:
         return

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from pathlib import Path
 
@@ -392,6 +393,12 @@ CREATE TABLE IF NOT EXISTS audit_comparison_idempotency_records (
     auth_nonce TEXT,
     auth_signature TEXT
 );
+CREATE TABLE IF NOT EXISTS audit_comparison_chain (
+    comparison_seq INTEGER PRIMARY KEY,
+    response_digest TEXT NOT NULL,
+    previous_chain_digest TEXT NOT NULL,
+    chain_digest TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS machine_delegations (
     id TEXT PRIMARY KEY,
     issuer_machine_id TEXT NOT NULL,
@@ -475,6 +482,22 @@ DELEGATION_EVENT_INDEX = "idx_delegation_events_delegation_seq"
 DELEGATION_SCOPE_MARKER = "delegation_scope_added"
 DELEGATION_DISPUTE_MARKER = "delegation_dispute_added"
 DELEGATION_PROOF_MARKER = "delegation_proof_added"
+AUDIT_CHAIN_MARKER = "audit_comparison_chain_backfilled"
+
+# 比较链首项的前项摘要：六十四个零。
+AUDIT_CHAIN_GENESIS_PREVIOUS = "0" * 64
+
+
+def audit_chain_digest(
+    comparison_seq: int, response_digest: str, previous_chain_digest: str
+) -> str:
+    # 链文本由 audit-chain-v1、比较序号、响应摘要、前项摘要逐行连接且末尾无换行，
+    # 取其 SHA-256 小写十六进制为链摘要。
+    text = (
+        f"audit-chain-v1\n{comparison_seq}\n{response_digest}\n"
+        f"{previous_chain_digest}"
+    )
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 AUTH_IDEMPOTENCY_TABLES = (
     "capability_idempotency_records",
@@ -954,6 +977,57 @@ def _add_delegation_proof(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _backfill_audit_comparison_chain(connection: sqlite3.Connection) -> None:
+    # 仅在一次性迁移（含空库首次连接）时取写锁；BEGIN IMMEDIATE 串行并发首启。
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        if (
+            connection.execute(
+                "SELECT 1 FROM schema_metadata WHERE key = ?",
+                (AUDIT_CHAIN_MARKER,),
+            ).fetchone()
+            is not None
+        ):
+            # 其他连接已完成迁移，直接释放写锁，不再补链。
+            connection.execute("COMMIT")
+            return
+        # 旧比较按比较序号升序在单事务补链：响应摘要取既有 response_json 的
+        # 紧凑 UTF-8 无尾换行字节，首项前项摘要为六十四个零；不改旧响应、
+        # 幂等字节、序号或时间。新库首启时比较表为空，此处不写入。
+        previous_chain_digest = AUDIT_CHAIN_GENESIS_PREVIOUS
+        rows = connection.execute(
+            "SELECT comparison_seq, response_json FROM audit_comparisons"
+            " ORDER BY comparison_seq ASC"
+        ).fetchall()
+        for row in rows:
+            response_digest = hashlib.sha256(
+                row["response_json"].encode("utf-8")
+            ).hexdigest()
+            chain_digest = audit_chain_digest(
+                row["comparison_seq"], response_digest, previous_chain_digest
+            )
+            connection.execute(
+                "INSERT INTO audit_comparison_chain"
+                "(comparison_seq, response_digest, previous_chain_digest,"
+                " chain_digest) VALUES (?, ?, ?, ?)",
+                (
+                    row["comparison_seq"],
+                    response_digest,
+                    previous_chain_digest,
+                    chain_digest,
+                ),
+            )
+            previous_chain_digest = chain_digest
+        connection.execute(
+            "INSERT INTO schema_metadata(key, value) VALUES (?, '1')",
+            (AUDIT_CHAIN_MARKER,),
+        )
+        connection.execute("COMMIT")
+    except BaseException:
+        connection.execute("ROLLBACK")
+        raise
+
+
 def connect(path: str) -> sqlite3.Connection:
     database = Path(path)
     database.parent.mkdir(parents=True, exist_ok=True)
@@ -1060,6 +1134,14 @@ def connect(path: str) -> sqlite3.Connection:
         is None
     ):
         _add_delegation_proof(connection)
+    if (
+        connection.execute(
+            "SELECT 1 FROM schema_metadata WHERE key = ?",
+            (AUDIT_CHAIN_MARKER,),
+        ).fetchone()
+        is None
+    ):
+        _backfill_audit_comparison_chain(connection)
     # 委托按签发事件序号分页：事件表 join 委托后需 (issuer, issued_seq) 索引。
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_delegation_events_delegation_seq"

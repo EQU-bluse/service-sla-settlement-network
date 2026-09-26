@@ -12229,6 +12229,347 @@ class AuditComparisonTests(_EvidenceScenario, unittest.TestCase):
             )
             self.assertEqual(status, 404)
 
+    # ---- 超大端点序号 ----
+
+    def test_oversized_endpoint_seqs_are_not_found(self) -> None:
+        # 端点序号接受任意非布尔正整数：超出 64 位存储范围但格式合法按不存在处理，
+        # 返回 404/not_found 且不断连；存在性先于顺序判断（逆序也不返回 409）。
+        self.create_checkpoints("cmp-big-cp1", "cmp-big-cp2")
+        huge = 9_223_372_036_854_775_808  # INT64_MAX + 1
+        giant = 10**40
+        for index, (from_seq, to_seq) in enumerate(
+            (
+                (1, huge),
+                (huge, 1),
+                (huge, giant),
+                (giant, giant + 1),
+                (1, giant),
+            )
+        ):
+            status, body = self.post_comparison(
+                from_seq, to_seq, f"cmp-big-{index}"
+            )
+            self.assertEqual(status, 404, body)
+            self.assertEqual(json.loads(body), {"error": "not_found"})
+        # 恰好落在 INT64_MAX 的序号同样无此检查点（404 而非 400）。
+        status, body = self.post_comparison(
+            1, 9_223_372_036_854_775_807, "cmp-big-max"
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+        # 非正整数、字符串与布尔仍为非法请求。
+        for index, value in enumerate((0, -10**40, "1", True, 1.5)):
+            body = json.dumps(
+                {"fromCheckpointSeq": 1, "toCheckpointSeq": value}
+            ).encode()
+            status, response = self.post_comparison_raw(
+                "/v1/audit-comparisons", body, f"cmp-big-bad-{index}"
+            )
+            self.assertEqual(status, 400, response)
+
+    # ---- 比较链读取 ----
+
+    def get_chain(
+        self,
+        path: str = "/v1/audit-chain",
+        *,
+        seed: bytes | None = None,
+        actor: str | None = None,
+        nonce: str | None = None,
+        request_time_ms: int | None = None,
+        omit_auth: bool = False,
+        delegation: str | None = None,
+    ) -> tuple[int, bytes]:
+        request = Request(self.url(path), data=b"", method="GET")
+        if delegation is not None:
+            request.add_header("SLA-Delegation", delegation)
+        elif not omit_auth:
+            nonce = nonce or f"nonce-chain-get-{time.time_ns()}"
+            request.add_header(
+                "SLA-Auth",
+                make_sla_auth(
+                    self.server,
+                    None,
+                    seed if seed is not None else self.AUDITOR_SEED,
+                    actor if actor is not None else self.auditor_id,
+                    "GET",
+                    urlsplit(path).path,
+                    b"",
+                    1,
+                    nonce=nonce,
+                    request_time_ms=request_time_ms,
+                ),
+            )
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    @staticmethod
+    def expected_chain_digest(seq: int, response_digest: str, previous: str) -> str:
+        text = f"audit-chain-v1\n{seq}\n{response_digest}\n{previous}"
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def create_comparisons(self, count: int, prefix: str) -> list[bytes]:
+        checkpoints = self.create_checkpoints(
+            *[f"{prefix}-cp-{index}" for index in range(1, count + 2)]
+        )
+        raw_responses = []
+        for index in range(count):
+            status, body = self.post_comparison(
+                checkpoints[index]["checkpointSeq"],
+                checkpoints[index + 1]["checkpointSeq"],
+                f"{prefix}-cmp-{index + 1}",
+            )
+            self.assertEqual(status, 201, body)
+            raw_responses.append(body)
+        return raw_responses
+
+    def test_chain_empty_history(self) -> None:
+        status, body = self.get_chain()
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertEqual(list(payload), ["entries", "nextCursor", "head"])
+        self.assertEqual(payload["entries"], [])
+        self.assertIsNone(payload["nextCursor"])
+        self.assertIsNone(payload["head"])
+        self.assertFalse(body.endswith(b"\n"))
+
+    def test_chain_entries_link_digests_and_head(self) -> None:
+        raw_responses = self.create_comparisons(3, "chain-link")
+        status, body = self.get_chain()
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertIsNone(payload["nextCursor"])
+        entries = payload["entries"]
+        self.assertEqual([entry["comparisonSeq"] for entry in entries], [1, 2, 3])
+        previous = "0" * 64
+        for index, entry in enumerate(entries):
+            self.assertEqual(
+                list(entry),
+                [
+                    "comparisonSeq",
+                    "responseDigest",
+                    "previousChainDigest",
+                    "chainDigest",
+                ],
+            )
+            response_digest = hashlib.sha256(raw_responses[index]).hexdigest()
+            self.assertEqual(entry["responseDigest"], response_digest)
+            self.assertEqual(entry["previousChainDigest"], previous)
+            chain_digest = self.expected_chain_digest(
+                index + 1, response_digest, previous
+            )
+            self.assertEqual(entry["chainDigest"], chain_digest)
+            previous = chain_digest
+        # 头对象给出 cut 末项序号与链摘要。
+        self.assertEqual(
+            payload["head"],
+            {"comparisonSeq": 3, "chainDigest": entries[-1]["chainDigest"]},
+        )
+
+    def test_chain_paging_stable_cut_and_head(self) -> None:
+        self.create_comparisons(2, "chain-page")
+        status, body = self.get_chain("/v1/audit-chain?limit=1")
+        self.assertEqual(status, 200, body)
+        first_page = json.loads(body)
+        self.assertEqual([e["comparisonSeq"] for e in first_page["entries"]], [1])
+        self.assertEqual(first_page["nextCursor"], "2:1")
+        # head 给出整个 cut 的末项（不随页变化）。
+        self.assertEqual(first_page["head"]["comparisonSeq"], 2)
+        # 旧游标携带 cut=2：此后新增比较不进入续页，head 仍为 cut 末项。
+        self.create_comparisons(1, "chain-page-new")
+        status, body = self.get_chain(
+            f"/v1/audit-chain?limit=1&cursor={first_page['nextCursor']}"
+        )
+        self.assertEqual(status, 200, body)
+        second_page = json.loads(body)
+        self.assertEqual([e["comparisonSeq"] for e in second_page["entries"]], [2])
+        self.assertIsNone(second_page["nextCursor"])
+        self.assertEqual(second_page["head"]["comparisonSeq"], 2)
+
+    def test_chain_paging_survives_restart(self) -> None:
+        self.create_comparisons(2, "chain-restart")
+        status, body = self.get_chain("/v1/audit-chain?limit=1")
+        self.assertEqual(status, 200)
+        cursor = json.loads(body)["nextCursor"]
+        self.restart()
+        status, body = self.get_chain(f"/v1/audit-chain?limit=1&cursor={cursor}")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(
+            [e["comparisonSeq"] for e in json.loads(body)["entries"]], [2]
+        )
+
+    def test_chain_invalid_params_before_auth(self) -> None:
+        self.create_comparisons(1, "chain-param")
+        for query in (
+            "limit=0",
+            "limit=101",
+            "limit=x",
+            "foo=1",
+            "cursor=1",
+            "cursor=x:1",
+            "limit=1&limit=2",
+        ):
+            status, response = self.get_chain(
+                f"/v1/audit-chain?{query}", omit_auth=True
+            )
+            self.assertEqual(status, 400, query)
+            self.assertEqual(json.loads(response), {"error": "invalid_request"})
+        # 代理头、缺失或重复认证头同样为非法请求。
+        status, _ = self.get_chain(delegation="d;0;1;n;s")
+        self.assertEqual(status, 400)
+
+    def test_chain_cut_ahead_and_missing_anchor(self) -> None:
+        self.create_comparisons(1, "chain-cursor")
+        for query in ("cursor=99:1", "cursor=1:5", "cursor=2:1"):
+            status, body = self.get_chain(f"/v1/audit-chain?{query}")
+            self.assertEqual(status, 400, query)
+            self.assertEqual(json.loads(body), {"error": "invalid_request"})
+
+    def test_chain_requires_auditor(self) -> None:
+        self.create_comparisons(1, "chain-auth")
+        status, _ = self.get_chain(
+            seed=PUBLIC_KEY_SEED_B, actor=self.consumer_id
+        )
+        self.assertEqual(status, 403)
+        status, _ = self.get_chain(omit_auth=True)
+        self.assertEqual(status, 400)
+
+    def test_chain_nonce_consumed_only_on_success(self) -> None:
+        self.create_comparisons(1, "chain-nonce")
+        nonce = f"nonce-chain-ok-{time.time_ns()}"
+        status, _ = self.get_chain(nonce=nonce)
+        self.assertEqual(status, 200)
+        status, body = self.get_chain(nonce=nonce)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "replay_detected"})
+        # 参数非法在认证前判定：不消费随机数。
+        reusable = f"nonce-chain-bad-{time.time_ns()}"
+        status, _ = self.get_chain(
+            "/v1/audit-chain?limit=0", nonce=reusable
+        )
+        self.assertEqual(status, 400)
+        status, _ = self.get_chain(nonce=reusable)
+        self.assertEqual(status, 200)
+        # 认证失败（过时请求）不消费随机数。
+        stale_nonce = f"nonce-chain-stale-{time.time_ns()}"
+        status, body = self.get_chain(
+            nonce=stale_nonce,
+            request_time_ms=int(time.time() * 1000) - 400_000,
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(body), {"error": "stale_request"})
+        status, _ = self.get_chain(nonce=stale_nonce)
+        self.assertEqual(status, 200)
+
+    def test_chain_does_not_change_on_failed_comparison(self) -> None:
+        self.create_comparisons(1, "chain-fail")
+        status, before = self.get_chain()
+        self.assertEqual(status, 200)
+        # 逆序请求失败：不写链记录。
+        status, _ = self.post_comparison(1, 1, "chain-fail-rev")
+        self.assertEqual(status, 409)
+        status, after = self.get_chain()
+        self.assertEqual(status, 200)
+        self.assertEqual(after, before)
+
+
+class AuditComparisonChainMigrationTests(unittest.TestCase):
+    # 旧库升级：新增比较链表并在单事务按比较序号升序补链，
+    # 不改旧响应、幂等字节、序号或时间。
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.database_path = str(Path(self.temporary.name) / "service.db")
+        from sla_network.database import connect as database_connect
+
+        connection = database_connect(self.database_path)
+        try:
+            self.payloads = []
+            for seq in (1, 2):
+                response_json = (
+                    f'{{"comparisonSeq":{seq},"fromCheckpointSeq":{seq},'
+                    f'"toCheckpointSeq":{seq + 1},"digest":"d{seq}"}}'
+                )
+                connection.execute(
+                    "INSERT INTO audit_comparisons"
+                    "(comparison_seq, from_checkpoint_seq, to_checkpoint_seq,"
+                    " digest, created_by, created_at_ms, result_json,"
+                    " response_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        seq,
+                        seq,
+                        seq + 1,
+                        f"d{seq}",
+                        "a" * 64,
+                        1234 + seq,
+                        "{}",
+                        response_json,
+                    ),
+                )
+                self.payloads.append(response_json)
+            # 模拟旧库：移除比较链表与一次性标记。
+            connection.execute("DROP TABLE audit_comparison_chain")
+            connection.execute(
+                "DELETE FROM schema_metadata"
+                " WHERE key = 'audit_comparison_chain_backfilled'"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_old_comparisons_backfilled_in_seq_order(self) -> None:
+        from sla_network.database import connect as database_connect
+
+        connection = database_connect(self.database_path)
+        try:
+            rows = connection.execute(
+                "SELECT c.comparison_seq, c.response_digest,"
+                " c.previous_chain_digest, c.chain_digest, a.response_json"
+                " FROM audit_comparison_chain AS c"
+                " JOIN audit_comparisons AS a"
+                " ON a.comparison_seq = c.comparison_seq"
+                " ORDER BY c.comparison_seq ASC"
+            ).fetchall()
+            self.assertEqual([row[0] for row in rows], [1, 2])
+            previous = "0" * 64
+            for index, row in enumerate(rows):
+                response_digest = hashlib.sha256(
+                    self.payloads[index].encode("utf-8")
+                ).hexdigest()
+                text = (
+                    f"audit-chain-v1\n{index + 1}\n{response_digest}\n{previous}"
+                )
+                chain_digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                self.assertEqual(row[1], response_digest)
+                self.assertEqual(row[2], previous)
+                self.assertEqual(row[3], chain_digest)
+                # 旧响应字节保持不变。
+                self.assertEqual(row[4], self.payloads[index])
+                previous = chain_digest
+            marker = connection.execute(
+                "SELECT 1 FROM schema_metadata"
+                " WHERE key = 'audit_comparison_chain_backfilled'"
+            ).fetchone()
+            self.assertIsNotNone(marker)
+        finally:
+            connection.close()
+
+        # 重启后不重复补链、不重写。
+        connection = database_connect(self.database_path)
+        try:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM audit_comparison_chain"
+            ).fetchone()[0]
+            self.assertEqual(count, 2)
+        finally:
+            connection.close()
+
 
 class AuditorCliTests(unittest.TestCase):
     # --auditor 启动参数：格式非法退出码 2；合法或省略时服务照常运行。
