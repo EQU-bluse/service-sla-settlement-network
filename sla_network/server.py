@@ -6440,9 +6440,12 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             side_accounts = {account for account, _ in sides}
             consumed = [False] * len(pair)
-            matched: dict[str, dict[str, Any]] = {}
+            # 预期腿与实际分录都按可重复集合逐腿匹配：同一账户可能出现
+            # 同引用的多条分录（如生产方与消费方为同一机器时正负两腿同
+            # 账户），不得按账户标识覆盖同组记录。
+            matched: list[dict[str, Any] | None] = [None] * len(sides)
             # 先按账户与金额精确匹配，再按账户匹配（错金额记 entry_direction）。
-            for account, delta in sides:
+            for side_index, (account, delta) in enumerate(sides):
                 for index, entry in enumerate(pair):
                     if (
                         not consumed[index]
@@ -6450,15 +6453,15 @@ class Handler(BaseHTTPRequestHandler):
                         and entry["delta_micros"] == delta
                     ):
                         consumed[index] = True
-                        matched[account] = entry
+                        matched[side_index] = entry
                         break
-            for account, delta in sides:
-                if account in matched:
+            for side_index, (account, delta) in enumerate(sides):
+                if matched[side_index] is not None:
                     continue
                 for index, entry in enumerate(pair):
                     if not consumed[index] and entry["account_id"] == account:
                         consumed[index] = True
-                        matched[account] = entry
+                        matched[side_index] = entry
                         differences.append(
                             self._audit_difference(
                                 account, "entry_direction",
@@ -6468,8 +6471,8 @@ class Handler(BaseHTTPRequestHandler):
                         )
                         break
             # 缺失侧：整对缺失产生两项，单侧缺失产生一项。
-            for account, delta in sides:
-                if account not in matched:
+            for side_index, (account, delta) in enumerate(sides):
+                if matched[side_index] is None:
                     differences.append(
                         self._audit_difference(
                             account, "entry_missing", None, None, delta, None
@@ -6496,8 +6499,8 @@ class Handler(BaseHTTPRequestHandler):
             # SLA 与评估归属：逐预期侧核对，无对应分录时序号为 null。
             attribution = expected["attribution"]
             if attribution is not None:
-                for account, _delta in sides:
-                    entry = matched.get(account)
+                for side_index, (account, _delta) in enumerate(sides):
+                    entry = matched[side_index]
                     differences.append(
                         self._audit_difference(
                             account, "entry_attribution",
