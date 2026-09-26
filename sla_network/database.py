@@ -445,6 +445,29 @@ CREATE TABLE IF NOT EXISTS audit_verification_idempotency_records (
     auth_nonce TEXT,
     auth_signature TEXT
 );
+CREATE TABLE IF NOT EXISTS audit_proofs (
+    proof_seq INTEGER PRIMARY KEY,
+    verification_seq INTEGER NOT NULL,
+    response_digest TEXT NOT NULL,
+    auditor_machine_id TEXT NOT NULL,
+    public_key TEXT NOT NULL,
+    key_version INTEGER NOT NULL,
+    signature TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    response_json TEXT NOT NULL,
+    UNIQUE (verification_seq, auditor_machine_id)
+);
+CREATE TABLE IF NOT EXISTS audit_proof_idempotency_records (
+    key TEXT PRIMARY KEY,
+    request_json TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    response_json TEXT NOT NULL,
+    auth_machine_id TEXT,
+    auth_key_version INTEGER,
+    auth_request_time_ms INTEGER,
+    auth_nonce TEXT,
+    auth_signature TEXT
+);
 CREATE TABLE IF NOT EXISTS machine_delegations (
     id TEXT PRIMARY KEY,
     issuer_machine_id TEXT NOT NULL,

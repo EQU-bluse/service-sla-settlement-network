@@ -89,6 +89,7 @@ EVIDENCE_PROOF_FIELDS = {"evidenceSeq", "actorId", "signature"}
 AUDIT_COMPARISON_FIELDS = {"fromCheckpointSeq", "toCheckpointSeq"}
 AUDIT_ANCHOR_FIELDS = {"comparisonSeq", "chainDigest"}
 AUDIT_VERIFICATION_FIELDS = {"comparisonSeq"}
+AUDIT_PROOF_FIELDS = {"verificationSeq", "signature"}
 DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}")
 KEY_ROTATION_FIELDS = {
     "expectedVersion",
@@ -120,6 +121,7 @@ AUDIT_CHECKPOINTS_QUERY_PARAMS = {"limit", "cursor"}
 AUDIT_COMPARISONS_QUERY_PARAMS = {"limit", "cursor"}
 AUDIT_ANCHORS_QUERY_PARAMS = {"limit", "cursor"}
 AUDIT_VERIFICATIONS_QUERY_PARAMS = {"limit", "cursor"}
+AUDIT_PROOFS_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTE_SNAPSHOT_STATES = {"open", "released", "refunded", "escalated"}
 ESCALATION_DELAY_MS = 86_400_000
 TELEMETRY_TIME_MAX = 2147483648000
@@ -223,6 +225,30 @@ def _positive_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 1
 
 
+def _parse_unbounded_int_token(token: str) -> int:
+    # 仅用于 README 明确允许任意长度整数的审计序号：常规长度交给内置转换；
+    # 超过解释器字符串转换位数保护（PEP 682）的令牌按位累加，不依赖全局保护状态。
+    # 负值由调用方的正整数校验拒绝，此处仍须安全返回而不抛异常。
+    sign = -1 if token[:1] == "-" else 1
+    digits = token[1:] if sign < 0 else token
+    try:
+        return int(token)
+    except ValueError:
+        value = 0
+        for char in digits:
+            value = value * 10 + (ord(char) - ord("0"))
+        return sign * value
+
+
+def _parse_protected_int_token(token: str) -> int:
+    # 其他 JSON 整数保留转换保护：超过解释器位数上限（PEP 682）的令牌直接判非法，
+    # 由调用方按非法请求处理，不断连、不关闭全局保护。扫描器连负号一并传入。
+    digits = token[1:] if token[:1] == "-" else token
+    if len(digits) > 4300:
+        raise ValueError("integer token exceeds conversion protection")
+    return int(token)
+
+
 class Handler(BaseHTTPRequestHandler):
     server: ApiServer
 
@@ -233,6 +259,18 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _require_single_idempotency_key(self) -> str | None:
+        # 幂等头必须存在、单值且格式合法；重复头统一判非法请求，且不查询任何资源。
+        values = self.headers.get_all("Idempotency-Key")
+        if (
+            values is None
+            or len(values) != 1
+            or IDEMPOTENCY_KEY_PATTERN.fullmatch(values[0]) is None
+        ):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return None
+        return values[0]
 
     def do_GET(self) -> None:  # noqa: N802
         target = urlsplit(self.path)
@@ -378,6 +416,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if target.path == "/v1/audit-verifications":
             self._get_audit_verifications(target.query)
+            return
+        if target.path == "/v1/audit-proofs":
+            self._get_audit_proofs(target.query)
             return
         sla_match = SLA_PATH_PATTERN.fullmatch(target.path)
         if sla_match is not None:
@@ -1689,6 +1730,9 @@ class Handler(BaseHTTPRequestHandler):
         if urlsplit(self.path).path == "/v1/audit-verifications":
             self._create_audit_verification()
             return
+        if urlsplit(self.path).path == "/v1/audit-proofs":
+            self._create_audit_proof()
+            return
         delegation_revocation_match = DELEGATION_PATH_PATTERN.fullmatch(
             urlsplit(self.path).path
         )
@@ -1723,7 +1767,9 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return self.rfile.read(length)
 
-    def _read_json_object(self, body: bytes | None = None) -> dict[str, Any] | None:
+    def _read_json_object(
+        self, body: bytes | None = None, *, unbounded_ints: bool = False
+    ) -> dict[str, Any] | None:
         if body is None:
             body = self._read_raw_body()
             if body is None:
@@ -1732,8 +1778,20 @@ class Handler(BaseHTTPRequestHandler):
             text = body.decode("utf-8")
         except UnicodeDecodeError:
             return None
+        # 默认保留解释器的整数字符串转换位数保护（PEP 682）：其他 JSON 整数
+        # 超出位数上限时解析失败并按非法请求处理。仅 README 明确允许任意长度
+        # 整数的审计序号入口逐位转换令牌；该保护不依赖全局开关状态。
+        parse_int = (
+            _parse_unbounded_int_token
+            if unbounded_ints
+            else _parse_protected_int_token
+        )
         try:
-            parsed = json.loads(text, object_pairs_hook=_unique_object)
+            parsed = json.loads(
+                text,
+                object_pairs_hook=_unique_object,
+                parse_int=parse_int,
+            )
         except ValueError:
             return None
         if not isinstance(parsed, dict):
@@ -2077,9 +2135,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise
 
     def _declare_capability(self, machine_id: str) -> None:
-        idempotency_key = self.headers.get("Idempotency-Key")
-        if idempotency_key is None or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+        idempotency_key = self._require_single_idempotency_key()
+        if idempotency_key is None:
             return
         # 先读并校验正文：升级前既有幂等记录可在无认证头时按原请求先行重放。
         raw_body = self._read_raw_body()
@@ -2276,12 +2333,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise
 
     def _create_delegation(self) -> None:
-        idempotency_key = self.headers.get("Idempotency-Key")
-        if (
-            idempotency_key is None
-            or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None
-        ):
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+        idempotency_key = self._require_single_idempotency_key()
+        if idempotency_key is None:
             return
         # 签发入口不接受任何查询参数：参数校验先于体校验。
         if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
@@ -2528,12 +2581,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise
 
     def _revoke_delegation(self, delegation_id: str) -> None:
-        idempotency_key = self.headers.get("Idempotency-Key")
-        if (
-            idempotency_key is None
-            or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None
-        ):
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+        idempotency_key = self._require_single_idempotency_key()
+        if idempotency_key is None:
             return
         # 撤销入口不接受任何查询参数。
         if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
@@ -2651,12 +2700,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise
 
     def _rotate_key(self, machine_id: str) -> None:
-        idempotency_key = self.headers.get("Idempotency-Key")
-        if (
-            idempotency_key is None
-            or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None
-        ):
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+        idempotency_key = self._require_single_idempotency_key()
+        if idempotency_key is None:
             return
         # 轮换入口不接受任何查询参数：参数校验先于体校验与机器查询。
         if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
@@ -2791,12 +2836,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise
 
     def _revoke_key(self, machine_id: str, version_text: str) -> None:
-        idempotency_key = self.headers.get("Idempotency-Key")
-        if (
-            idempotency_key is None
-            or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None
-        ):
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+        idempotency_key = self._require_single_idempotency_key()
+        if idempotency_key is None:
             return
         # 吊销入口不接受任何查询参数。
         if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
@@ -2921,9 +2962,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise
 
     def _create_sla_template(self) -> None:
-        idempotency_key = self.headers.get("Idempotency-Key")
-        if idempotency_key is None or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+        idempotency_key = self._require_single_idempotency_key()
+        if idempotency_key is None:
             return
         fields = self._read_sla_template_object()
         if fields is None:
@@ -3017,9 +3057,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise
 
     def _create_sla(self) -> None:
-        idempotency_key = self.headers.get("Idempotency-Key")
-        if idempotency_key is None or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+        idempotency_key = self._require_single_idempotency_key()
+        if idempotency_key is None:
             return
         fields = self._read_sla_object()
         if fields is None:
@@ -3130,9 +3169,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise
 
     def _confirm_sla(self, sla_id: str) -> None:
-        idempotency_key = self.headers.get("Idempotency-Key")
-        if idempotency_key is None or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+        idempotency_key = self._require_single_idempotency_key()
+        if idempotency_key is None:
             return
         # 先读并校验正文：升级前既有幂等记录可在无认证头时按原请求先行重放。
         raw_body = self._read_raw_body()
@@ -3291,9 +3329,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise
 
     def _post_telemetry(self, sla_id: str) -> None:
-        idempotency_key = self.headers.get("Idempotency-Key")
-        if idempotency_key is None or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+        idempotency_key = self._require_single_idempotency_key()
+        if idempotency_key is None:
             return
         parsed = self._read_telemetry_object()
         if parsed is None:
@@ -3465,9 +3502,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise
 
     def _evaluate_sla(self, sla_id: str) -> None:
-        idempotency_key = self.headers.get("Idempotency-Key")
-        if idempotency_key is None or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+        idempotency_key = self._require_single_idempotency_key()
+        if idempotency_key is None:
             return
         fields = self._read_evaluation_object()
         if fields is None:
@@ -3592,9 +3628,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise
 
     def _deposit_funds(self, machine_id: str) -> None:
-        idempotency_key = self.headers.get("Idempotency-Key")
-        if idempotency_key is None or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+        idempotency_key = self._require_single_idempotency_key()
+        if idempotency_key is None:
             return
         fields = self._read_fund_object()
         if fields is None:
@@ -3724,9 +3759,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise
 
     def _create_settlement(self) -> None:
-        idempotency_key = self.headers.get("Idempotency-Key")
-        if idempotency_key is None or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+        idempotency_key = self._require_single_idempotency_key()
+        if idempotency_key is None:
             return
         fields = self._read_settlement_object()
         if fields is None:
@@ -3906,9 +3940,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise
 
     def _create_dispute(self) -> None:
-        idempotency_key = self.headers.get("Idempotency-Key")
-        if idempotency_key is None or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+        idempotency_key = self._require_single_idempotency_key()
+        if idempotency_key is None:
             return
         fields = self._read_dispute_object()
         if fields is None:
@@ -4024,12 +4057,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise
 
     def _submit_evidence(self, dispute_id: str) -> None:
-        idempotency_key = self.headers.get("Idempotency-Key")
-        if (
-            idempotency_key is None
-            or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None
-        ):
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+        idempotency_key = self._require_single_idempotency_key()
+        if idempotency_key is None:
             return
         # POST 证据不接受任何查询参数：参数校验先于体校验与争议查询。
         if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
@@ -4247,12 +4276,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise
 
     def _create_evidence_snapshot(self, dispute_id: str) -> None:
-        idempotency_key = self.headers.get("Idempotency-Key")
-        if (
-            idempotency_key is None
-            or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None
-        ):
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+        idempotency_key = self._require_single_idempotency_key()
+        if idempotency_key is None:
             return
         # 创建快照不接受任何查询参数：参数校验先于体校验与争议查询。
         if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
@@ -4488,12 +4513,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise
 
     def _create_adjudication_proposal(self, dispute_id: str) -> None:
-        idempotency_key = self.headers.get("Idempotency-Key")
-        if (
-            idempotency_key is None
-            or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None
-        ):
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+        idempotency_key = self._require_single_idempotency_key()
+        if idempotency_key is None:
             return
         # 提交提案不接受任何查询参数：参数校验先于体校验与争议查询。
         if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
@@ -4781,12 +4802,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise
 
     def _create_escalation(self, dispute_id: str) -> None:
-        idempotency_key = self.headers.get("Idempotency-Key")
-        if (
-            idempotency_key is None
-            or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None
-        ):
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+        idempotency_key = self._require_single_idempotency_key()
+        if idempotency_key is None:
             return
         # 升级不接受任何查询参数：参数校验先于体校验与争议查询。
         if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
@@ -5107,12 +5124,8 @@ class Handler(BaseHTTPRequestHandler):
         self._json(status, payload)
 
     def _create_arbitration(self, dispute_id: str) -> None:
-        idempotency_key = self.headers.get("Idempotency-Key")
-        if (
-            idempotency_key is None
-            or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None
-        ):
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+        idempotency_key = self._require_single_idempotency_key()
+        if idempotency_key is None:
             return
         # 仲裁不接受任何查询参数：参数校验先于体校验与争议查询。
         if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
@@ -5430,12 +5443,8 @@ class Handler(BaseHTTPRequestHandler):
         self._json(status, payload)
 
     def _create_evidence_proof(self) -> None:
-        idempotency_key = self.headers.get("Idempotency-Key")
-        if (
-            idempotency_key is None
-            or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None
-        ):
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+        idempotency_key = self._require_single_idempotency_key()
+        if idempotency_key is None:
             return
         # POST 证明不接受任何查询参数：参数校验先于体校验与资源查询。
         if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
@@ -6001,9 +6010,8 @@ class Handler(BaseHTTPRequestHandler):
         self._json(status, payload)
 
     def _resolve_dispute(self, dispute_id: str) -> None:
-        idempotency_key = self.headers.get("Idempotency-Key")
-        if idempotency_key is None or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+        idempotency_key = self._require_single_idempotency_key()
+        if idempotency_key is None:
             return
         fields = self._read_resolution_object()
         if fields is None:
@@ -6123,12 +6131,8 @@ class Handler(BaseHTTPRequestHandler):
     # ---- 只读全库审计检查点 ----
 
     def _create_audit_checkpoint(self) -> None:
-        idempotency_key = self.headers.get("Idempotency-Key")
-        if (
-            idempotency_key is None
-            or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None
-        ):
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+        idempotency_key = self._require_single_idempotency_key()
+        if idempotency_key is None:
             return
         # 审计创建拒绝查询参数：参数校验先于体校验与认证结构。
         if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
@@ -6982,12 +6986,8 @@ class Handler(BaseHTTPRequestHandler):
         self._json(HTTPStatus.OK, payload)
 
     def _create_audit_comparison(self) -> None:
-        idempotency_key = self.headers.get("Idempotency-Key")
-        if (
-            idempotency_key is None
-            or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None
-        ):
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+        idempotency_key = self._require_single_idempotency_key()
+        if idempotency_key is None:
             return
         # 比较创建拒绝查询参数：参数校验先于体校验与认证结构。
         if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
@@ -7018,7 +7018,7 @@ class Handler(BaseHTTPRequestHandler):
         self._json(status, payload)
 
     def _read_audit_comparison_object(self, body: bytes) -> dict[str, Any] | None:
-        parsed = self._read_json_object(body)
+        parsed = self._read_json_object(body, unbounded_ints=True)
         if parsed is None or set(parsed) != AUDIT_COMPARISON_FIELDS:
             return None
         from_seq = parsed["fromCheckpointSeq"]
@@ -7540,12 +7540,8 @@ class Handler(BaseHTTPRequestHandler):
         self._json(HTTPStatus.OK, payload)
 
     def _create_audit_anchor(self) -> None:
-        idempotency_key = self.headers.get("Idempotency-Key")
-        if (
-            idempotency_key is None
-            or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None
-        ):
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+        idempotency_key = self._require_single_idempotency_key()
+        if idempotency_key is None:
             return
         # 锚点创建拒绝查询参数：参数校验先于体校验与认证结构。
         if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
@@ -7577,7 +7573,7 @@ class Handler(BaseHTTPRequestHandler):
         self._json(status, payload)
 
     def _read_audit_anchor_object(self, body: bytes) -> dict[str, Any] | None:
-        parsed = self._read_json_object(body)
+        parsed = self._read_json_object(body, unbounded_ints=True)
         if parsed is None or set(parsed) != AUDIT_ANCHOR_FIELDS:
             return None
         comparison_seq = parsed["comparisonSeq"]
@@ -7845,12 +7841,8 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def _create_audit_verification(self) -> None:
-        idempotency_key = self.headers.get("Idempotency-Key")
-        if (
-            idempotency_key is None
-            or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None
-        ):
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+        idempotency_key = self._require_single_idempotency_key()
+        if idempotency_key is None:
             return
         # 验证创建拒绝查询参数：参数校验先于体校验与认证结构。
         if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
@@ -7881,7 +7873,7 @@ class Handler(BaseHTTPRequestHandler):
         self._json(status, payload)
 
     def _read_audit_verification_object(self, body: bytes) -> dict[str, Any] | None:
-        parsed = self._read_json_object(body)
+        parsed = self._read_json_object(body, unbounded_ints=True)
         if parsed is None or set(parsed) != AUDIT_VERIFICATION_FIELDS:
             return None
         comparison_seq = parsed["comparisonSeq"]
@@ -8266,6 +8258,304 @@ class Handler(BaseHTTPRequestHandler):
         self._json(
             HTTPStatus.OK,
             {"verifications": verifications, "nextCursor": next_cursor},
+        )
+
+    def _create_audit_proof(self) -> None:
+        idempotency_key = self._require_single_idempotency_key()
+        if idempotency_key is None:
+            return
+        # 证明创建拒绝查询参数：参数校验先于体校验与认证结构。
+        if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 正文恰含 verificationSeq（非布尔正整数，任意长度）与 signature
+        # （恰 128 位小写十六进制），键不得重复。
+        raw_body = self._read_raw_body()
+        fields = (
+            None
+            if raw_body is None
+            else self._read_audit_proof_object(raw_body)
+        )
+        if fields is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 仅接受单一 SLA-Auth：代理头、缺失、重复或结构非法均为非法请求。
+        if self.headers.get_all(SLA_DELEGATION_HEADER):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        auth = self._parse_sla_auth()
+        if auth is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        body_digest = hashlib.sha256(raw_body).hexdigest()
+        status, payload = self._apply_audit_proof(
+            fields, auth, body_digest, idempotency_key
+        )
+        self._json(status, payload)
+
+    def _read_audit_proof_object(self, body: bytes) -> dict[str, Any] | None:
+        parsed = self._read_json_object(body, unbounded_ints=True)
+        if parsed is None or set(parsed) != AUDIT_PROOF_FIELDS:
+            return None
+        verification_seq = parsed["verificationSeq"]
+        signature = parsed["signature"]
+        # 报告序号接受任意非布尔正整数，不以数据库整数上界判为非法请求；
+        # 超出存储范围但格式合法者按报告不存在处理（404/not_found）。
+        if not _positive_int(verification_seq):
+            return None
+        if (
+            not isinstance(signature, str)
+            or SLA_AUTH_SIGNATURE_PATTERN.fullmatch(signature) is None
+        ):
+            return None
+        return parsed
+
+    def _apply_audit_proof(
+        self,
+        fields: dict[str, Any],
+        auth: SlaAuth,
+        body_digest: str,
+        idempotency_key: str,
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        verification_seq = fields["verificationSeq"]
+        request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+        standard_path = "/v1/audit-proofs"
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                # 幂等判定先于授权与认证：同键更换正文或认证五段均冲突，且不查资源。
+                record = database.execute(
+                    "SELECT request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature"
+                    " FROM audit_proof_idempotency_records WHERE key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    if (
+                        record["request_json"] == request_json
+                        and self._auth_record_matches(record, auth)
+                    ):
+                        return HTTPStatus(record["status"]), json.loads(
+                            record["response_json"]
+                        )
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                # 认证机器须为启动时配置的审计机器；未配置审计密钥一律 403。
+                if auth.machine_id not in self.server.auditors:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
+                try:
+                    self._verify_request_principal(
+                        database, auth, standard_path, body_digest
+                    )
+                    self._check_request_nonce(database, auth)
+                except AuthRejected as rejected:
+                    database.execute("ROLLBACK")
+                    return rejected.status, {"error": rejected.error}
+                # 报告须存在；超存储范围但格式合法（参数无法绑定 SQLite 整数）
+                # 同样按不存在处理。
+                if verification_seq <= INT64_MAX:
+                    report = database.execute(
+                        "SELECT comparison_seq_bound, anchor_seq_bound, digest,"
+                        " response_json FROM audit_verifications"
+                        " WHERE verification_seq = ?",
+                        (verification_seq,),
+                    ).fetchone()
+                else:
+                    report = None
+                if report is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                # 原始响应摘要取创建报告时保存的完整紧凑 UTF-8 无尾换行字节。
+                response_bytes = report["response_json"].encode("utf-8")
+                response_digest = hashlib.sha256(response_bytes).hexdigest()
+                # 待签文本以 audit-proof-v1 开头，逐行连接报告序号、原始响应摘要、
+                # 报告摘要、比较上界与锚点上界，末尾无换行。
+                proof_message = "\n".join(
+                    (
+                        "audit-proof-v1",
+                        str(verification_seq),
+                        response_digest,
+                        report["digest"],
+                        str(report["comparison_seq_bound"]),
+                        str(report["anchor_seq_bound"]),
+                    )
+                ).encode("utf-8")
+                # 证明使用当前审计密钥：认证已确保该版本为最新且未吊销；
+                # 查不到公钥等同验签失败（409/invalid_signature）。
+                key_row = database.execute(
+                    "SELECT public_key FROM machine_keys"
+                    " WHERE machine_id = ? AND version = ?",
+                    (auth.machine_id, auth.key_version),
+                ).fetchone()
+                signature_valid = False
+                if key_row is not None:
+                    signature_valid = ed25519_verify(
+                        bytes.fromhex(key_row["public_key"]),
+                        proof_message,
+                        bytes.fromhex(fields["signature"]),
+                    )
+                if not signature_valid:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "invalid_signature"}
+                # 同一审计机器对同一报告限证明一次；不同审计机器可分别签名。
+                existing = database.execute(
+                    "SELECT 1 FROM audit_proofs"
+                    " WHERE verification_seq = ? AND auditor_machine_id = ?",
+                    (verification_seq, auth.machine_id),
+                ).fetchone()
+                if existing is not None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "proof_exists"}
+                # 全库唯一持久递增证明序号：取写锁后取最大序号 + 1（空表 1）。
+                proof_seq = database.execute(
+                    "SELECT COALESCE(MAX(proof_seq), 0) + 1 AS next_seq"
+                    " FROM audit_proofs"
+                ).fetchone()["next_seq"]
+                created_at_ms = int(datetime.now(UTC).timestamp() * 1000)
+                payload = {
+                    "proofSeq": proof_seq,
+                    "verificationSeq": verification_seq,
+                    "responseDigest": response_digest,
+                    "auditorId": auth.machine_id,
+                    "publicKey": key_row["public_key"],
+                    "keyVersion": auth.key_version,
+                    "signature": fields["signature"],
+                    "createdAt": created_at_ms,
+                }
+                response_json = json.dumps(payload, separators=(",", ":"))
+                database.execute(
+                    "INSERT INTO audit_proofs"
+                    "(proof_seq, verification_seq, response_digest,"
+                    " auditor_machine_id, public_key, key_version, signature,"
+                    " created_at_ms, response_json)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        proof_seq,
+                        verification_seq,
+                        response_digest,
+                        auth.machine_id,
+                        key_row["public_key"],
+                        auth.key_version,
+                        fields["signature"],
+                        created_at_ms,
+                        response_json,
+                    ),
+                )
+                database.execute(
+                    "INSERT INTO audit_proof_idempotency_records"
+                    "(key, request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        request_json,
+                        int(HTTPStatus.CREATED),
+                        response_json,
+                        auth.machine_id,
+                        auth.key_version,
+                        auth.request_time_ms,
+                        auth.nonce,
+                        auth.signature,
+                    ),
+                )
+                # 证明、序号、幂等结果与随机数同一事务原子持久化；
+                # 其他失败、重放或并发败者不消费随机数、不推进证明序号。
+                self._consume_request_nonce(database, auth)
+                database.execute("COMMIT")
+                return HTTPStatus.CREATED, payload
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+
+    def _audit_proof_collection_page(
+        self, database: Any, cut: int, last_seq: int, limit: int
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        rows = database.execute(
+            "SELECT proof_seq, response_json FROM audit_proofs"
+            " WHERE proof_seq <= ? AND proof_seq > ?"
+            " ORDER BY proof_seq ASC LIMIT ?",
+            (cut, last_seq, limit + 1),
+        ).fetchall()
+        has_next = len(rows) > limit
+        page = rows[:limit]
+        proofs = [json.loads(row["response_json"]) for row in page]
+        next_cursor = f"{cut}:{page[-1]['proof_seq']}" if has_next else None
+        return proofs, next_cursor
+
+    def _get_audit_proofs(self, query: str) -> None:
+        # 证明集合分页沿用验证报告列表的 limit、cursor=cut:lastSeq 与认证。
+        parsed = self._parse_evaluation_query(query, AUDIT_PROOFS_QUERY_PARAMS)
+        if parsed is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        limit, cursor = parsed
+        if self.headers.get_all(SLA_DELEGATION_HEADER):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        auth = self._parse_sla_auth()
+        if auth is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        body_digest = hashlib.sha256(b"").hexdigest()
+        standard_path = "/v1/audit-proofs"
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                if auth.machine_id not in self.server.auditors:
+                    database.execute("ROLLBACK")
+                    self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                    return
+                try:
+                    self._verify_request_principal(
+                        database, auth, standard_path, body_digest
+                    )
+                    self._check_request_nonce(database, auth)
+                except AuthRejected as rejected:
+                    database.execute("ROLLBACK")
+                    self._json(rejected.status, {"error": rejected.error})
+                    return
+                # 首页在写事务起点冻结最大证明序号：并发新增不进入旧 cut。
+                current_max = database.execute(
+                    "SELECT COALESCE(MAX(proof_seq), 0) AS current_max"
+                    " FROM audit_proofs"
+                ).fetchone()["current_max"]
+                if cursor is None:
+                    cut, last_seq = current_max, 0
+                else:
+                    cut, last_seq = cursor
+                    # 认证通过后的超前 cut 或缺失锚点同为非法请求。
+                    if cut > current_max:
+                        database.execute("ROLLBACK")
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                        )
+                        return
+                    anchor = database.execute(
+                        "SELECT 1 FROM audit_proofs"
+                        " WHERE proof_seq = ? AND proof_seq <= ?",
+                        (last_seq, cut),
+                    ).fetchone()
+                    if anchor is None:
+                        database.execute("ROLLBACK")
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                        )
+                        return
+                proofs, next_cursor = self._audit_proof_collection_page(
+                    database, cut, last_seq, limit
+                )
+                # 仅成功读取才在同一事务消费随机数；任何失败均不消费、不推进序号。
+                self._consume_request_nonce(database, auth)
+                database.execute("COMMIT")
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+        self._json(
+            HTTPStatus.OK,
+            {"proofs": proofs, "nextCursor": next_cursor},
         )
 
     def log_message(self, format: str, *args: object) -> None:

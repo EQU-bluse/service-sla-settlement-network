@@ -13994,6 +13994,771 @@ class AuditVerificationTests(_EvidenceScenario, unittest.TestCase):
             )
             self.assertEqual(status, 400)
 
+    def test_duplicate_idempotency_key_is_400_without_resource_lookup(self) -> None:
+        import http.client
+
+        body = json.dumps({"comparisonSeq": 999}).encode()
+        target = urlsplit(self.url("/v1/audit-verifications"))
+        connection = http.client.HTTPConnection(
+            target.hostname, target.port, timeout=5
+        )
+        connection.putrequest("POST", target.path)
+        connection.putheader("Idempotency-Key", "vf-dup-idem-a")
+        connection.putheader("Idempotency-Key", "vf-dup-idem-b")
+        connection.putheader("Content-Length", str(len(body)))
+        connection.endheaders()
+        connection.send(body)
+        response = connection.getresponse()
+        self.assertEqual(response.status, 400)
+        self.assertEqual(json.loads(response.read()), {"error": "invalid_request"})
+        connection.close()
+
+
+class AuditProofTests(_EvidenceScenario, unittest.TestCase):
+    # 报告签名证明：audit-proof-v1 绑定报告序号、原始响应摘要、报告摘要与两个
+    # 上界；同机异键重复证明冲突，异机可分别签名；证明序号全库递增、原子提交。
+    AUDITOR_SEED = ARBITRATOR_SEED
+    AUDITOR2_SEED = b"\x08" * 32
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.auditor_id = machine_id(ARBITRATOR_PUBLIC)
+        self.auditor2_public = _ed25519_public_key(self.AUDITOR2_SEED).hex()
+        self.auditor2_id = machine_id(self.auditor2_public)
+        self.server.auditors = frozenset({self.auditor_id, self.auditor2_id})
+        for key, public in (
+            ("register-auditor-pf-1", ARBITRATOR_PUBLIC),
+            ("register-auditor-pf-2", self.auditor2_public),
+        ):
+            status, _ = self.post_json(
+                "/v1/machines", {"publicKey": public}, key
+            )
+            self.assertEqual(status, 201)
+        self.report_bytes: dict[int, bytes] = {}
+
+    def restart(self) -> None:
+        super().restart()
+        self.server.auditors = frozenset({self.auditor_id, self.auditor2_id})
+
+    def create_checkpoints(self, *keys: str) -> None:
+        for key_value in keys:
+            status, body = self.request_raw(
+                "/v1/audit-checkpoints", b"{}", key_value, "POST"
+            )
+            self.assertEqual(status, 201, body)
+
+    def chain_digest(self, comparison_seq: int) -> str:
+        status, body = self.request_raw("/v1/audit-chain", b"", None, "GET")
+        self.assertEqual(status, 200, body)
+        entries = json.loads(body)["entries"]
+        return next(
+            entry["chainDigest"]
+            for entry in entries
+            if entry["comparisonSeq"] == comparison_seq
+        )
+
+    def post_verification(self, seq: int, key: str, **kwargs: object) -> tuple[int, bytes]:
+        return self.request_raw(
+            "/v1/audit-verifications",
+            json.dumps({"comparisonSeq": seq}).encode(),
+            key,
+            "POST",
+            **kwargs,
+        )
+
+    def request_raw(
+        self,
+        path: str,
+        body: bytes,
+        key: str | None,
+        method: str,
+        *,
+        seed: bytes | None = None,
+        actor: str | None = None,
+        nonce: str | None = None,
+        auth_header: str | None = None,
+        delegation: str | None = None,
+        omit_auth: bool = False,
+        key_version: int = 1,
+        request_time_ms: int | None = None,
+        duplicate_idempotency: bool = False,
+    ) -> tuple[int, bytes]:
+        if duplicate_idempotency:
+            import http.client
+
+            target = urlsplit(self.url(path))
+            connection = http.client.HTTPConnection(
+                target.hostname, target.port, timeout=5
+            )
+            connection.putrequest(method, target.path + (f"?{target.query}" if target.query else ""))
+            connection.putheader("Idempotency-Key", f"{key}-a")
+            connection.putheader("Idempotency-Key", f"{key}-b")
+            connection.putheader("Content-Length", str(len(body)))
+            connection.endheaders()
+            connection.send(body)
+            response = connection.getresponse()
+            result = response.status, response.read()
+            connection.close()
+            return result
+        request = Request(self.url(path), data=body, method=method)
+        if key is not None:
+            request.add_header("Idempotency-Key", key)
+        if key is None and nonce is None and auth_header is None:
+            nonce = f"nonce-pf-get-{time.time_ns()}"
+        if delegation is not None:
+            request.add_header("SLA-Delegation", delegation)
+        elif not omit_auth:
+            request.add_header(
+                "SLA-Auth",
+                auth_header
+                if auth_header is not None
+                else make_sla_auth(
+                    self.server,
+                    key,
+                    seed if seed is not None else self.AUDITOR_SEED,
+                    actor if actor is not None else self.auditor_id,
+                    method,
+                    urlsplit(path).path,
+                    body,
+                    key_version,
+                    nonce=nonce,
+                    request_time_ms=request_time_ms,
+                ),
+            )
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def create_report(
+        self,
+        key: str,
+        *,
+        seed: bytes | None = None,
+        key_version: int = 1,
+    ) -> tuple[dict[str, Any], bytes]:
+        signing_seed = seed if seed is not None else self.AUDITOR_SEED
+        signing_actor = (
+            self.auditor_id if seed is None else machine_id(
+                _ed25519_public_key(signing_seed).hex()
+            )
+        )
+        self.create_checkpoints(f"{key}-cp1", f"{key}-cp2")
+        # 检查点与比较序号全库递增：取最新两个检查点构造比较，不假设序号为 1。
+        status, listing = self.request_raw(
+            "/v1/audit-checkpoints", b"", None, "GET"
+        )
+        self.assertEqual(status, 200, listing)
+        checkpoints = json.loads(listing)["checkpoints"]
+        to_seq = checkpoints[-1]["checkpointSeq"]
+        comparison_body = json.dumps(
+            {"fromCheckpointSeq": to_seq - 1, "toCheckpointSeq": to_seq}
+        ).encode()
+        status, comparison = self.request_raw(
+            "/v1/audit-comparisons",
+            comparison_body,
+            f"{key}-cmp",
+            "POST",
+            seed=signing_seed,
+            actor=signing_actor,
+            key_version=key_version,
+        )
+        self.assertEqual(status, 201, comparison)
+        comparison_seq = json.loads(comparison)["comparisonSeq"]
+        anchor_body = json.dumps(
+            {
+                "comparisonSeq": comparison_seq,
+                "chainDigest": self.chain_digest(comparison_seq),
+            }
+        ).encode()
+        status, _ = self.request_raw(
+            "/v1/audit-anchors",
+            anchor_body,
+            f"{key}-anc",
+            "POST",
+            seed=signing_seed,
+            actor=signing_actor,
+            key_version=key_version,
+        )
+        self.assertEqual(status, 201)
+        verification_body = json.dumps(
+            {"comparisonSeq": comparison_seq}
+        ).encode()
+        status, raw = self.request_raw(
+            "/v1/audit-verifications",
+            verification_body,
+            key,
+            "POST",
+            seed=signing_seed,
+            actor=signing_actor,
+            key_version=key_version,
+        )
+        self.assertEqual(status, 201, raw)
+        report = json.loads(raw)
+        self.report_bytes[report["verificationSeq"]] = raw
+        return report, raw
+
+    @staticmethod
+    def proof_message(
+        verification_seq: int, report_bytes: bytes, report: dict[str, Any]
+    ) -> bytes:
+        response_digest = hashlib.sha256(report_bytes).hexdigest()
+        return "\n".join(
+            (
+                "audit-proof-v1",
+                str(verification_seq),
+                response_digest,
+                report["digest"],
+                str(report["comparisonSeqBound"]),
+                str(report["anchorSeqBound"]),
+            )
+        ).encode("utf-8")
+
+    def proof_body(
+        self,
+        report: dict[str, Any],
+        seed: bytes | None = None,
+        *,
+        verification_seq: int | None = None,
+        signature: str | None = None,
+    ) -> bytes:
+        seq = verification_seq if verification_seq is not None else report["verificationSeq"]
+        if signature is None:
+            raw = self.report_bytes[seq]
+            signature = _ed25519_sign(
+                seed if seed is not None else self.AUDITOR_SEED,
+                self.proof_message(seq, raw, report),
+            ).hex()
+        return json.dumps(
+            {"verificationSeq": seq, "signature": signature}
+        ).encode()
+
+    def post_proof(
+        self, body: bytes, key: str, **kwargs: object
+    ) -> tuple[int, bytes]:
+        return self.request_raw("/v1/audit-proofs", body, key, "POST", **kwargs)
+
+    def get_proofs(
+        self,
+        path: str = "/v1/audit-proofs",
+        **kwargs: object,
+    ) -> tuple[int, bytes]:
+        return self.request_raw(path, b"", None, "GET", **kwargs)
+
+    # ---- 创建成功路径 ----
+
+    def test_create_proof_full_payload(self) -> None:
+        report, raw = self.create_report("pf-ok-1")
+        body = self.proof_body(report)
+        status, response = self.post_proof(body, "pf-ok-key")
+        self.assertEqual(status, 201, response)
+        self.assertFalse(response.endswith(b"\n"))
+        payload = json.loads(response)
+        self.assertEqual(
+            list(payload),
+            [
+                "proofSeq",
+                "verificationSeq",
+                "responseDigest",
+                "auditorId",
+                "publicKey",
+                "keyVersion",
+                "signature",
+                "createdAt",
+            ],
+        )
+        self.assertEqual(payload["proofSeq"], 1)
+        self.assertEqual(payload["verificationSeq"], report["verificationSeq"])
+        self.assertEqual(
+            payload["responseDigest"],
+            hashlib.sha256(raw).hexdigest(),
+        )
+        self.assertEqual(payload["auditorId"], self.auditor_id)
+        self.assertEqual(payload["publicKey"], ARBITRATOR_PUBLIC)
+        self.assertEqual(payload["keyVersion"], 1)
+        self.assertEqual(payload["signature"], json.loads(body)["signature"])
+        self.assertIsInstance(payload["createdAt"], int)
+        self.assertGreaterEqual(payload["createdAt"], 0)
+
+    def test_replay_returns_first_bytes_without_advancing_seq(self) -> None:
+        report, raw = self.create_report("pf-rp-1")
+        body = self.proof_body(report)
+        status, first = self.post_proof(body, "pf-rp-key")
+        self.assertEqual(status, 201)
+        status, second = self.post_proof(body, "pf-rp-key")
+        self.assertEqual(status, 201)
+        self.assertEqual(second, first)
+        status, listed = self.get_proofs()
+        self.assertEqual(status, 200)
+        self.assertEqual(len(json.loads(listed)["proofs"]), 1)
+
+    def test_replay_survives_restart(self) -> None:
+        report, raw = self.create_report("pf-rs-1")
+        body = self.proof_body(report)
+        status, first = self.post_proof(body, "pf-rs-key")
+        self.assertEqual(status, 201)
+        self.restart()
+        status, second = self.post_proof(body, "pf-rs-key")
+        self.assertEqual(status, 201)
+        self.assertEqual(second, first)
+
+    def test_same_key_changed_body_conflicts_before_resource(self) -> None:
+        report, raw = self.create_report("pf-sk-1")
+        status, _ = self.post_proof(self.proof_body(report), "pf-sk-key")
+        self.assertEqual(status, 201)
+        # 更换正文即使报告不存在也先判冲突（不查询资源）。
+        changed = json.dumps(
+            {"verificationSeq": 999, "signature": "a" * 128}
+        ).encode()
+        status, body = self.post_proof(changed, "pf-sk-key")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    # ---- 失败判定 ----
+
+    def test_missing_report_is_not_found(self) -> None:
+        for seq in (2, 999, 10**30):
+            body = json.dumps(
+                {"verificationSeq": seq, "signature": "a" * 128}
+            ).encode()
+            status, response = self.post_proof(body, f"pf-nf-{seq}")
+            self.assertEqual(status, 404, seq)
+            self.assertEqual(json.loads(response), {"error": "not_found"})
+        # 超过解释器整数字符串转换位数上限的合法序号仍按不存在处理，不断连。
+        huge = json.dumps(
+            {"verificationSeq": int("9" * 5000), "signature": "a" * 128}
+        ).encode()
+        status, response = self.post_proof(huge, "pf-nf-huge")
+        self.assertEqual(status, 404, response)
+        self.assertEqual(json.loads(response), {"error": "not_found"})
+
+    def test_invalid_bodies_are_400(self) -> None:
+        bodies = [
+            b"{}",
+            b"[]",
+            b'{"verificationSeq":1}',
+            json.dumps({"signature": "a" * 128}).encode(),
+            json.dumps(
+                {"verificationSeq": 0, "signature": "a" * 128}
+            ).encode(),
+            json.dumps(
+                {"verificationSeq": -1, "signature": "a" * 128}
+            ).encode(),
+            json.dumps(
+                {"verificationSeq": True, "signature": "a" * 128}
+            ).encode(),
+            json.dumps(
+                {"verificationSeq": "1", "signature": "a" * 128}
+            ).encode(),
+            json.dumps(
+                {"verificationSeq": 1, "signature": "A" * 128}
+            ).encode(),
+            json.dumps(
+                {"verificationSeq": 1, "signature": "a" * 127}
+            ).encode(),
+            json.dumps(
+                {"verificationSeq": 1, "signature": "a" * 129}
+            ).encode(),
+            json.dumps(
+                {"verificationSeq": 1, "signature": 123}
+            ).encode(),
+            json.dumps(
+                {
+                    "verificationSeq": 1,
+                    "signature": "a" * 128,
+                    "extra": 1,
+                }
+            ).encode(),
+        ]
+        for index, body in enumerate(bodies):
+            status, response = self.post_proof(body, f"pf-bad-{index}")
+            self.assertEqual(status, 400, body)
+            self.assertEqual(json.loads(response), {"error": "invalid_request"})
+
+    def test_query_params_delegation_and_missing_auth_are_400(self) -> None:
+        report, raw = self.create_report("pf-st-1")
+        body = self.proof_body(report)
+        status, _ = self.post_proof(body, "pf-st-ok")
+        self.assertEqual(status, 201)
+        status, response = self.request_raw(
+            "/v1/audit-proofs?x=1", body, "pf-st-query", "POST"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(response), {"error": "invalid_request"})
+        status, _ = self.post_proof(
+            body,
+            "pf-st-delegation",
+            delegation="d;0;1;n-1234567890123456;" + "a" * 128,
+        )
+        self.assertEqual(status, 400)
+        status, _ = self.post_proof(body, "pf-st-noauth", omit_auth=True)
+        self.assertEqual(status, 400)
+        request = Request(
+            self.url("/v1/audit-proofs"), data=body, method="POST"
+        )
+        request.add_header("Idempotency-Key", "pf-st-dupauth")
+        request.add_header("SLA-Auth", "a")
+        request.add_header("SLA-Auth", "b")
+        try:
+            with urlopen(request, timeout=5) as response:
+                status = response.status
+        except HTTPError as error:
+            status = error.code
+        self.assertEqual(status, 400)
+
+    def test_duplicate_idempotency_key_is_400_without_resource_lookup(self) -> None:
+        body = json.dumps(
+            {"verificationSeq": 999, "signature": "a" * 128}
+        ).encode()
+        status, response = self.request_raw(
+            "/v1/audit-proofs",
+            body,
+            "pf-dup-idem",
+            "POST",
+            duplicate_idempotency=True,
+        )
+        self.assertEqual(status, 400, response)
+        self.assertEqual(json.loads(response), {"error": "invalid_request"})
+
+    def test_missing_or_malformed_idempotency_key_is_400(self) -> None:
+        report, raw = self.create_report("pf-ik-1")
+        body = self.proof_body(report)
+        # 无幂等键（直接构造请求）：400，先于认证与资源查询。
+        request = Request(
+            self.url("/v1/audit-proofs"), data=body, method="POST"
+        )
+        request.add_header(
+            "SLA-Auth",
+            make_sla_auth(
+                self.server,
+                None,
+                self.AUDITOR_SEED,
+                self.auditor_id,
+                "POST",
+                "/v1/audit-proofs",
+                body,
+            ),
+        )
+        try:
+            with urlopen(request, timeout=5) as response:
+                status = response.status
+        except HTTPError as error:
+            status = error.code
+        self.assertEqual(status, 400)
+
+    def test_unconfigured_auditor_is_forbidden(self) -> None:
+        report, raw = self.create_report("pf-fb-1")
+        body = self.proof_body(report)
+        self.server.auditors = frozenset()
+        try:
+            status, response = self.post_proof(body, "pf-fb-key")
+        finally:
+            self.server.auditors = frozenset(
+                {self.auditor_id, self.auditor2_id}
+            )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(response), {"error": "forbidden"})
+
+    def test_stale_and_invalid_authentication(self) -> None:
+        report, raw = self.create_report("pf-au-1")
+        body = self.proof_body(report)
+        stale = int(time.time() * 1000) - 400_000
+        status, response = self.post_proof(
+            body, "pf-au-stale", request_time_ms=stale
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(response), {"error": "stale_request"})
+        good = make_sla_auth(
+            self.server,
+            "pf-au-badsig",
+            self.AUDITOR_SEED,
+            self.auditor_id,
+            "POST",
+            "/v1/audit-proofs",
+            body,
+            1,
+        )
+        parts = good.split(";")
+        parts[-1] = "ab" * 64
+        status, response = self.post_proof(
+            body, "pf-au-badsig", auth_header=";".join(parts)
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(
+            json.loads(response), {"error": "invalid_authentication"}
+        )
+
+    def test_replayed_nonce_with_different_key_conflicts(self) -> None:
+        report, raw = self.create_report("pf-nr-1")
+        nonce = f"nonce-pf-nr-{time.time_ns()}"
+        status, _ = self.post_proof(
+            self.proof_body(report), "pf-nr-1", nonce=nonce
+        )
+        self.assertEqual(status, 201)
+        status, response = self.post_proof(
+            self.proof_body(report), "pf-nr-2", nonce=nonce
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(response), {"error": "replay_detected"})
+
+    def test_business_signature_must_cover_digest_and_bounds(self) -> None:
+        report, raw = self.create_report("pf-bs-1")
+        # 篡改待签文本中的任一绑定项：响应摘要换为 64 个 a，验签失败。
+        tampered = "\n".join(
+            (
+                "audit-proof-v1",
+                str(report["verificationSeq"]),
+                "a" * 64,
+                report["digest"],
+                str(report["comparisonSeqBound"]),
+                str(report["anchorSeqBound"]),
+            )
+        ).encode("utf-8")
+        body = json.dumps(
+            {
+                "verificationSeq": report["verificationSeq"],
+                "signature": _ed25519_sign(self.AUDITOR_SEED, tampered).hex(),
+            }
+        ).encode()
+        status, response = self.post_proof(body, "pf-bs-key")
+        self.assertEqual(status, 409)
+        self.assertEqual(
+            json.loads(response), {"error": "invalid_signature"}
+        )
+
+    def test_invalid_signature_does_not_consume_nonce_or_advance_seq(self) -> None:
+        report, raw = self.create_report("pf-fl-1")
+        nonce = f"nonce-pf-fl-{time.time_ns()}"
+        bad = json.dumps(
+            {"verificationSeq": report["verificationSeq"], "signature": "a" * 128}
+        ).encode()
+        status, _ = self.post_proof(bad, "pf-fl-fail", nonce=nonce)
+        self.assertEqual(status, 409)
+        # 随机数未被失败请求消费；成功后证明序号仍为 1。
+        status, response = self.post_proof(
+            self.proof_body(report), "pf-fl-ok", nonce=nonce
+        )
+        self.assertEqual(status, 201, response)
+        self.assertEqual(json.loads(response)["proofSeq"], 1)
+
+    def test_same_machine_different_key_is_proof_exists(self) -> None:
+        report, raw = self.create_report("pf-pe-1")
+        status, _ = self.post_proof(self.proof_body(report), "pf-pe-1")
+        self.assertEqual(status, 201)
+        status, response = self.post_proof(
+            self.proof_body(report), "pf-pe-2"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(response), {"error": "proof_exists"})
+
+    def test_different_auditor_can_sign_same_report(self) -> None:
+        report, raw = self.create_report("pf-da-1")
+        status, first = self.post_proof(self.proof_body(report), "pf-da-1")
+        self.assertEqual(status, 201)
+        body = self.proof_body(report, self.AUDITOR2_SEED)
+        status, second = self.post_proof(
+            body, "pf-da-2", seed=self.AUDITOR2_SEED, actor=self.auditor2_id
+        )
+        self.assertEqual(status, 201, second)
+        first_payload = json.loads(first)
+        second_payload = json.loads(second)
+        self.assertEqual(second_payload["proofSeq"], 2)
+        self.assertEqual(
+            second_payload["verificationSeq"],
+            first_payload["verificationSeq"],
+        )
+        self.assertEqual(second_payload["auditorId"], self.auditor2_id)
+        self.assertEqual(second_payload["publicKey"], self.auditor2_public)
+
+    def test_concurrent_same_machine_different_keys_only_one_created(self) -> None:
+        report, raw = self.create_report("pf-cc-1")
+        results: list[int] = []
+        lock = threading.Lock()
+
+        def submit(key: str) -> None:
+            status, _ = self.post_proof(self.proof_body(report), key)
+            with lock:
+                results.append(status)
+
+        threads = [
+            threading.Thread(target=submit, args=(f"pf-cc-{index}",))
+            for index in range(6)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual(sorted(results).count(201), 1)
+        self.assertEqual(sorted(results).count(409), 5)
+        status, listed = self.get_proofs()
+        self.assertEqual(status, 200)
+        self.assertEqual(len(json.loads(listed)["proofs"]), 1)
+
+    def test_key_rotation_and_revocation_keep_history(self) -> None:
+        report, raw = self.create_report("pf-kr-1")
+        status, first = self.post_proof(self.proof_body(report), "pf-kr-old")
+        self.assertEqual(status, 201)
+        # 第二份报告先于轮换创建；轮换后以新版本密钥证明它。
+        report2, raw2 = self.create_report("pf-kr-2")
+        new_seed = b"\x0b" * 32
+        new_public = _ed25519_public_key(new_seed).hex()
+        current_signature, new_signature = key_rotation_signatures(
+            self.AUDITOR_SEED, new_seed, self.auditor_id, 1, new_public
+        )
+        status, _ = self.post_json(
+            f"/v1/machines/{self.auditor_id}/keys",
+            {
+                "expectedVersion": 1,
+                "publicKey": new_public,
+                "currentSignature": current_signature,
+                "newSignature": new_signature,
+            },
+            "pf-kr-rotate",
+        )
+        self.assertEqual(status, 201)
+        body = self.proof_body(report2, new_seed)
+        status, second = self.post_proof(
+            body, "pf-kr-new", seed=new_seed, key_version=2
+        )
+        self.assertEqual(status, 201, second)
+        self.assertEqual(json.loads(second)["keyVersion"], 2)
+        status, revocation = self.post_json(
+            f"/v1/machines/{self.auditor_id}/keys/1/revocation",
+            {"signature": key_revocation_signature(new_seed, self.auditor_id, 1)},
+            "pf-kr-revoke",
+        )
+        self.assertEqual(status, 200, revocation)
+        # 轮换吊销不改历史：集合中两条证明保持创建时字段。
+        status, listed = self.get_proofs(seed=new_seed, key_version=2)
+        self.assertEqual(status, 200, listed)
+        proofs = json.loads(listed)["proofs"]
+        self.assertEqual([p["proofSeq"] for p in proofs], [1, 2])
+        self.assertEqual(proofs[0]["keyVersion"], 1)
+        self.assertEqual(proofs[0], json.loads(first))
+
+    # ---- 集合读取 ----
+
+    def test_get_empty_collection(self) -> None:
+        status, body = self.get_proofs()
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertEqual(list(payload), ["proofs", "nextCursor"])
+        self.assertEqual(payload["proofs"], [])
+        self.assertIsNone(payload["nextCursor"])
+        self.assertFalse(body.endswith(b"\n"))
+
+    def test_get_collection_returns_full_proofs(self) -> None:
+        report, raw = self.create_report("pf-gc-1")
+        status, first = self.post_proof(self.proof_body(report), "pf-gc-1")
+        self.assertEqual(status, 201)
+        body2 = self.proof_body(report, self.AUDITOR2_SEED)
+        status, second = self.post_proof(
+            body2, "pf-gc-2", seed=self.AUDITOR2_SEED, actor=self.auditor2_id
+        )
+        self.assertEqual(status, 201)
+        status, body = self.get_proofs()
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertEqual([p["proofSeq"] for p in payload["proofs"]], [1, 2])
+        self.assertEqual(payload["proofs"][0], json.loads(first))
+        self.assertEqual(payload["proofs"][1], json.loads(second))
+        self.assertIsNone(payload["nextCursor"])
+
+    def test_collection_paging_and_stable_cut(self) -> None:
+        report, raw = self.create_report("pf-pg-1")
+        body = self.proof_body(report)
+        self.post_proof(body, "pf-pg-1")
+        body2 = self.proof_body(report, self.AUDITOR2_SEED)
+        self.post_proof(
+            body2, "pf-pg-2", seed=self.AUDITOR2_SEED, actor=self.auditor2_id
+        )
+        status, body = self.get_proofs("/v1/audit-proofs?limit=1")
+        self.assertEqual(status, 200, body)
+        first_page = json.loads(body)
+        self.assertEqual([p["proofSeq"] for p in first_page["proofs"]], [1])
+        self.assertEqual(first_page["nextCursor"], "2:1")
+        # 新报告与新证明不进入旧 cut 的续页。
+        report2, raw2 = self.create_report("pf-pg-3")
+        self.report_bytes[report2["verificationSeq"]] = raw2
+        self.post_proof(self.proof_body(report2), "pf-pg-3")
+        status, body = self.get_proofs(
+            f"/v1/audit-proofs?limit=1&cursor={first_page['nextCursor']}"
+        )
+        self.assertEqual(status, 200, body)
+        second_page = json.loads(body)
+        self.assertEqual([p["proofSeq"] for p in second_page["proofs"]], [2])
+        self.assertIsNone(second_page["nextCursor"])
+
+    def test_collection_invalid_params_and_cursors(self) -> None:
+        report, raw = self.create_report("pf-cu-1")
+        self.post_proof(self.proof_body(report), "pf-cu-1")
+        for query in (
+            "limit=0",
+            "limit=101",
+            "limit=x",
+            "foo=1",
+            "cursor=1",
+            "cursor=x:1",
+            "limit=1&limit=2",
+            "cursor=99:1",
+            "cursor=1:5",
+        ):
+            status, _ = self.get_proofs(f"/v1/audit-proofs?{query}")
+            self.assertEqual(status, 400, query)
+
+    def test_collection_requires_auditor_and_auth(self) -> None:
+        status, _ = self.get_proofs(
+            seed=PUBLIC_KEY_SEED_B, actor=self.consumer_id
+        )
+        self.assertEqual(status, 403)
+        status, _ = self.get_proofs(omit_auth=True)
+        self.assertEqual(status, 400)
+        request = Request(self.url("/v1/audit-proofs"), data=b"", method="GET")
+        request.add_header("SLA-Delegation", "d;0;1;n;s")
+        try:
+            with urlopen(request, timeout=5) as response:
+                status = response.status
+        except HTTPError as error:
+            status = error.code
+        self.assertEqual(status, 400)
+
+    def test_collection_nonce_consumed_only_on_success(self) -> None:
+        nonce = f"nonce-pf-gn-{time.time_ns()}"
+        status, _ = self.get_proofs(nonce=nonce)
+        self.assertEqual(status, 200)
+        status, body = self.get_proofs(nonce=nonce)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "replay_detected"})
+        failed_nonce = f"nonce-pf-gnf-{time.time_ns()}"
+        for _ in range(2):
+            status, _ = self.get_proofs(
+                "/v1/audit-proofs?cursor=99:1", nonce=failed_nonce
+            )
+            self.assertEqual(status, 400)
+
+    def test_other_json_integers_keep_conversion_protection(self) -> None:
+        # 非 README 三类审计序号的 JSON 整数字段超过解释器位数上限时判非法请求，
+        # 不断连；此处用入金入口的 amountMicros 验证保护仍然有效。
+        body = json.dumps(
+            {
+                "amountMicros": int("9" * 5000),
+                "reference": "fund-big",
+            }
+        ).encode()
+        request = Request(
+            self.url(f"/v1/funds/{machine_id(PUBLIC_KEY_A)}"),
+            data=body,
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "pf-other-int")
+        try:
+            with urlopen(request, timeout=5) as response:
+                status = response.status
+        except HTTPError as error:
+            status = error.code
+        self.assertEqual(status, 400)
+
 
 class AuditorCliTests(unittest.TestCase):
     # --auditor 启动参数：格式非法退出码 2；合法或省略时服务照常运行。
@@ -14158,6 +14923,61 @@ class AuditStorageMigrationTests(unittest.TestCase):
             )
             row = connection.execute(
                 "SELECT anchor_seq, comparison_seq, key_version FROM audit_anchors"
+            ).fetchone()
+            self.assertEqual(tuple(row), (1, 1, 1))
+            connection.commit()
+        finally:
+            connection.close()
+
+    def test_old_database_gains_proof_storage_without_backfill(self) -> None:
+        from sla_network.database import connect as database_connect
+
+        connection = database_connect(self.database_path)
+        try:
+            # 既有验证报告原样保留；模拟旧库：移除证明表。
+            connection.execute(
+                "INSERT INTO audit_verifications"
+                "(verification_seq, comparison_seq_bound, anchor_seq_bound,"
+                " digest, created_by, created_at_ms, response_json)"
+                " VALUES (1, 1, 0, ?, 'auditor-legacy', 0, '{}')",
+                ("ab" * 32,),
+            )
+            connection.execute("DROP TABLE audit_proofs")
+            connection.execute("DROP TABLE audit_proof_idempotency_records")
+            connection.commit()
+        finally:
+            connection.close()
+
+        connection = database_connect(self.database_path)
+        try:
+            # 验证报告不改动，证明存储存在且为空：不补造任何历史签名。
+            report = connection.execute(
+                "SELECT verification_seq, digest FROM audit_verifications"
+            ).fetchone()
+            self.assertEqual(tuple(report), (1, "ab" * 32))
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) AS c FROM audit_proofs"
+                ).fetchone()["c"],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) AS c FROM audit_proof_idempotency_records"
+                ).fetchone()["c"],
+                0,
+            )
+            # 证明序号自 1 起全库递增，与既有报告序号互不影响。
+            connection.execute(
+                "INSERT INTO audit_proofs"
+                "(proof_seq, verification_seq, response_digest,"
+                " auditor_machine_id, public_key, key_version, signature,"
+                " created_at_ms, response_json)"
+                " VALUES (1, 1, ?, 'auditor-legacy', ?, 1, ?, 0, '{}')",
+                ("cd" * 32, "aa" * 32, "ee" * 64),
+            )
+            row = connection.execute(
+                "SELECT proof_seq, verification_seq, key_version FROM audit_proofs"
             ).fetchone()
             self.assertEqual(tuple(row), (1, 1, 1))
             connection.commit()

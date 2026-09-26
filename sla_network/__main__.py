@@ -28,7 +28,8 @@ def main() -> None:
         metavar="MACHINE_ID",
         help=(
             "machine authorized to create and read audit checkpoints,"
-            " comparisons, chain and anchors (repeatable)"
+            " comparisons, chain, anchors, verifications and proofs"
+            " (repeatable)"
         ),
     )
     args = parser.parse_args()
