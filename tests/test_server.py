@@ -13211,6 +13211,669 @@ class AuditAnchorTests(_EvidenceScenario, unittest.TestCase):
         )
 
 
+class AuditVerificationTests(_EvidenceScenario, unittest.TestCase):
+    # 比较链验证报告：冻结比较与锚点上界，重算响应/链摘要并复核锚点签名；
+    # 异常只记录为无重复升序整数数组，数据不一致仍保存报告并返回 201。
+    AUDITOR_SEED = ARBITRATOR_SEED
+    AUDITOR2_SEED = b"\x08" * 32
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.auditor_id = machine_id(ARBITRATOR_PUBLIC)
+        self.auditor2_public = _ed25519_public_key(self.AUDITOR2_SEED).hex()
+        self.auditor2_id = machine_id(self.auditor2_public)
+        self.server.auditors = frozenset({self.auditor_id, self.auditor2_id})
+        status, _ = self.post_json(
+            "/v1/machines", {"publicKey": ARBITRATOR_PUBLIC}, "register-auditor-vf"
+        )
+        self.assertEqual(status, 201)
+
+    def restart(self) -> None:
+        super().restart()
+        self.server.auditors = frozenset({self.auditor_id, self.auditor2_id})
+
+    def post_verification_raw(
+        self,
+        body: bytes,
+        key: str | None,
+        path: str = "/v1/audit-verifications",
+        *,
+        seed: bytes | None = None,
+        actor: str | None = None,
+        nonce: str | None = None,
+        auth_header: str | None = None,
+        delegation: str | None = None,
+        omit_auth: bool = False,
+        key_version: int = 1,
+        request_time_ms: int | None = None,
+    ) -> tuple[int, bytes]:
+        request = Request(self.url(path), data=body, method="POST")
+        if key is not None:
+            request.add_header("Idempotency-Key", key)
+        if delegation is not None:
+            request.add_header("SLA-Delegation", delegation)
+        elif not omit_auth:
+            request.add_header(
+                "SLA-Auth",
+                auth_header
+                if auth_header is not None
+                else make_sla_auth(
+                    self.server,
+                    key,
+                    seed if seed is not None else self.AUDITOR_SEED,
+                    actor if actor is not None else self.auditor_id,
+                    "POST",
+                    urlsplit(path).path,
+                    body,
+                    key_version,
+                    nonce=nonce,
+                    request_time_ms=request_time_ms,
+                ),
+            )
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def post_verification(
+        self,
+        comparison_seq: int,
+        key: str = "vf-1",
+        **kwargs: object,
+    ) -> tuple[int, bytes]:
+        body = json.dumps({"comparisonSeq": comparison_seq}).encode()
+        return self.post_verification_raw(body, key, **kwargs)  # type: ignore[arg-type]
+
+    def get_verification(
+        self,
+        path: str = "/v1/audit-verifications",
+        *,
+        seed: bytes | None = None,
+        actor: str | None = None,
+        nonce: str | None = None,
+    ) -> tuple[int, bytes]:
+        request = Request(self.url(path), data=b"", method="GET")
+        nonce = nonce or f"nonce-vf-get-{time.time_ns()}"
+        request.add_header(
+            "SLA-Auth",
+            make_sla_auth(
+                self.server,
+                None,
+                seed if seed is not None else self.AUDITOR_SEED,
+                actor if actor is not None else self.auditor_id,
+                "GET",
+                urlsplit(path).path,
+                b"",
+                1,
+                nonce=nonce,
+            ),
+        )
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def create_comparison(self, seq: int, key: str) -> None:
+        # 每两个检查点产生一条比较；场景内序号严格递增。
+        checkpoint_body = b"{}"
+        for suffix in ("cp1", "cp2"):
+            request = Request(
+                self.url("/v1/audit-checkpoints"), data=checkpoint_body, method="POST"
+            )
+            request.add_header("Idempotency-Key", f"{key}-{suffix}")
+            request.add_header(
+                "SLA-Auth",
+                make_sla_auth(
+                    self.server,
+                    f"{key}-{suffix}",
+                    self.AUDITOR_SEED,
+                    self.auditor_id,
+                    "POST",
+                    "/v1/audit-checkpoints",
+                    checkpoint_body,
+                    1,
+                    nonce=f"nonce-vf-{suffix}-{time.time_ns()}",
+                ),
+            )
+            with urlopen(request, timeout=5) as response:
+                self.assertEqual(response.status, 201)
+        # 第 seq 条比较：from/to 检查点序号为 2*seq-1 与 2*seq。
+        body = json.dumps(
+            {"fromCheckpointSeq": 2 * seq - 1, "toCheckpointSeq": 2 * seq}
+        ).encode()
+        status, response = self.post_verification_raw(
+            body,
+            key,
+            path="/v1/audit-comparisons",
+            nonce=f"nonce-vf-cmp-{time.time_ns()}",
+        )
+        self.assertEqual(status, 201, response)
+        self.assertEqual(json.loads(response)["comparisonSeq"], seq)
+
+    def chain_digest(self, comparison_seq: int) -> str:
+        status, body = self.get_verification("/v1/audit-chain")
+        self.assertEqual(status, 200, body)
+        entries = json.loads(body)["entries"]
+        return next(
+            entry["chainDigest"]
+            for entry in entries
+            if entry["comparisonSeq"] == comparison_seq
+        )
+
+    def anchor(self, comparison_seq: int, key: str, **kwargs: object) -> None:
+        body = json.dumps(
+            {"comparisonSeq": comparison_seq, "chainDigest": self.chain_digest(comparison_seq)}
+        ).encode()
+        status, response = self.post_verification_raw(
+            body, key, path="/v1/audit-anchors", **kwargs  # type: ignore[arg-type]
+        )
+        self.assertEqual(status, 201, response)
+
+    def execute_sql(self, statement: str, arguments: tuple = ()) -> None:
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            connection.execute(statement, arguments)
+            connection.commit()
+        finally:
+            connection.close()
+
+    # ---- 成功路径与摘要 ----
+
+    def test_verification_consistent_and_fully_covered(self) -> None:
+        self.create_comparison(1, "vf-sc-1")
+        self.anchor(1, "vf-sc-a1")
+        status, response = self.post_verification(1, "vf-sc")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(
+            list(payload),
+            [
+                "verificationSeq",
+                "comparisonSeqBound",
+                "anchorSeqBound",
+                "digest",
+                "createdBy",
+                "createdAt",
+                "chainConsistent",
+                "fullyCovered",
+                "invalidChainNodes",
+                "invalidAnchors",
+                "uncoveredNodes",
+            ],
+        )
+        self.assertEqual(payload["verificationSeq"], 1)
+        self.assertEqual(payload["comparisonSeqBound"], 1)
+        self.assertEqual(payload["anchorSeqBound"], 1)
+        self.assertEqual(payload["createdBy"], self.auditor_id)
+        self.assertIsInstance(payload["createdAt"], int)
+        self.assertGreaterEqual(payload["createdAt"], 0)
+        self.assertIs(payload["chainConsistent"], True)
+        self.assertIs(payload["fullyCovered"], True)
+        self.assertEqual(payload["invalidChainNodes"], [])
+        self.assertEqual(payload["invalidAnchors"], [])
+        self.assertEqual(payload["uncoveredNodes"], [])
+        summary = {
+            "comparisonSeqBound": 1,
+            "anchorSeqBound": 1,
+            "chainConsistent": True,
+            "fullyCovered": True,
+            "invalidChainNodes": [],
+            "invalidAnchors": [],
+            "uncoveredNodes": [],
+        }
+        expected_digest = hashlib.sha256(
+            json.dumps(summary, separators=(",", ":")).encode()
+        ).hexdigest()
+        self.assertEqual(payload["digest"], expected_digest)
+        self.assertFalse(response.endswith(b"\n"))
+
+    def test_unanchored_node_is_uncovered_but_chain_consistent(self) -> None:
+        self.create_comparison(1, "vf-ua-1")
+        status, response = self.post_verification(1, "vf-ua")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertIs(payload["chainConsistent"], True)
+        self.assertIs(payload["fullyCovered"], False)
+        self.assertEqual(payload["uncoveredNodes"], [1])
+        self.assertEqual(payload["invalidChainNodes"], [])
+        self.assertEqual(payload["invalidAnchors"], [])
+        self.assertEqual(payload["anchorSeqBound"], 0)
+
+    def test_partial_prefix_coverage_and_out_of_bound_anchor(self) -> None:
+        self.create_comparison(1, "vf-pp-1")
+        self.create_comparison(2, "vf-pp-2")
+        # 仅锚定节点 1；上界为 2 时节点 2 未覆盖。
+        self.anchor(1, "vf-pp-a1")
+        status, response = self.post_verification(2, "vf-pp-2")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertIs(payload["chainConsistent"], True)
+        self.assertIs(payload["fullyCovered"], False)
+        self.assertEqual(payload["uncoveredNodes"], [2])
+        # 上界为 1 时锚点上界冻结为 1，节点 1 完整覆盖。
+        status, response = self.post_verification(1, "vf-pp-1")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertIs(payload["fullyCovered"], True)
+        self.assertEqual(payload["uncoveredNodes"], [])
+
+    def test_anchor_beyond_comparison_bound_excluded(self) -> None:
+        self.create_comparison(1, "vf-ob-1")
+        self.create_comparison(2, "vf-ob-2")
+        self.anchor(2, "vf-ob-a2")
+        # 仅验证链段 [1,1]：指向节点 2 的锚点不在复核范围，节点 1 未覆盖。
+        status, response = self.post_verification(1, "vf-ob")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(payload["anchorSeqBound"], 1)
+        self.assertEqual(payload["invalidAnchors"], [])
+        self.assertEqual(payload["uncoveredNodes"], [1])
+
+    def test_two_auditors_covering_same_node_both_valid(self) -> None:
+        status, _ = self.post_json(
+            "/v1/machines",
+            {"publicKey": self.auditor2_public},
+            "register-auditor2-vf",
+        )
+        self.assertEqual(status, 201)
+        self.create_comparison(1, "vf-2a-1")
+        self.anchor(1, "vf-2a-a1")
+        self.anchor(
+            1,
+            "vf-2a-a2",
+            seed=self.AUDITOR2_SEED,
+            actor=self.auditor2_id,
+            key_version=1,
+            nonce=f"nonce-vf-2a-{time.time_ns()}",
+        )
+        status, response = self.post_verification(1, "vf-2a")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertIs(payload["fullyCovered"], True)
+        self.assertEqual(payload["invalidAnchors"], [])
+
+    # ---- 数据异常：仍 201 保存 ----
+
+    def test_missing_chain_row_recorded_and_report_saved(self) -> None:
+        self.create_comparison(1, "vf-mc-1")
+        self.anchor(1, "vf-mc-a1")
+        self.execute_sql("DELETE FROM audit_comparison_chain WHERE comparison_seq = 1")
+        status, response = self.post_verification(1, "vf-mc")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertIs(payload["chainConsistent"], False)
+        self.assertEqual(payload["invalidChainNodes"], [1])
+        # 链行缺失：锚点找不到对应链摘要，记为无效，节点也未覆盖。
+        self.assertEqual(payload["invalidAnchors"], [1])
+        self.assertEqual(payload["uncoveredNodes"], [1])
+        # 报告已保存，可经集合读取。
+        status, body = self.get_verification()
+        self.assertEqual(status, 200, body)
+        self.assertEqual(
+            json.loads(body)["verifications"][0]["invalidChainNodes"], [1]
+        )
+
+    def test_replaced_chain_digest_marks_node_and_anchor(self) -> None:
+        self.create_comparison(1, "vf-rd-1")
+        self.anchor(1, "vf-rd-a1")
+        self.execute_sql(
+            "UPDATE audit_comparison_chain SET chain_digest = ?"
+            " WHERE comparison_seq = 1",
+            ("ab" * 32,),
+        )
+        status, response = self.post_verification(1, "vf-rd")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(payload["invalidChainNodes"], [1])
+        self.assertEqual(payload["invalidAnchors"], [1])
+        self.assertEqual(payload["uncoveredNodes"], [1])
+
+    def test_tampered_response_digest_marks_node_only(self) -> None:
+        self.create_comparison(1, "vf-tr-1")
+        self.anchor(1, "vf-tr-a1")
+        # 仅替换链记录保存的响应摘要：链节点无效，但锚点的链摘要仍与
+        # 保存的链摘要逐字一致、签名有效，覆盖结论不受影响。
+        self.execute_sql(
+            "UPDATE audit_comparison_chain SET response_digest = ?"
+            " WHERE comparison_seq = 1",
+            ("cd" * 32,),
+        )
+        status, response = self.post_verification(1, "vf-tr")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(payload["invalidChainNodes"], [1])
+        self.assertEqual(payload["invalidAnchors"], [])
+        self.assertEqual(payload["uncoveredNodes"], [])
+        self.assertIs(payload["fullyCovered"], True)
+        self.assertIs(payload["chainConsistent"], False)
+
+    def test_reordered_chain_rows_mark_both_nodes(self) -> None:
+        self.create_comparison(1, "vf-ro-1")
+        self.create_comparison(2, "vf-ro-2")
+        self.anchor(1, "vf-ro-a1")
+        self.anchor(2, "vf-ro-a2")
+        # 交换两条链记录的全部字段：两位置规范链均对不上，锚点摘要也失配。
+        self.execute_sql(
+            "UPDATE audit_comparison_chain SET comparison_seq = 3"
+            " WHERE comparison_seq = 1"
+        )
+        self.execute_sql(
+            "UPDATE audit_comparison_chain SET comparison_seq = 1"
+            " WHERE comparison_seq = 2"
+        )
+        self.execute_sql(
+            "UPDATE audit_comparison_chain SET comparison_seq = 2"
+            " WHERE comparison_seq = 3"
+        )
+        status, response = self.post_verification(2, "vf-ro")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(payload["invalidChainNodes"], [1, 2])
+        self.assertEqual(payload["invalidAnchors"], [1, 2])
+        self.assertEqual(payload["uncoveredNodes"], [1, 2])
+
+    def test_tampered_anchor_signature_is_invalid(self) -> None:
+        self.create_comparison(1, "vf-ts-1")
+        self.anchor(1, "vf-ts-a1")
+        self.execute_sql(
+            "UPDATE audit_anchors SET auth_signature = ? WHERE anchor_seq = 1",
+            ("00" * 64,),
+        )
+        status, response = self.post_verification(1, "vf-ts")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(payload["invalidChainNodes"], [])
+        self.assertEqual(payload["invalidAnchors"], [1])
+        self.assertEqual(payload["uncoveredNodes"], [1])
+        self.assertIs(payload["chainConsistent"], True)
+        self.assertIs(payload["fullyCovered"], False)
+
+    def test_tampered_anchor_public_key_identity_is_invalid(self) -> None:
+        self.create_comparison(1, "vf-tk-1")
+        self.anchor(1, "vf-tk-a1")
+        self.execute_sql(
+            "UPDATE audit_anchors SET public_key = ? WHERE anchor_seq = 1",
+            (PUBLIC_KEY_B,),
+        )
+        status, response = self.post_verification(1, "vf-tk")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(payload["invalidAnchors"], [1])
+        self.assertEqual(payload["uncoveredNodes"], [1])
+
+    def test_tampered_comparison_response_marks_node(self) -> None:
+        self.create_comparison(1, "vf-tc-1")
+        self.anchor(1, "vf-tc-a1")
+        self.execute_sql(
+            "UPDATE audit_comparisons SET response_json = ? WHERE comparison_seq = 1",
+            ('{"tampered":true}',),
+        )
+        status, response = self.post_verification(1, "vf-tc")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(payload["invalidChainNodes"], [1])
+        # 锚点冻结的是链摘要；链记录本身未改，锚点仍有效并覆盖该节点。
+        self.assertEqual(payload["invalidAnchors"], [])
+        self.assertEqual(payload["uncoveredNodes"], [])
+
+    # ---- 幂等、序号与重启 ----
+
+    def test_replay_returns_first_bytes_and_does_not_advance_seq(self) -> None:
+        self.create_comparison(1, "vf-rp-1")
+        status, first = self.post_verification(1, "vf-rp")
+        self.assertEqual(status, 201)
+        status, second = self.post_verification(1, "vf-rp")
+        self.assertEqual(status, 201)
+        self.assertEqual(second, first)
+        # 重放不推进报告序号。
+        status, other = self.post_verification(
+            1, "vf-rp-other", nonce=f"nonce-vf-rp-{time.time_ns()}"
+        )
+        self.assertEqual(status, 201, other)
+        self.assertEqual(json.loads(other)["verificationSeq"], 2)
+
+    def test_replay_survives_restart(self) -> None:
+        self.create_comparison(1, "vf-rs-1")
+        status, first = self.post_verification(1, "vf-rs")
+        self.assertEqual(status, 201)
+        self.restart()
+        status, second = self.post_verification(1, "vf-rs")
+        self.assertEqual(status, 201)
+        self.assertEqual(second, first)
+
+    def test_concurrent_requests_get_dense_unique_seqs(self) -> None:
+        self.create_comparison(1, "vf-cc-1")
+
+        def create(index: int) -> tuple[int, bytes]:
+            return self.post_verification(
+                1, f"vf-cc-{index}", nonce=f"nonce-vf-conc-{index:020d}"
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(6) as executor:
+            results = list(executor.map(create, range(6)))
+        self.assertTrue(all(status == 201 for status, _ in results), results)
+        seqs = sorted(json.loads(body)["verificationSeq"] for _, body in results)
+        self.assertEqual(seqs, list(range(1, 7)))
+
+    # ---- 错误判定 ----
+
+    def test_invalid_bodies_return_400(self) -> None:
+        bodies = (
+            b"{}",
+            b"[]",
+            b"not json",
+            json.dumps({"comparisonSeq": 1, "extra": 1}).encode(),
+            json.dumps({"bound": 1}).encode(),
+            json.dumps({"comparisonSeq": 0}).encode(),
+            json.dumps({"comparisonSeq": -1}).encode(),
+            json.dumps({"comparisonSeq": True}).encode(),
+            json.dumps({"comparisonSeq": "1"}).encode(),
+            json.dumps({"comparisonSeq": 1.5}).encode(),
+            b'{"comparisonSeq":1,"comparisonSeq":2}',
+        )
+        for index, body in enumerate(bodies):
+            status, response = self.post_verification_raw(body, f"vf-ib-{index}")
+            self.assertEqual(status, 400, body)
+            self.assertEqual(json.loads(response), {"error": "invalid_request"})
+
+    def test_query_delegation_missing_headers_return_400(self) -> None:
+        body = json.dumps({"comparisonSeq": 1}).encode()
+        status, response = self.post_verification_raw(
+            body, "vf-qp", path="/v1/audit-verifications?x=1"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(response), {"error": "invalid_request"})
+        status, _ = self.post_verification_raw(
+            body, "vf-dl", delegation="d;0;1;nonnonnonnonnonnonn;s"
+        )
+        self.assertEqual(status, 400)
+        status, _ = self.post_verification_raw(body, "vf-na", omit_auth=True)
+        self.assertEqual(status, 400)
+        request = Request(
+            self.url("/v1/audit-verifications"), data=body, method="POST"
+        )
+        try:
+            with urlopen(request, timeout=5) as response:
+                status = response.status
+        except HTTPError as error:
+            status = error.code
+        self.assertEqual(status, 400)
+
+    def test_same_key_different_body_or_auth_conflicts(self) -> None:
+        self.create_comparison(1, "vf-sb-1")
+        status, _ = self.post_verification(1, "vf-same")
+        self.assertEqual(status, 201)
+        status, response = self.post_verification(
+            1,
+            "vf-same",
+            nonce=f"nonce-vf-sa-{time.time_ns()}",
+        )
+        # 同键同体但更换认证五段（随机数）：冲突。
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(response), {"error": "conflict"})
+        body = json.dumps({"comparisonSeq": 999}).encode()
+        status, response = self.post_verification_raw(
+            body, "vf-same", nonce=f"nonce-vf-sb-{time.time_ns()}"
+        )
+        # 同键更换正文：冲突，且先于资源查询（999 不存在不产生 404）。
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(response), {"error": "conflict"})
+
+    def test_non_auditor_forbidden(self) -> None:
+        self.create_comparison(1, "vf-fb-1")
+        status, response = self.post_verification(
+            1,
+            "vf-forbidden",
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+            nonce=f"nonce-vf-fb-{time.time_ns()}",
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(response), {"error": "forbidden"})
+        status, _ = self.get_verification(
+            seed=PUBLIC_KEY_SEED_B, actor=self.consumer_id
+        )
+        self.assertEqual(status, 403)
+
+    def test_stale_invalid_auth_and_nonce_reuse(self) -> None:
+        self.create_comparison(1, "vf-au-1")
+        # 过时请求。
+        status, response = self.post_verification(
+            1,
+            "vf-stale",
+            request_time_ms=int(time.time() * 1000) - 400_000,
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(response), {"error": "stale_request"})
+        # 无效签名（他机种子签本机身份）。
+        status, response = self.post_verification(
+            1,
+            "vf-badsig",
+            seed=PUBLIC_KEY_SEED_B,
+            nonce=f"nonce-vf-bs-{time.time_ns()}",
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(response), {"error": "invalid_authentication"})
+        # 有效随机数异键复用。
+        nonce = f"nonce-vf-nr-{time.time_ns()}"
+        status, _ = self.post_verification(1, "vf-nr-1", nonce=nonce)
+        self.assertEqual(status, 201)
+        status, response = self.post_verification(
+            1, "vf-nr-2", nonce=nonce
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(response), {"error": "replay_detected"})
+
+    def test_missing_comparison_is_not_found(self) -> None:
+        for comparison_seq in (1, 999):
+            status, response = self.post_verification(
+                comparison_seq, f"vf-nf-{comparison_seq}"
+            )
+            self.assertEqual(status, 404, comparison_seq)
+            self.assertEqual(json.loads(response), {"error": "not_found"})
+        status, response = self.post_verification(
+            10**30, "vf-nf-huge"
+        )
+        self.assertEqual(status, 404, response)
+        status, response = self.post_verification_raw(
+            json.dumps({"comparisonSeq": int("9" * 5000)}).encode(),
+            "vf-nf-long",
+        )
+        self.assertEqual(status, 404, response)
+
+    def test_failure_does_not_consume_nonce_or_advance_seq(self) -> None:
+        nonce = f"nonce-vf-fl-{time.time_ns()}"
+        # 比较不存在：失败不消费随机数、不推进序号。
+        status, _ = self.post_verification(999, "vf-fl-fail", nonce=nonce)
+        self.assertEqual(status, 404)
+        self.create_comparison(1, "vf-fl-1")
+        status, body = self.post_verification(1, "vf-fl-ok", nonce=nonce)
+        self.assertEqual(status, 201, body)
+        self.assertEqual(json.loads(body)["verificationSeq"], 1)
+
+    # ---- 集合读取 ----
+
+    def test_get_empty_collection(self) -> None:
+        status, body = self.get_verification()
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertEqual(list(payload), ["verifications", "nextCursor"])
+        self.assertEqual(payload["verifications"], [])
+        self.assertIsNone(payload["nextCursor"])
+
+    def test_get_collection_returns_full_reports_and_pages(self) -> None:
+        self.create_comparison(1, "vf-gc-1")
+        self.anchor(1, "vf-gc-a1")
+        status, first = self.post_verification(1, "vf-gc-1")
+        self.assertEqual(status, 201)
+        status, _ = self.post_verification(
+            1, "vf-gc-2", nonce=f"nonce-vf-gc-{time.time_ns()}"
+        )
+        self.assertEqual(status, 201)
+        status, body = self.get_verification()
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertEqual(
+            [item["verificationSeq"] for item in payload["verifications"]], [1, 2]
+        )
+        self.assertEqual(payload["verifications"][0], json.loads(first))
+        self.assertIsNone(payload["nextCursor"])
+        # 分页：limit=1，游标携带冻结 cut。
+        status, body = self.get_verification("/v1/audit-verifications?limit=1")
+        self.assertEqual(status, 200, body)
+        first_page = json.loads(body)
+        self.assertEqual(
+            [item["verificationSeq"] for item in first_page["verifications"]], [1]
+        )
+        self.assertEqual(first_page["nextCursor"], "2:1")
+        # 旧 cut 之后新增报告不进入续页。
+        status, _ = self.post_verification(
+            1, "vf-gc-3", nonce=f"nonce-vf-gc3-{time.time_ns()}"
+        )
+        self.assertEqual(status, 201)
+        status, body = self.get_verification(
+            f"/v1/audit-verifications?limit=1&cursor={first_page['nextCursor']}"
+        )
+        self.assertEqual(status, 200, body)
+        second_page = json.loads(body)
+        self.assertEqual(
+            [item["verificationSeq"] for item in second_page["verifications"]], [2]
+        )
+        self.assertIsNone(second_page["nextCursor"])
+
+    def test_collection_invalid_params_and_cursors(self) -> None:
+        self.create_comparison(1, "vf-cu-1")
+        status, _ = self.post_verification(1, "vf-cu-1")
+        self.assertEqual(status, 201)
+        for query in (
+            "limit=0",
+            "limit=101",
+            "limit=a",
+            "unknown=1",
+            "limit=1&limit=2",
+            "cursor=abc",
+            "cursor=9:1",
+            "cursor=1:9",
+            "cursor=0:0",
+        ):
+            status, _ = self.get_verification(
+                f"/v1/audit-verifications?{query}"
+            )
+            self.assertEqual(status, 400, query)
+        # 缺少认证结构同样为 400。
+        request = Request(
+            self.url("/v1/audit-verifications?limit=1"), data=b"", method="GET"
+        )
+        try:
+            with urlopen(request, timeout=5) as response:
+                status = response.status
+        except HTTPError as error:
+            status = error.code
+        self.assertEqual(status, 400)
+
+
 class AuditorCliTests(unittest.TestCase):
     # --auditor 启动参数：格式非法退出码 2；合法或省略时服务照常运行。
 
@@ -13377,6 +14040,69 @@ class AuditStorageMigrationTests(unittest.TestCase):
             ).fetchone()
             self.assertEqual(tuple(row), (1, 1, 1))
             connection.commit()
+        finally:
+            connection.close()
+
+    def test_old_database_gains_verification_storage_without_backfill(self) -> None:
+        from sla_network.database import connect as database_connect
+
+        connection = database_connect(self.database_path)
+        try:
+            # 既有锚点原样保留；模拟旧库：移除验证报告表。
+            connection.execute(
+                "INSERT INTO audit_comparisons"
+                "(comparison_seq, from_checkpoint_seq, to_checkpoint_seq,"
+                " digest, created_by, created_at_ms, result_json, response_json)"
+                " VALUES (1, 1, 2, ?, 'auditor-legacy', 0, '{}', '{}')",
+                ("ab" * 32,),
+            )
+            connection.execute(
+                "INSERT INTO audit_comparison_chain"
+                "(comparison_seq, response_digest, previous_chain_digest,"
+                " chain_digest) VALUES (1, ?, ?, ?)",
+                ("cd" * 32, "0" * 64, "ef" * 32),
+            )
+            connection.execute(
+                "INSERT INTO audit_anchors"
+                "(anchor_seq, comparison_seq, chain_digest, auditor_machine_id,"
+                " public_key, key_version, request_time_ms, nonce, body_digest,"
+                " auth_signature, created_at_ms, response_json)"
+                " VALUES (1, 1, ?, 'auditor-legacy', ?, 1, 0, 'nonce-legacy',"
+                " ?, ?, 0, '{}')",
+                ("ef" * 32, "aa" * 32, "bb" * 32, "cc" * 64),
+            )
+            connection.execute("DROP TABLE audit_verifications")
+            connection.execute(
+                "DROP TABLE audit_verification_idempotency_records"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        connection = database_connect(self.database_path)
+        try:
+            # 既有比较链与锚点不改动，验证报告存储存在且为空：报告序号自 1 起。
+            chain = connection.execute(
+                "SELECT comparison_seq, chain_digest FROM audit_comparison_chain"
+            ).fetchone()
+            self.assertEqual(tuple(chain), (1, "ef" * 32))
+            anchor = connection.execute(
+                "SELECT anchor_seq FROM audit_anchors"
+            ).fetchone()
+            self.assertEqual(tuple(anchor), (1,))
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) AS c FROM audit_verifications"
+                ).fetchone()["c"],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) AS c"
+                    " FROM audit_verification_idempotency_records"
+                ).fetchone()["c"],
+                0,
+            )
         finally:
             connection.close()
 
