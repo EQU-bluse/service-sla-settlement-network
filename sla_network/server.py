@@ -6388,7 +6388,9 @@ class Handler(BaseHTTPRequestHandler):
                 "reference_broken": reference_broken,
             }
 
-        # 实际分录按 (kind, referenceSeq) 归集，与预期侧双向匹配。
+        # 实际分录按 (kind, referenceSeq) 归集为可重复集合：预期腿同样按出现
+        # 次数逐条匹配，账户标识不得覆盖同组记录。公开模型允许 SLA 生产方与
+        # 消费者为同一机器，此时同一账户须保留金额相反的两条独立分录。
         entries_by_pair: dict[tuple[str, int], list[dict[str, Any]]] = {}
         for entry in entries:
             entries_by_pair.setdefault(
@@ -6429,7 +6431,10 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             sides: list[tuple[str, int]] = expected["sides"]
             if expected["reference_broken"]:
-                # 业务记录状态与分录引用不一致：沿用逐笔 entry_reference。
+                # 业务记录链断裂（结算缺失或争议状态与仲裁决定不一致）：
+                # 逐笔 entry_reference 保留实际锚点；预期腿仍按账户可重复
+                # 集合计数，缺少实际分录锚点的腿逐条记 entry_missing，
+                # 不能因没有实际分录而漏过业务记录。
                 for entry in pair:
                     differences.append(
                         self._audit_difference(
@@ -6437,12 +6442,24 @@ class Handler(BaseHTTPRequestHandler):
                             entry["entry_seq"], reference_seq,
                         )
                     )
+                actual_accounts = [entry["account_id"] for entry in pair]
+                for account, delta in sides:
+                    if account in actual_accounts:
+                        actual_accounts.remove(account)
+                    else:
+                        differences.append(
+                            self._audit_difference(
+                                account, "entry_missing", None, None,
+                                delta, None,
+                            )
+                        )
                 continue
             side_accounts = {account for account, _ in sides}
             consumed = [False] * len(pair)
-            matched: dict[str, dict[str, Any]] = {}
-            # 先按账户与金额精确匹配，再按账户匹配（错金额记 entry_direction）。
-            for account, delta in sides:
+            # 每条预期腿单独锚定实际分录：先按账户与有符号金额精确消费，
+            # 再按账户消费（金额/方向不符记 entry_direction）。
+            matched_by_leg: list[dict[str, Any] | None] = [None] * len(sides)
+            for leg_index, (account, delta) in enumerate(sides):
                 for index, entry in enumerate(pair):
                     if (
                         not consumed[index]
@@ -6450,15 +6467,15 @@ class Handler(BaseHTTPRequestHandler):
                         and entry["delta_micros"] == delta
                     ):
                         consumed[index] = True
-                        matched[account] = entry
+                        matched_by_leg[leg_index] = entry
                         break
-            for account, delta in sides:
-                if account in matched:
+            for leg_index, (account, delta) in enumerate(sides):
+                if matched_by_leg[leg_index] is not None:
                     continue
                 for index, entry in enumerate(pair):
                     if not consumed[index] and entry["account_id"] == account:
                         consumed[index] = True
-                        matched[account] = entry
+                        matched_by_leg[leg_index] = entry
                         differences.append(
                             self._audit_difference(
                                 account, "entry_direction",
@@ -6467,15 +6484,18 @@ class Handler(BaseHTTPRequestHandler):
                             )
                         )
                         break
-            # 缺失侧：整对缺失产生两项，单侧缺失产生一项。
-            for account, delta in sides:
-                if account not in matched:
+            # 缺失腿逐条记录（同账户缺两腿即两项）：无实际分录锚点时两个
+            # 序号字段均为 null，expected 保留有符号金额，actual 固定 null。
+            # 少一腿时仅产生一项 entry_missing。
+            for leg_index, (account, delta) in enumerate(sides):
+                if matched_by_leg[leg_index] is None:
                     differences.append(
                         self._audit_difference(
                             account, "entry_missing", None, None, delta, None
                         )
                     )
-            # 多余分录：重复侧记 entry_unpaired，错账户记 entry_reference。
+            # 多余分录：同账户副本记 entry_unpaired，错账户记 entry_reference；
+            # 差异保留实际 entrySeq，第三条同账户副本不得被任意配对后忽略。
             for index, entry in enumerate(pair):
                 if consumed[index]:
                     continue
@@ -6493,11 +6513,12 @@ class Handler(BaseHTTPRequestHandler):
                             entry["entry_seq"], reference_seq,
                         )
                     )
-            # SLA 与评估归属：逐预期侧核对，无对应分录时序号为 null。
+            # SLA 与评估归属：逐条预期腿核对，锚点取该腿匹配到的实际分录，
+            # 无对应分录时序号为 null。
             attribution = expected["attribution"]
             if attribution is not None:
-                for account, _delta in sides:
-                    entry = matched.get(account)
+                for leg_index, (account, _delta) in enumerate(sides):
+                    entry = matched_by_leg[leg_index]
                     differences.append(
                         self._audit_difference(
                             account, "entry_attribution",
@@ -6506,7 +6527,7 @@ class Handler(BaseHTTPRequestHandler):
                             attribution[0], attribution[1],
                         )
                     )
-            # 金额不守恒：两侧分录齐全时金额和须为零。
+            # 金额不守恒：两条实际分录均被预期腿消费时金额和须为零。
             if len(pair) == 2 and all(consumed):
                 total = self._audit_pair_delta(pair)
                 if total != 0:

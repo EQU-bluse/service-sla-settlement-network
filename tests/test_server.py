@@ -10834,6 +10834,353 @@ class AuditCheckpointTests(_EvidenceScenario, unittest.TestCase):
         self.assertEqual(status, 201)
         self.assertIs(json.loads(body)["consistent"], False)
 
+    # ---- 同账户双腿：集合匹配，账户不得覆盖同组分录 ----
+
+    def _insert_self_settlement_records(
+        self, connection: sqlite3.Connection, *, sla_id: str = "sla-self"
+    ) -> None:
+        # 公开模型允许 SLA 生产方与消费者为同一机器：补一条自结算业务链。
+        connection.execute(
+            "INSERT INTO slas(id, template_id, machine_id, consumer_id,"
+            " capability_version, price_micros, max_latency_ms,"
+            " start_unix, end_unix, state)"
+            " VALUES (?,?,?,?,1,1000,50,0,99999999,'active')",
+            (sla_id, "tpl-1", self.consumer_id, self.consumer_id),
+        )
+        connection.execute(
+            "INSERT INTO sla_evaluation_idempotency_records"
+            "(key, sla_id, request_json, status, response_json,"
+            " evaluation_seq, created_at_ms)"
+            " VALUES ('eval-self',?,'{}',201,'{}',2,0)",
+            (sla_id,),
+        )
+        connection.execute(
+            "INSERT INTO settlements(settlement_seq, sla_id, evaluation_seq,"
+            " result, amount_micros, payer_id, payee_id, created_at_ms)"
+            " VALUES (2,?,2,'charged',1000,?,?,0)",
+            (sla_id, self.consumer_id, self.consumer_id),
+        )
+
+    def _insert_ledger_entry(
+        self,
+        connection: sqlite3.Connection,
+        entry_seq: int,
+        account: str,
+        delta: int,
+        after: int,
+        *,
+        kind: str = "settlement",
+        reference_seq: int = 2,
+    ) -> None:
+        connection.execute(
+            "INSERT INTO ledger_entries(entry_seq, kind, reference_seq,"
+            " account_id, delta_micros, balance_after_micros, created_at_ms)"
+            " VALUES (?,?,?,?,?,?,0)",
+            (entry_seq, kind, reference_seq, account, delta, after),
+        )
+
+    def test_same_account_two_opposite_legs_are_consistent(self) -> None:
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            self._insert_self_settlement_records(connection)
+            # 同账户两条相反分录（-1000 后 +1000），存储余额净额不变。
+            self._insert_ledger_entry(connection, 5, self.consumer_id, -1000, 98000)
+            self._insert_ledger_entry(connection, 6, self.consumer_id, 1000, 99000)
+            connection.commit()
+        finally:
+            connection.close()
+        status, body = self.post_checkpoint("audit-self-ok")
+        self.assertEqual(status, 201, body)
+        payload = json.loads(body)
+        self.assertIs(payload["consistent"], True, body)
+        self.assertEqual(payload["differences"], [])
+
+    def test_same_account_single_missing_leg_is_one_entry_missing(self) -> None:
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            self._insert_self_settlement_records(connection)
+            # 仅保留借记腿，贷记腿缺失；存储余额与重放对齐以隔离腿匹配差异。
+            self._insert_ledger_entry(connection, 5, self.consumer_id, -1000, 98000)
+            connection.execute(
+                "UPDATE ledger_accounts SET balance_micros = 98000"
+                " WHERE account_id = ?",
+                (self.consumer_id,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        status, body = self.post_checkpoint("audit-self-one-missing")
+        self.assertEqual(status, 201, body)
+        payload = json.loads(body)
+        self.assertIs(payload["consistent"], False)
+        missing = [
+            item for item in payload["differences"]
+            if item["type"] == "entry_missing"
+        ]
+        self.assertEqual(
+            missing,
+            [
+                {
+                    "accountId": self.consumer_id,
+                    "type": "entry_missing",
+                    "entrySeq": None,
+                    "referenceSeq": None,
+                    "expected": 1000,
+                    "actual": None,
+                }
+            ],
+        )
+        self.assertEqual(
+            [item["type"] for item in payload["differences"]],
+            ["entry_missing"],
+        )
+
+    def test_same_account_pair_missing_records_two_signed_legs(self) -> None:
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            self._insert_self_settlement_records(connection)
+            # 两条预期腿均无实际分录：不得因没有实际分录而漏过业务记录。
+            connection.commit()
+        finally:
+            connection.close()
+        status, body = self.post_checkpoint("audit-self-both-missing")
+        self.assertEqual(status, 201, body)
+        payload = json.loads(body)
+        self.assertIs(payload["consistent"], False)
+        missing = [
+            item for item in payload["differences"]
+            if item["type"] == "entry_missing"
+        ]
+        self.assertEqual(
+            sorted(item["expected"] for item in missing), [-1000, 1000]
+        )
+        for item in missing:
+            self.assertIsNone(item["entrySeq"])
+            self.assertIsNone(item["referenceSeq"])
+            self.assertIsNone(item["actual"])
+            self.assertEqual(item["accountId"], self.consumer_id)
+
+    def test_same_account_third_duplicate_leg_is_extra_entry(self) -> None:
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            self._insert_self_settlement_records(connection)
+            self._insert_ledger_entry(connection, 5, self.consumer_id, -1000, 98000)
+            self._insert_ledger_entry(connection, 6, self.consumer_id, 1000, 99000)
+            # 同账户第三条副本：任意配对后也不得被忽略。
+            self._insert_ledger_entry(connection, 7, self.consumer_id, 1000, 100000)
+            connection.execute(
+                "UPDATE ledger_accounts SET balance_micros = 100000"
+                " WHERE account_id = ?",
+                (self.consumer_id,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        status, body = self.post_checkpoint("audit-self-extra")
+        self.assertEqual(status, 201, body)
+        payload = json.loads(body)
+        self.assertIs(payload["consistent"], False)
+        extras = [
+            item for item in payload["differences"]
+            if item["type"] == "entry_unpaired"
+        ]
+        self.assertEqual(
+            extras,
+            [
+                {
+                    "accountId": self.consumer_id,
+                    "type": "entry_unpaired",
+                    "entrySeq": 7,
+                    "referenceSeq": 2,
+                    "expected": 2,
+                    "actual": 3,
+                }
+            ],
+        )
+        self.assertEqual(
+            [item["type"] for item in payload["differences"]],
+            ["entry_unpaired"],
+        )
+
+    def test_same_account_wrong_account_leg_is_detected(self) -> None:
+        # 贷记腿落到陌生账户：预期账户缺腿记 entry_missing（实际 entrySeq
+        # 锚点保留在错账户的 entry_reference 上）。
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            self._insert_self_settlement_records(connection)
+            self._insert_ledger_entry(connection, 5, self.consumer_id, -1000, 98000)
+            self._insert_ledger_entry(connection, 6, "x" * 64, 1000, 1000)
+            connection.commit()
+        finally:
+            connection.close()
+        status, body = self.post_checkpoint("audit-self-wrong-account")
+        self.assertEqual(status, 201, body)
+        payload = json.loads(body)
+        self.assertIs(payload["consistent"], False)
+        types = sorted(item["type"] for item in payload["differences"])
+        self.assertIn("entry_missing", types)
+        self.assertIn("entry_reference", types)
+        wrong = next(
+            item for item in payload["differences"]
+            if item["type"] == "entry_reference"
+        )
+        self.assertEqual(wrong["entrySeq"], 6)
+        self.assertEqual(wrong["accountId"], "x" * 64)
+
+    def test_same_account_wrong_kind_legs_are_detected(self) -> None:
+        # 同两笔分录被错标为 deposit：settlement 组两腿皆缺，deposit 组为
+        # 无业务引用的孤立分录。
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            self._insert_self_settlement_records(connection)
+            self._insert_ledger_entry(
+                connection, 5, self.consumer_id, -1000, 98000,
+                kind="deposit", reference_seq=99,
+            )
+            self._insert_ledger_entry(
+                connection, 6, self.consumer_id, 1000, 99000,
+                kind="deposit", reference_seq=99,
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        status, body = self.post_checkpoint("audit-self-wrong-kind")
+        self.assertEqual(status, 201, body)
+        payload = json.loads(body)
+        self.assertIs(payload["consistent"], False)
+        missing = sorted(
+            item["expected"] for item in payload["differences"]
+            if item["type"] == "entry_missing"
+        )
+        self.assertEqual(missing, [-1000, 1000])
+        self.assertTrue(
+            any(item["type"] == "entry_reference" for item in payload["differences"])
+        )
+
+    def test_arbitration_misattributed_escalation_is_detected(self) -> None:
+        # 仲裁回指的升级不属于本争议（含最终收款账户随之错属）须稳定检出。
+        self.escalate_dispute()
+        self.arbitrate_dispute()
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            connection.execute(
+                "INSERT INTO disputes(id, settlement_seq, claimant_id,"
+                " payer_id, payee_id, amount_micros, state)"
+                " VALUES ('dispute-y',98,'x','x','y',1000,'escalated')"
+            )
+            connection.execute(
+                "INSERT INTO dispute_escalations(escalation_seq, dispute_id,"
+                " first_proposal_seq, second_proposal_seq,"
+                " first_snapshot_digest, second_snapshot_digest, deadline_ms,"
+                " amount_micros, created_at_ms)"
+                " VALUES (2,'dispute-y',1,2,'a','b',0,1000,0)"
+            )
+            # 仲裁改指属于其他争议的升级：仲裁—升级归属断裂。
+            connection.execute(
+                "UPDATE dispute_arbitrations SET escalation_seq = 2"
+                " WHERE arbitration_seq = 1"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        status, body = self.post_checkpoint("audit-arb-wrong-esc")
+        self.assertEqual(status, 201, body)
+        payload = json.loads(body)
+        self.assertIs(payload["consistent"], False)
+        self.assertIn(
+            "arbitration_escalation_mismatch",
+            [item["type"] for item in payload["differences"]],
+        )
+
+    def test_self_party_settlement_over_http_audits_consistent(self) -> None:
+        # 生产方与消费者为同一机器：经公开入口完成正金额结算，同一账户须
+        # 物理保留金额相反的两条独立分录，审计不得视为非法。
+        status, _ = self.post_json(
+            f"/v1/funds/{self.machine_id}",
+            {"amountMicros": 100000, "reference": "ref-fund-self"},
+            "fund-self",
+        )
+        self.assertEqual(status, 201)
+        current = int(time.time())
+        start = current - 10
+        end = current + 3600
+        status, _ = self.post_json(
+            "/v1/slas",
+            {
+                "id": "sla-self",
+                "templateId": "tpl-1",
+                "consumerId": self.machine_id,
+                "start": start,
+                "end": end,
+            },
+            "sla-self-create",
+        )
+        self.assertEqual(status, 201, status)
+        for index, party in enumerate(("producer", "consumer")):
+            status, _ = self.post_json(
+                "/v1/slas/sla-self/confirmations",
+                {"party": party, "actorId": self.machine_id},
+                f"conf-self-{index}",
+            )
+            self.assertEqual(status, 200)
+        event_id = "evt-self"
+        timestamp = start * 1000 + 1
+        digest = hashlib.sha256(
+            f"sla-self\n{event_id}\n{timestamp}\n10\n{self.machine_id}".encode()
+        ).hexdigest()
+        status, _ = self.post_json(
+            "/v1/slas/sla-self/telemetry",
+            {
+                "eventId": event_id,
+                "timestamp": timestamp,
+                "latencyMs": 10,
+                "digest": digest,
+                "keyVersion": 1,
+                "signature": telemetry_signature(
+                    PRODUCER_SEED, "sla-self", event_id, timestamp, 10, digest,
+                    self.machine_id,
+                ),
+            },
+            "tel-self",
+        )
+        self.assertEqual(status, 201)
+        status, body = self.post_json(
+            "/v1/slas/sla-self/evaluations",
+            {"from": start * 1000, "to": end * 1000},
+            "eval-self",
+        )
+        self.assertEqual(status, 201, body)
+        evaluation_seq = json.loads(body)["evaluationSeq"]
+        status, body = self.post_json(
+            "/v1/settlements",
+            {"slaId": "sla-self", "evaluationSeq": evaluation_seq},
+            "settle-self",
+        )
+        self.assertEqual(status, 201, body)
+        settlement_seq = json.loads(body)["settlementSeq"]
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            legs = connection.execute(
+                "SELECT account_id, delta_micros FROM ledger_entries"
+                " WHERE kind = 'settlement' AND reference_seq = ?"
+                " ORDER BY entry_seq",
+                (settlement_seq,),
+            ).fetchall()
+        finally:
+            connection.close()
+        self.assertEqual(
+            legs,
+            [
+                (self.machine_id, -1000),
+                (self.machine_id, 1000),
+            ],
+        )
+        status, body = self.post_checkpoint("audit-self-http")
+        self.assertEqual(status, 201, body)
+        payload = json.loads(body)
+        self.assertIs(payload["consistent"], True, body)
+        self.assertEqual(payload["differences"], [])
+
     def test_checkpoint_sequences_advance_and_survive_restart(self) -> None:
         status, first = self.post_checkpoint("audit-seq-1")
         self.assertEqual(status, 201)
