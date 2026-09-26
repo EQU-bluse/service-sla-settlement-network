@@ -87,6 +87,8 @@ ESCALATION_FIELDS = {"actorId"}
 ARBITRATION_FIELDS = {"decision"}
 EVIDENCE_PROOF_FIELDS = {"evidenceSeq", "actorId", "signature"}
 AUDIT_COMPARISON_FIELDS = {"fromCheckpointSeq", "toCheckpointSeq"}
+AUDIT_ANCHOR_FIELDS = {"comparisonSeq", "chainDigest"}
+DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}")
 KEY_ROTATION_FIELDS = {
     "expectedVersion",
     "publicKey",
@@ -115,6 +117,7 @@ DELEGATION_EVENTS_QUERY_PARAMS = {"limit", "cursor"}
 DELEGATION_CONSUMPTIONS_QUERY_PARAMS = {"limit", "cursor"}
 AUDIT_CHECKPOINTS_QUERY_PARAMS = {"limit", "cursor"}
 AUDIT_COMPARISONS_QUERY_PARAMS = {"limit", "cursor"}
+AUDIT_ANCHORS_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTE_SNAPSHOT_STATES = {"open", "released", "refunded", "escalated"}
 ESCALATION_DELAY_MS = 86_400_000
 TELEMETRY_TIME_MAX = 2147483648000
@@ -367,6 +370,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if target.path == "/v1/audit-chain":
             self._get_audit_chain(target.query)
+            return
+        if target.path == "/v1/audit-anchors":
+            self._get_audit_anchors(target.query)
             return
         sla_match = SLA_PATH_PATTERN.fullmatch(target.path)
         if sla_match is not None:
@@ -1671,6 +1677,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if urlsplit(self.path).path == "/v1/audit-comparisons":
             self._create_audit_comparison()
+            return
+        if urlsplit(self.path).path == "/v1/audit-anchors":
+            self._create_audit_anchor()
             return
         delegation_revocation_match = DELEGATION_PATH_PATTERN.fullmatch(
             urlsplit(self.path).path
@@ -7521,6 +7530,311 @@ class Handler(BaseHTTPRequestHandler):
                 database.execute("ROLLBACK")
                 raise
         self._json(HTTPStatus.OK, payload)
+
+    def _create_audit_anchor(self) -> None:
+        idempotency_key = self.headers.get("Idempotency-Key")
+        if (
+            idempotency_key is None
+            or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None
+        ):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 锚点创建拒绝查询参数：参数校验先于体校验与认证结构。
+        if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 正文恰含 comparisonSeq（非布尔正整数，任意长度）与 chainDigest
+        # （64 位小写十六进制），键不得重复。
+        raw_body = self._read_raw_body()
+        fields = (
+            None
+            if raw_body is None
+            else self._read_audit_anchor_object(raw_body)
+        )
+        if fields is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 仅接受单一 SLA-Auth：代理头、缺失、重复或结构非法均为非法请求。
+        if self.headers.get_all(SLA_DELEGATION_HEADER):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        auth = self._parse_sla_auth()
+        if auth is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        body_digest = hashlib.sha256(raw_body).hexdigest()
+        status, payload = self._apply_audit_anchor(
+            fields, auth, body_digest, idempotency_key
+        )
+        self._json(status, payload)
+
+    def _read_audit_anchor_object(self, body: bytes) -> dict[str, Any] | None:
+        parsed = self._read_json_object(body)
+        if parsed is None or set(parsed) != AUDIT_ANCHOR_FIELDS:
+            return None
+        comparison_seq = parsed["comparisonSeq"]
+        chain_digest = parsed["chainDigest"]
+        # 链位置接受任意非布尔正整数，不以数据库整数上界判为非法请求；
+        # 超出存储范围但格式合法者按链节点不存在处理（404/not_found）。
+        if not _positive_int(comparison_seq):
+            return None
+        if (
+            not isinstance(chain_digest, str)
+            or DIGEST_PATTERN.fullmatch(chain_digest) is None
+        ):
+            return None
+        return parsed
+
+    def _apply_audit_anchor(
+        self,
+        fields: dict[str, Any],
+        auth: SlaAuth,
+        body_digest: str,
+        idempotency_key: str,
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        comparison_seq = fields["comparisonSeq"]
+        claimed_chain_digest = fields["chainDigest"]
+        request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+        standard_path = "/v1/audit-anchors"
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                # 幂等判定先于授权与认证：同键更换正文或认证五段均冲突。
+                record = database.execute(
+                    "SELECT request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature"
+                    " FROM audit_anchor_idempotency_records WHERE key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    if (
+                        record["request_json"] == request_json
+                        and self._auth_record_matches(record, auth)
+                    ):
+                        return HTTPStatus(record["status"]), json.loads(
+                            record["response_json"]
+                        )
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                # 认证机器须为启动时配置的审计机器；未获审计授权一律 403。
+                if auth.machine_id not in self.server.auditors:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
+                try:
+                    self._verify_request_principal(
+                        database, auth, standard_path, body_digest
+                    )
+                    self._check_request_nonce(database, auth)
+                except AuthRejected as rejected:
+                    database.execute("ROLLBACK")
+                    return rejected.status, {"error": rejected.error}
+                # 目标序号须指向已保存的比较链节点；超存储范围但格式合法
+                # （参数无法绑定 SQLite 整数）同样按不存在处理。
+                if comparison_seq <= INT64_MAX:
+                    chain_row = database.execute(
+                        "SELECT chain_digest FROM audit_comparison_chain"
+                        " WHERE comparison_seq = ?",
+                        (comparison_seq,),
+                    ).fetchone()
+                else:
+                    chain_row = None
+                if chain_row is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                # 摘要须与保存的链摘要逐字一致；错配为冲突，不锚定也不消费随机数。
+                if chain_row["chain_digest"] != claimed_chain_digest:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                # 同一审计机器对同一链节点限锚定一次；不同审计机器仍可分别签名。
+                existing = database.execute(
+                    "SELECT 1 FROM audit_anchors"
+                    " WHERE comparison_seq = ? AND auditor_machine_id = ?",
+                    (comparison_seq, auth.machine_id),
+                ).fetchone()
+                if existing is not None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "anchor_exists"}
+                # 冻结签名公钥：取该机器本次认证版本登记的公钥；
+                # 认证通过后该行必存在，按 README 请求认证规则由冻结字段重建
+                # 待验字节并复核签名，确保落库锚点独立可验。
+                key_row = database.execute(
+                    "SELECT public_key FROM machine_keys"
+                    " WHERE machine_id = ? AND version = ?",
+                    (auth.machine_id, auth.key_version),
+                ).fetchone()
+                frozen_message = self._request_auth_signing_bytes(
+                    auth, standard_path, body_digest
+                )
+                rebuilt_valid = (
+                    key_row is not None
+                    and ed25519_verify(
+                        bytes.fromhex(key_row["public_key"]),
+                        frozen_message,
+                        auth.signature_bytes,
+                    )
+                )
+                if not rebuilt_valid:
+                    database.execute("ROLLBACK")
+                    return (
+                        HTTPStatus.UNAUTHORIZED,
+                        {"error": "invalid_authentication"},
+                    )
+                # 全库唯一持久递增锚点序号：取写锁后取最大序号 + 1（空表 1）。
+                anchor_seq = database.execute(
+                    "SELECT COALESCE(MAX(anchor_seq), 0) + 1 AS next_seq"
+                    " FROM audit_anchors"
+                ).fetchone()["next_seq"]
+                created_at_ms = int(datetime.now(UTC).timestamp() * 1000)
+                payload = {
+                    "anchorSeq": anchor_seq,
+                    "comparisonSeq": comparison_seq,
+                    "chainDigest": claimed_chain_digest,
+                    "auditorId": auth.machine_id,
+                    "publicKey": key_row["public_key"],
+                    "keyVersion": auth.key_version,
+                    "requestTimeMs": auth.request_time_ms,
+                    "nonce": auth.nonce,
+                    "bodyDigest": body_digest,
+                    "authSignature": auth.signature,
+                    "createdAt": created_at_ms,
+                }
+                response_json = json.dumps(payload, separators=(",", ":"))
+                database.execute(
+                    "INSERT INTO audit_anchors"
+                    "(anchor_seq, comparison_seq, chain_digest, auditor_machine_id,"
+                    " public_key, key_version, request_time_ms, nonce, body_digest,"
+                    " auth_signature, created_at_ms, response_json)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        anchor_seq,
+                        comparison_seq,
+                        claimed_chain_digest,
+                        auth.machine_id,
+                        key_row["public_key"],
+                        auth.key_version,
+                        auth.request_time_ms,
+                        auth.nonce,
+                        body_digest,
+                        auth.signature,
+                        created_at_ms,
+                        response_json,
+                    ),
+                )
+                database.execute(
+                    "INSERT INTO audit_anchor_idempotency_records"
+                    "(key, request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        request_json,
+                        int(HTTPStatus.CREATED),
+                        response_json,
+                        auth.machine_id,
+                        auth.key_version,
+                        auth.request_time_ms,
+                        auth.nonce,
+                        auth.signature,
+                    ),
+                )
+                # 锚点、幂等结果与随机数同一事务原子持久化；
+                # 失败、重放或并发败者不消费随机数、不推进锚点序号。
+                self._consume_request_nonce(database, auth)
+                database.execute("COMMIT")
+                return HTTPStatus.CREATED, payload
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+
+    def _audit_anchor_collection_page(
+        self, database: Any, cut: int, last_seq: int, limit: int
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        rows = database.execute(
+            "SELECT anchor_seq, response_json FROM audit_anchors"
+            " WHERE anchor_seq <= ? AND anchor_seq > ?"
+            " ORDER BY anchor_seq ASC LIMIT ?",
+            (cut, last_seq, limit + 1),
+        ).fetchall()
+        has_next = len(rows) > limit
+        page = rows[:limit]
+        anchors = [json.loads(row["response_json"]) for row in page]
+        next_cursor = f"{cut}:{page[-1]['anchor_seq']}" if has_next else None
+        return anchors, next_cursor
+
+    def _get_audit_anchors(self, query: str) -> None:
+        # 锚点集合分页沿用比较列表的 limit 与 cursor=cut:lastSeq。
+        parsed = self._parse_evaluation_query(query, AUDIT_ANCHORS_QUERY_PARAMS)
+        if parsed is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        limit, cursor = parsed
+        if self.headers.get_all(SLA_DELEGATION_HEADER):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        auth = self._parse_sla_auth()
+        if auth is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        body_digest = hashlib.sha256(b"").hexdigest()
+        standard_path = "/v1/audit-anchors"
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                if auth.machine_id not in self.server.auditors:
+                    database.execute("ROLLBACK")
+                    self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                    return
+                try:
+                    self._verify_request_principal(
+                        database, auth, standard_path, body_digest
+                    )
+                    self._check_request_nonce(database, auth)
+                except AuthRejected as rejected:
+                    database.execute("ROLLBACK")
+                    self._json(rejected.status, {"error": rejected.error})
+                    return
+                # 首页在写事务起点冻结最大锚点序号：并发新增不进入旧 cut。
+                current_max = database.execute(
+                    "SELECT COALESCE(MAX(anchor_seq), 0) AS current_max"
+                    " FROM audit_anchors"
+                ).fetchone()["current_max"]
+                if cursor is None:
+                    cut, last_seq = current_max, 0
+                else:
+                    cut, last_seq = cursor
+                    # 认证通过后的超前 cut 或缺失锚点同为非法请求。
+                    if cut > current_max:
+                        database.execute("ROLLBACK")
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                        )
+                        return
+                    anchor = database.execute(
+                        "SELECT 1 FROM audit_anchors"
+                        " WHERE anchor_seq = ? AND anchor_seq <= ?",
+                        (last_seq, cut),
+                    ).fetchone()
+                    if anchor is None:
+                        database.execute("ROLLBACK")
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                        )
+                        return
+                anchors, next_cursor = self._audit_anchor_collection_page(
+                    database, cut, last_seq, limit
+                )
+                # 仅成功读取才消费随机数；任何失败均不消费、不推进序号。
+                self._consume_request_nonce(database, auth)
+                database.execute("COMMIT")
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+        self._json(
+            HTTPStatus.OK,
+            {"anchors": anchors, "nextCursor": next_cursor},
+        )
 
     def log_message(self, format: str, *args: object) -> None:
         return

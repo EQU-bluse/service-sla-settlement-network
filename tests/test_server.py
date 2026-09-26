@@ -12255,6 +12255,28 @@ class AuditComparisonTests(_EvidenceScenario, unittest.TestCase):
         status, body = self.post_comparison(1, 2, "cmp-bign-ok", nonce=nonce)
         self.assertEqual(status, 201, body)
 
+    def test_very_long_digit_endpoint_seqs_treated_as_not_found(self) -> None:
+        # 超过解释器整数字符串转换位数上限（PEP 682，4300 位）的合法 JSON
+        # 端点仍须解析为非布尔正整数：返回 404/not_found，不得断连或判为非法请求。
+        self.create_checkpoints("cmp-long-cp1", "cmp-long-cp2")
+        huge = int("9" * 5000)
+        body = json.dumps(
+            {"fromCheckpointSeq": 1, "toCheckpointSeq": huge}
+        ).encode()
+        status, response = self.post_comparison_raw(
+            "/v1/audit-comparisons", body, "cmp-long-to"
+        )
+        self.assertEqual(status, 404, response)
+        self.assertEqual(json.loads(response), {"error": "not_found"})
+        nonce = f"nonce-long-{time.time_ns()}"
+        status, _ = self.post_comparison(
+            1, huge, "cmp-long-fail", nonce=nonce
+        )
+        self.assertEqual(status, 404)
+        # 失败不落幂等记录、不消费随机数：同键同正文随后不重放，随机数仍可成功使用。
+        status, body = self.post_comparison(1, 2, "cmp-long-ok", nonce=nonce)
+        self.assertEqual(status, 201, body)
+
     # ---- 比较链 GET /v1/audit-chain ----
 
     def get_chain(self, path: str = "/v1/audit-chain", **kwargs: object):
@@ -12416,6 +12438,779 @@ class AuditComparisonTests(_EvidenceScenario, unittest.TestCase):
         self.assertEqual(reread, first)
 
 
+class AuditAnchorTests(_EvidenceScenario, unittest.TestCase):
+    # 比较签名锚点：审计机器对已保存比较链节点冻结认证五段与签名公钥，
+    # 可按 README 请求认证规则独立复验；同机异键重复锚定冲突，异机可分别签名。
+    AUDITOR_SEED = ARBITRATOR_SEED
+    AUDITOR2_SEED = b"\x08" * 32
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.auditor_id = machine_id(ARBITRATOR_PUBLIC)
+        self.auditor2_public = _ed25519_public_key(self.AUDITOR2_SEED).hex()
+        self.auditor2_id = machine_id(self.auditor2_public)
+        self.server.auditors = frozenset({self.auditor_id, self.auditor2_id})
+        status, _ = self.post_json(
+            "/v1/machines", {"publicKey": ARBITRATOR_PUBLIC}, "register-auditor-anc"
+        )
+        self.assertEqual(status, 201)
+
+    def restart(self) -> None:
+        super().restart()
+        self.server.auditors = frozenset({self.auditor_id, self.auditor2_id})
+
+    def post_anchor_raw(
+        self,
+        path: str,
+        body: bytes,
+        key: str | None,
+        *,
+        seed: bytes | None = None,
+        actor: str | None = None,
+        nonce: str | None = None,
+        auth_header: str | None = None,
+        delegation: str | None = None,
+        omit_auth: bool = False,
+        key_version: int = 1,
+    ) -> tuple[int, bytes]:
+        request = Request(self.url(path), data=body, method="POST")
+        if key is not None:
+            request.add_header("Idempotency-Key", key)
+        if delegation is not None:
+            request.add_header("SLA-Delegation", delegation)
+        elif not omit_auth:
+            request.add_header(
+                "SLA-Auth",
+                auth_header
+                if auth_header is not None
+                else make_sla_auth(
+                    self.server,
+                    key,
+                    seed if seed is not None else self.AUDITOR_SEED,
+                    actor if actor is not None else self.auditor_id,
+                    "POST",
+                    urlsplit(path).path,
+                    body,
+                    key_version,
+                    nonce=nonce,
+                ),
+            )
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def get_anchor(
+        self,
+        path: str = "/v1/audit-anchors",
+        *,
+        seed: bytes | None = None,
+        actor: str | None = None,
+        nonce: str | None = None,
+        key_version: int = 1,
+        omit_auth: bool = False,
+    ) -> tuple[int, bytes]:
+        request = Request(self.url(path), data=b"", method="GET")
+        if not omit_auth:
+            nonce = nonce or f"nonce-anc-get-{time.time_ns()}"
+            auth_header = make_sla_auth(
+                self.server,
+                None,
+                seed if seed is not None else self.AUDITOR_SEED,
+                actor if actor is not None else self.auditor_id,
+                "GET",
+                urlsplit(path).path,
+                b"",
+                key_version,
+                nonce=nonce,
+            )
+            request.add_header("SLA-Auth", auth_header)
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def create_checkpoints(self, *keys: str) -> None:
+        for key in keys:
+            status, body = self.post_anchor_raw(
+                "/v1/audit-checkpoints", b"{}", key
+            )
+            self.assertEqual(status, 201, body)
+
+    def create_comparison(self, seq: int, key: str) -> bytes:
+        self.create_checkpoints(f"{key}-cp1", f"{key}-cp2")
+        body = json.dumps(
+            {"fromCheckpointSeq": 1, "toCheckpointSeq": 2}
+        ).encode()
+        status, response = self.post_anchor_raw(
+            "/v1/audit-comparisons", body, key
+        )
+        self.assertEqual(status, 201, response)
+        self.assertEqual(json.loads(response)["comparisonSeq"], seq)
+        return response
+
+    def chain_digest(self, comparison_seq: int) -> str:
+        status, body = self.get_anchor("/v1/audit-chain")
+        self.assertEqual(status, 200, body)
+        entries = json.loads(body)["entries"]
+        return next(
+            entry["chainDigest"]
+            for entry in entries
+            if entry["comparisonSeq"] == comparison_seq
+        )
+
+    def anchor_body(self, comparison_seq: int, chain_digest: str) -> bytes:
+        return json.dumps(
+            {"comparisonSeq": comparison_seq, "chainDigest": chain_digest}
+        ).encode()
+
+    # ---- 创建成功路径 ----
+
+    def test_anchor_created_with_frozen_verifiable_fields(self) -> None:
+        from sla_network.ed25519 import verify as ed25519_verify
+
+        self.create_comparison(1, "anc-sc-1")
+        chain_digest = self.chain_digest(1)
+        body = self.anchor_body(1, chain_digest)
+        status, response = self.post_anchor_raw(
+            "/v1/audit-anchors", body, "anchor-1"
+        )
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(
+            list(payload),
+            [
+                "anchorSeq",
+                "comparisonSeq",
+                "chainDigest",
+                "auditorId",
+                "publicKey",
+                "keyVersion",
+                "requestTimeMs",
+                "nonce",
+                "bodyDigest",
+                "authSignature",
+                "createdAt",
+            ],
+        )
+        self.assertEqual(payload["anchorSeq"], 1)
+        self.assertEqual(payload["comparisonSeq"], 1)
+        self.assertEqual(payload["chainDigest"], chain_digest)
+        self.assertEqual(payload["auditorId"], self.auditor_id)
+        self.assertEqual(payload["publicKey"], ARBITRATOR_PUBLIC)
+        self.assertEqual(payload["keyVersion"], 1)
+        self.assertEqual(
+            payload["bodyDigest"], hashlib.sha256(body).hexdigest()
+        )
+        self.assertRegex(payload["nonce"], r"[A-Za-z0-9-]{16,64}")
+        self.assertRegex(payload["authSignature"], r"[0-9a-f]{128}")
+        self.assertIsInstance(payload["createdAt"], int)
+        self.assertGreaterEqual(payload["createdAt"], 0)
+        # 冻结字段按 README 请求认证规则重建待验字节并严格复核认证签名。
+        message = (
+            f"request-auth-v1\nPOST\n/v1/audit-anchors\n{payload['bodyDigest']}\n"
+            f"{payload['requestTimeMs']}\n{payload['nonce']}\n"
+            f"{payload['keyVersion']}\n{self.auditor_id}"
+        ).encode("utf-8")
+        self.assertTrue(
+            ed25519_verify(
+                bytes.fromhex(ARBITRATOR_PUBLIC),
+                message,
+                bytes.fromhex(payload["authSignature"]),
+            )
+        )
+        self.assertFalse(response.endswith(b"\n"))
+
+    def test_anchor_replay_returns_first_bytes(self) -> None:
+        self.create_comparison(1, "anc-rp-1")
+        body = self.anchor_body(1, self.chain_digest(1))
+        status, first = self.post_anchor_raw(
+            "/v1/audit-anchors", body, "anchor-replay"
+        )
+        self.assertEqual(status, 201)
+        status, second = self.post_anchor_raw(
+            "/v1/audit-anchors", body, "anchor-replay"
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(second, first)
+        # 重放不推进锚点序号：异键锚定另一节点仍为序号 2。
+        self.create_comparison(2, "anc-rp-2")
+        status, third = self.post_anchor_raw(
+            "/v1/audit-anchors",
+            self.anchor_body(2, self.chain_digest(2)),
+            "anchor-replay-other",
+        )
+        self.assertEqual(status, 201, third)
+        self.assertEqual(json.loads(third)["anchorSeq"], 2)
+
+    def test_anchor_replay_survives_restart(self) -> None:
+        self.create_comparison(1, "anc-rs-1")
+        body = self.anchor_body(1, self.chain_digest(1))
+        status, first = self.post_anchor_raw(
+            "/v1/audit-anchors", body, "anchor-restart"
+        )
+        self.assertEqual(status, 201)
+        self.restart()
+        status, second = self.post_anchor_raw(
+            "/v1/audit-anchors", body, "anchor-restart"
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(second, first)
+
+    # ---- 错误判定 ----
+
+    def test_same_key_different_body_conflicts(self) -> None:
+        self.create_comparison(1, "anc-sb-1")
+        status, _ = self.post_anchor_raw(
+            "/v1/audit-anchors",
+            self.anchor_body(1, self.chain_digest(1)),
+            "anchor-same-key",
+        )
+        self.assertEqual(status, 201)
+        status, body = self.post_anchor_raw(
+            "/v1/audit-anchors",
+            self.anchor_body(1, "ab" * 32),
+            "anchor-same-key",
+            nonce=f"nonce-anc-sb-{time.time_ns()}",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_same_key_different_auth_conflicts(self) -> None:
+        self.create_comparison(1, "anc-sa-1")
+        body = self.anchor_body(1, self.chain_digest(1))
+        status, _ = self.post_anchor_raw(
+            "/v1/audit-anchors", body, "anchor-auth"
+        )
+        self.assertEqual(status, 201)
+        # 同键更换认证五段（随机数）即使目标不存在也先判冲突。
+        status, response = self.post_anchor_raw(
+            "/v1/audit-anchors",
+            self.anchor_body(999, "ab" * 32),
+            "anchor-auth",
+            nonce=f"nonce-anc-sa-{time.time_ns()}",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(response), {"error": "conflict"})
+
+    def test_missing_comparison_is_not_found(self) -> None:
+        self.create_comparison(1, "anc-nf-1")
+        for comparison_seq in (2, 999):
+            status, body = self.post_anchor_raw(
+                "/v1/audit-anchors",
+                self.anchor_body(comparison_seq, "ab" * 32),
+                f"anchor-missing-{comparison_seq}",
+            )
+            self.assertEqual(status, 404, comparison_seq)
+            self.assertEqual(json.loads(body), {"error": "not_found"})
+        # 格式合法但超出存储范围的序号同样为 404，不断连。
+        status, body = self.post_anchor_raw(
+            "/v1/audit-anchors",
+            self.anchor_body(10**30, "ab" * 32),
+            "anchor-missing-huge",
+        )
+        self.assertEqual(status, 404, body)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+        status, body = self.post_anchor_raw(
+            "/v1/audit-anchors",
+            json.dumps(
+                {"comparisonSeq": int("9" * 5000), "chainDigest": "ab" * 32}
+            ).encode(),
+            "anchor-missing-very-long",
+        )
+        self.assertEqual(status, 404, body)
+
+    def test_chain_digest_mismatch_conflicts(self) -> None:
+        self.create_comparison(1, "anc-dm-1")
+        status, body = self.post_anchor_raw(
+            "/v1/audit-anchors",
+            self.anchor_body(1, "ab" * 32),
+            "anchor-digest",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_same_machine_different_key_anchor_exists(self) -> None:
+        self.create_comparison(1, "anc-ae-1")
+        body = self.anchor_body(1, self.chain_digest(1))
+        status, first = self.post_anchor_raw(
+            "/v1/audit-anchors", body, "anchor-exists-1"
+        )
+        self.assertEqual(status, 201)
+        status, response = self.post_anchor_raw(
+            "/v1/audit-anchors",
+            body,
+            "anchor-exists-2",
+            nonce=f"nonce-anc-ae-{time.time_ns()}",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(response), {"error": "anchor_exists"})
+
+    def test_different_auditors_may_each_sign_same_node(self) -> None:
+        status, _ = self.post_json(
+            "/v1/machines",
+            {"publicKey": self.auditor2_public},
+            "register-auditor2-anc",
+        )
+        self.assertEqual(status, 201)
+        self.create_comparison(1, "anc-da-1")
+        body = self.anchor_body(1, self.chain_digest(1))
+        status, first = self.post_anchor_raw(
+            "/v1/audit-anchors", body, "anchor-da-1"
+        )
+        self.assertEqual(status, 201)
+        status, second = self.post_anchor_raw(
+            "/v1/audit-anchors",
+            body,
+            "anchor-da-2",
+            seed=self.AUDITOR2_SEED,
+            actor=self.auditor2_id,
+            nonce=f"nonce-anc-da-{time.time_ns()}",
+        )
+        self.assertEqual(status, 201, second)
+        first_payload = json.loads(first)
+        second_payload = json.loads(second)
+        self.assertEqual(first_payload["anchorSeq"], 1)
+        self.assertEqual(second_payload["anchorSeq"], 2)
+        self.assertEqual(second_payload["auditorId"], self.auditor2_id)
+        self.assertEqual(second_payload["publicKey"], self.auditor2_public)
+        # 同一审计机器仍不可重复锚定。
+        status, body = self.post_anchor_raw(
+            "/v1/audit-anchors",
+            body,
+            "anchor-da-3",
+            seed=self.AUDITOR2_SEED,
+            actor=self.auditor2_id,
+            nonce=f"nonce-anc-da2-{time.time_ns()}",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "anchor_exists"})
+
+    def test_non_auditor_forbidden(self) -> None:
+        self.create_comparison(1, "anc-fb-1")
+        body = self.anchor_body(1, self.chain_digest(1))
+        status, response = self.post_anchor_raw(
+            "/v1/audit-anchors",
+            body,
+            "anchor-forbidden",
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+            nonce=f"nonce-anc-fb-{time.time_ns()}",
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(response), {"error": "forbidden"})
+        status, _ = self.get_anchor(
+            seed=PUBLIC_KEY_SEED_B, actor=self.consumer_id
+        )
+        self.assertEqual(status, 403)
+
+    def test_invalid_body_returns_400(self) -> None:
+        self.create_comparison(1, "anc-ib-1")
+        valid_digest = self.chain_digest(1)
+        bodies = (
+            b"{}",
+            b"[]",
+            b"not json",
+            json.dumps({"chainDigest": valid_digest}).encode(),
+            json.dumps(
+                {"comparisonSeq": 1, "chainDigest": valid_digest, "extra": 1}
+            ).encode(),
+            json.dumps(
+                {"comparisonSeq": 0, "chainDigest": valid_digest}
+            ).encode(),
+            json.dumps(
+                {"comparisonSeq": -1, "chainDigest": valid_digest}
+            ).encode(),
+            json.dumps(
+                {"comparisonSeq": True, "chainDigest": valid_digest}
+            ).encode(),
+            json.dumps(
+                {"comparisonSeq": "1", "chainDigest": valid_digest}
+            ).encode(),
+            json.dumps(
+                {"comparisonSeq": 1, "chainDigest": "AB" * 32}
+            ).encode(),
+            json.dumps(
+                {"comparisonSeq": 1, "chainDigest": "a" * 63}
+            ).encode(),
+            json.dumps(
+                {"comparisonSeq": 1, "chainDigest": 1}
+            ).encode(),
+            (
+                b'{"comparisonSeq":1,"chainDigest":"'
+                + valid_digest.encode()
+                + b'","comparisonSeq":1}'
+            ),
+        )
+        for index, body in enumerate(bodies):
+            status, response = self.post_anchor_raw(
+                "/v1/audit-anchors", body, f"anchor-invalid-{index}"
+            )
+            self.assertEqual(status, 400, body)
+            self.assertEqual(json.loads(response), {"error": "invalid_request"})
+
+    def test_query_params_delegation_and_missing_auth_rejected(self) -> None:
+        self.create_comparison(1, "anc-qp-1")
+        body = self.anchor_body(1, self.chain_digest(1))
+        status, response = self.post_anchor_raw(
+            "/v1/audit-anchors?x=1", body, "anchor-query"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(response), {"error": "invalid_request"})
+        status, _ = self.post_anchor_raw(
+            "/v1/audit-anchors",
+            body,
+            "anchor-delegation",
+            delegation="d;0;1;nonnonnonnonnonnonn;s",
+        )
+        self.assertEqual(status, 400)
+        status, _ = self.post_anchor_raw(
+            "/v1/audit-anchors", body, "anchor-no-auth", omit_auth=True
+        )
+        self.assertEqual(status, 400)
+        # 缺少幂等头同样为非法请求。
+        request = Request(
+            self.url("/v1/audit-anchors"), data=body, method="POST"
+        )
+        try:
+            with urlopen(request, timeout=5) as response:
+                status = response.status
+        except HTTPError as error:
+            status = error.code
+        self.assertEqual(status, 400)
+
+    def test_failure_does_not_consume_nonce_or_advance_seq(self) -> None:
+        self.create_comparison(1, "anc-fl-1")
+        nonce = f"nonce-anc-fl-{time.time_ns()}"
+        # 摘要错配失败：不消费随机数。
+        status, _ = self.post_anchor_raw(
+            "/v1/audit-anchors",
+            self.anchor_body(1, "ab" * 32),
+            "anchor-fl-fail",
+            nonce=nonce,
+        )
+        self.assertEqual(status, 409)
+        # 同随机数用于一次成功锚定：未被失败请求消费，序号仍自 1 起。
+        status, body = self.post_anchor_raw(
+            "/v1/audit-anchors",
+            self.anchor_body(1, self.chain_digest(1)),
+            "anchor-fl-ok",
+            nonce=nonce,
+        )
+        self.assertEqual(status, 201, body)
+        self.assertEqual(json.loads(body)["anchorSeq"], 1)
+
+    def test_replayed_nonce_with_different_key_is_replay_detected(self) -> None:
+        self.create_comparison(1, "anc-nr-1")
+        nonce = f"nonce-anc-nr-{time.time_ns()}"
+        status, _ = self.post_anchor_raw(
+            "/v1/audit-anchors",
+            self.anchor_body(1, self.chain_digest(1)),
+            "anchor-nr-1",
+            nonce=nonce,
+        )
+        self.assertEqual(status, 201)
+        status, body = self.post_anchor_raw(
+            "/v1/audit-anchors",
+            self.anchor_body(1, self.chain_digest(1)),
+            "anchor-nr-2",
+            nonce=nonce,
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "replay_detected"})
+
+    def test_concurrent_distinct_targets_get_dense_unique_seqs(self) -> None:
+        self.create_checkpoints("anc-cc-cp1", "anc-cc-cp2")
+        body = json.dumps(
+            {"fromCheckpointSeq": 1, "toCheckpointSeq": 2}
+        ).encode()
+        count = 8
+        for index in range(1, count + 1):
+            status, response = self.post_anchor_raw(
+                "/v1/audit-comparisons", body, f"anc-cc-cmp-{index}"
+            )
+            self.assertEqual(status, 201, response)
+        digests = {
+            index: self.chain_digest(index) for index in range(1, count + 1)
+        }
+
+        def anchor(index: int) -> tuple[int, bytes]:
+            return self.post_anchor_raw(
+                "/v1/audit-anchors",
+                self.anchor_body(index, digests[index]),
+                f"anc-cc-{index}",
+                nonce=f"nonce-anc-conc-{index:020d}",
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(count) as executor:
+            results = list(executor.map(anchor, range(1, count + 1)))
+        self.assertTrue(all(status == 201 for status, _ in results), results)
+        seqs = sorted(json.loads(response)["anchorSeq"] for _, response in results)
+        self.assertEqual(seqs, list(range(1, count + 1)))
+
+    def test_concurrent_same_target_distinct_keys_single_success(self) -> None:
+        self.create_comparison(1, "anc-cs-1")
+        body = self.anchor_body(1, self.chain_digest(1))
+
+        def anchor(index: int) -> tuple[int, bytes]:
+            return self.post_anchor_raw(
+                "/v1/audit-anchors",
+                body,
+                f"anchor-cs-{index}",
+                nonce=f"nonce-anc-csame-{index:020d}",
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(8) as executor:
+            results = list(executor.map(anchor, range(8)))
+        statuses = sorted(status for status, _ in results)
+        self.assertEqual(statuses.count(201), 1)
+        self.assertEqual(statuses.count(409), 7)
+        self.assertEqual(
+            {json.loads(response)["error"] for status, response in results if status == 409},
+            {"anchor_exists"},
+        )
+
+    # ---- 集合读取 ----
+
+    def test_get_empty_collection(self) -> None:
+        status, body = self.get_anchor()
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertEqual(list(payload), ["anchors", "nextCursor"])
+        self.assertEqual(payload["anchors"], [])
+        self.assertIsNone(payload["nextCursor"])
+
+    def test_get_collection_returns_full_anchors(self) -> None:
+        self.create_comparison(1, "anc-gc-1")
+        self.create_comparison(2, "anc-gc-2")
+        status, first = self.post_anchor_raw(
+            "/v1/audit-anchors",
+            self.anchor_body(1, self.chain_digest(1)),
+            "anchor-gc-1",
+        )
+        self.assertEqual(status, 201)
+        status, _ = self.post_anchor_raw(
+            "/v1/audit-anchors",
+            self.anchor_body(2, self.chain_digest(2)),
+            "anchor-gc-2",
+        )
+        self.assertEqual(status, 201)
+        status, body = self.get_anchor()
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertEqual(list(payload), ["anchors", "nextCursor"])
+        self.assertEqual([a["anchorSeq"] for a in payload["anchors"]], [1, 2])
+        self.assertEqual(payload["anchors"][0], json.loads(first))
+        self.assertIsNone(payload["nextCursor"])
+
+    def test_collection_paging_and_stable_cut(self) -> None:
+        self.create_checkpoints("anc-pg-cp1", "anc-pg-cp2")
+        comparison_body = json.dumps(
+            {"fromCheckpointSeq": 1, "toCheckpointSeq": 2}
+        ).encode()
+        for index in range(1, 4):
+            status, _ = self.post_anchor_raw(
+                "/v1/audit-comparisons", comparison_body, f"anc-pg-cmp-{index}"
+            )
+            self.assertEqual(status, 201)
+        for index in range(1, 4):
+            status, _ = self.post_anchor_raw(
+                "/v1/audit-anchors",
+                self.anchor_body(index, self.chain_digest(index)),
+                f"anc-pg-{index}",
+            )
+            self.assertEqual(status, 201)
+        status, body = self.get_anchor("/v1/audit-anchors?limit=1")
+        self.assertEqual(status, 200, body)
+        first_page = json.loads(body)
+        self.assertEqual([a["anchorSeq"] for a in first_page["anchors"]], [1])
+        self.assertEqual(first_page["nextCursor"], "3:1")
+        # 旧游标携带 cut=3：此后新增锚定不进入续页。
+        status, _ = self.post_anchor_raw(
+            "/v1/audit-comparisons", comparison_body, "anc-pg-cmp-4"
+        )
+        self.assertEqual(status, 201)
+        status, _ = self.post_anchor_raw(
+            "/v1/audit-anchors",
+            self.anchor_body(4, self.chain_digest(4)),
+            "anc-pg-4",
+        )
+        self.assertEqual(status, 201)
+        status, body = self.get_anchor(
+            f"/v1/audit-anchors?limit=1&cursor={first_page['nextCursor']}"
+        )
+        self.assertEqual(status, 200, body)
+        second_page = json.loads(body)
+        self.assertEqual([a["anchorSeq"] for a in second_page["anchors"]], [2])
+        self.assertEqual(second_page["nextCursor"], "3:2")
+
+    def test_collection_invalid_params_and_cursors(self) -> None:
+        self.create_comparison(1, "anc-cu-1")
+        status, _ = self.post_anchor_raw(
+            "/v1/audit-anchors",
+            self.anchor_body(1, self.chain_digest(1)),
+            "anchor-cu-1",
+        )
+        self.assertEqual(status, 201)
+        for query in (
+            "limit=0",
+            "limit=101",
+            "limit=x",
+            "foo=1",
+            "cursor=1",
+            "cursor=x:1",
+            "limit=1&limit=2",
+            "cursor=99:1",
+            "cursor=1:5",
+        ):
+            status, _ = self.get_anchor(f"/v1/audit-anchors?{query}")
+            self.assertEqual(status, 400, query)
+
+    def test_collection_requires_auditor_and_auth(self) -> None:
+        status, _ = self.get_anchor(
+            seed=PUBLIC_KEY_SEED_B, actor=self.consumer_id
+        )
+        self.assertEqual(status, 403)
+        status, _ = self.get_anchor(omit_auth=True)
+        self.assertEqual(status, 400)
+        request = Request(self.url("/v1/audit-anchors"), data=b"", method="GET")
+        request.add_header("SLA-Delegation", "d;0;1;n;s")
+        try:
+            with urlopen(request, timeout=5) as response:
+                status = response.status
+        except HTTPError as error:
+            status = error.code
+        self.assertEqual(status, 400)
+
+    def test_collection_nonce_consumed_only_on_success(self) -> None:
+        self.create_comparison(1, "anc-gn-1")
+        nonce = f"nonce-anc-gn-{time.time_ns()}"
+        status, _ = self.get_anchor(nonce=nonce)
+        self.assertEqual(status, 200)
+        status, body = self.get_anchor(nonce=nonce)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "replay_detected"})
+        failed_nonce = f"nonce-anc-gnf-{time.time_ns()}"
+        for _ in range(2):
+            status, _ = self.get_anchor(
+                "/v1/audit-anchors?cursor=99:1", nonce=failed_nonce
+            )
+            self.assertEqual(status, 400)
+
+    def test_rotation_revocation_and_growth_keep_anchors_immutable(self) -> None:
+        from sla_network.ed25519 import verify as ed25519_verify
+
+        self.create_comparison(1, "anc-im-1")
+        body = self.anchor_body(1, self.chain_digest(1))
+        status, first = self.post_anchor_raw(
+            "/v1/audit-anchors", body, "anchor-im-1"
+        )
+        self.assertEqual(status, 201)
+        self.create_comparison(2, "anc-im-pre2")
+        status, _ = self.post_anchor_raw(
+            "/v1/audit-anchors",
+            self.anchor_body(2, self.chain_digest(2)),
+            "anchor-im-pre2",
+        )
+        self.assertEqual(status, 201)
+        # 分页取首页并保留游标；随后轮换并吊销审计机器密钥。
+        status, page = self.get_anchor("/v1/audit-anchors?limit=1")
+        self.assertEqual(status, 200)
+        cursor = json.loads(page)["nextCursor"]
+        self.assertEqual(cursor, "2:1")
+        new_seed = b"\x0a" * 32
+        new_public = _ed25519_public_key(new_seed).hex()
+        current_signature, new_signature = key_rotation_signatures(
+            self.AUDITOR_SEED, new_seed, self.auditor_id, 1, new_public
+        )
+        request = Request(
+            self.url(f"/v1/machines/{self.auditor_id}/keys"),
+            data=json.dumps(
+                {
+                    "expectedVersion": 1,
+                    "publicKey": new_public,
+                    "currentSignature": current_signature,
+                    "newSignature": new_signature,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "anchor-im-rotate")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        revocation = key_revocation_signature(
+            new_seed, self.auditor_id, 1
+        )
+        request = Request(
+            self.url(f"/v1/machines/{self.auditor_id}/keys/1/revocation"),
+            data=json.dumps({"signature": revocation}).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "anchor-im-revoke")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+        # 链增长后以新版本继续锚定；旧锚点字段保持冻结。
+        comparison_body = json.dumps(
+            {"fromCheckpointSeq": 1, "toCheckpointSeq": 2}
+        ).encode()
+        status, _ = self.post_anchor_raw(
+            "/v1/audit-comparisons",
+            comparison_body,
+            "anc-im-2",
+            seed=new_seed,
+            key_version=2,
+        )
+        self.assertEqual(status, 201)
+        status, chain_body = self.get_anchor(
+            "/v1/audit-chain", seed=new_seed, key_version=2
+        )
+        self.assertEqual(status, 200)
+        third_digest = json.loads(chain_body)["entries"][2]["chainDigest"]
+        status, second_anchor = self.post_anchor_raw(
+            "/v1/audit-anchors",
+            self.anchor_body(3, third_digest),
+            "anchor-im-3",
+            seed=new_seed,
+            key_version=2,
+            nonce=f"nonce-anc-im-{time.time_ns()}",
+        )
+        self.assertEqual(status, 201, second_anchor)
+        self.assertEqual(json.loads(second_anchor)["keyVersion"], 2)
+        # 重启后旧锚点字节不变，旧游标续页稳定。
+        self.restart()
+        status, replay = self.post_anchor_raw(
+            "/v1/audit-anchors", body, "anchor-im-1"
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(replay, first)
+        status, continued = self.get_anchor(
+            f"/v1/audit-anchors?limit=1&cursor={cursor}",
+            seed=new_seed,
+            key_version=2,
+        )
+        self.assertEqual(status, 200, continued)
+        self.assertEqual(
+            [a["anchorSeq"] for a in json.loads(continued)["anchors"]], [2]
+        )
+        # 旧锚点冻结公钥与签名仍可独立复验。
+        first_payload = json.loads(first)
+        message = (
+            f"request-auth-v1\nPOST\n/v1/audit-anchors\n"
+            f"{first_payload['bodyDigest']}\n{first_payload['requestTimeMs']}\n"
+            f"{first_payload['nonce']}\n{first_payload['keyVersion']}\n"
+            f"{self.auditor_id}"
+        ).encode("utf-8")
+        self.assertTrue(
+            ed25519_verify(
+                bytes.fromhex(ARBITRATOR_PUBLIC),
+                message,
+                bytes.fromhex(first_payload["authSignature"]),
+            )
+        )
+
+
 class AuditorCliTests(unittest.TestCase):
     # --auditor 启动参数：格式非法退出码 2；合法或省略时服务照常运行。
 
@@ -12527,6 +13322,61 @@ class AuditStorageMigrationTests(unittest.TestCase):
                 ).fetchone()[0],
                 0,
             )
+        finally:
+            connection.close()
+
+    def test_old_database_gains_anchor_storage_without_backfill(self) -> None:
+        from sla_network.database import connect as database_connect
+
+        connection = database_connect(self.database_path)
+        try:
+            # 既有比较链记录原样保留；模拟旧库：移除锚点表。
+            connection.execute(
+                "INSERT INTO audit_comparisons"
+                "(comparison_seq, from_checkpoint_seq, to_checkpoint_seq,"
+                " digest, created_by, created_at_ms, result_json, response_json)"
+                " VALUES (1, 1, 2, ?, 'auditor-legacy', 0, '{}', '{}')",
+                ("ab" * 32,),
+            )
+            connection.execute(
+                "INSERT INTO audit_comparison_chain"
+                "(comparison_seq, response_digest, previous_chain_digest,"
+                " chain_digest) VALUES (1, ?, ?, ?)",
+                ("cd" * 32, "0" * 64, "ef" * 32),
+            )
+            connection.execute("DROP TABLE audit_anchors")
+            connection.execute("DROP TABLE audit_anchor_idempotency_records")
+            connection.commit()
+        finally:
+            connection.close()
+
+        connection = database_connect(self.database_path)
+        try:
+            # 比较链不改动，锚点存储存在且为空：不补造任何历史签名。
+            chain = connection.execute(
+                "SELECT comparison_seq, chain_digest FROM audit_comparison_chain"
+            ).fetchone()
+            self.assertEqual(tuple(chain), (1, "ef" * 32))
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) AS c FROM audit_anchors"
+                ).fetchone()["c"],
+                0,
+            )
+            connection.execute(
+                "INSERT INTO audit_anchors"
+                "(anchor_seq, comparison_seq, chain_digest, auditor_machine_id,"
+                " public_key, key_version, request_time_ms, nonce, body_digest,"
+                " auth_signature, created_at_ms, response_json)"
+                " VALUES (1, 1, ?, 'auditor-legacy', ?, 1, 0, 'nonce-legacy',"
+                " ?, ?, 0, '{}')",
+                ("ef" * 32, "aa" * 32, "bb" * 32, "cc" * 64),
+            )
+            row = connection.execute(
+                "SELECT anchor_seq, comparison_seq, key_version FROM audit_anchors"
+            ).fetchone()
+            self.assertEqual(tuple(row), (1, 1, 1))
+            connection.commit()
         finally:
             connection.close()
 
