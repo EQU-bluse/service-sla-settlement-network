@@ -12229,6 +12229,192 @@ class AuditComparisonTests(_EvidenceScenario, unittest.TestCase):
             )
             self.assertEqual(status, 404)
 
+    # ---- 超大端点序号：格式合法、按不存在处理 ----
+
+    def test_oversized_endpoint_seqs_treated_as_not_found(self) -> None:
+        self.create_checkpoints("cmp-big-cp1", "cmp-big-cp2")
+        huge = 10**30
+        status, body = self.post_comparison(1, huge, "cmp-big-to")
+        self.assertEqual(status, 404, body)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+        status, _ = self.post_comparison(huge, huge + 1, "cmp-big-both")
+        self.assertEqual(status, 404)
+        # 超范围且逆序：缺失判定先于顺序，仍为 404 而非 409。
+        status, _ = self.post_comparison(huge, 1, "cmp-big-rev")
+        self.assertEqual(status, 404)
+        status, _ = self.post_comparison(2, huge, "cmp-big-rev2")
+        self.assertEqual(status, 404)
+
+    def test_oversized_request_failure_does_not_consume_nonce(self) -> None:
+        self.create_checkpoints("cmp-bign-cp1", "cmp-bign-cp2")
+        huge = 10**30
+        nonce = f"nonce-big-{time.time_ns()}"
+        status, _ = self.post_comparison(1, huge, "cmp-bign-fail", nonce=nonce)
+        self.assertEqual(status, 404)
+        # 失败不消费随机数：同随机数随后成功。
+        status, body = self.post_comparison(1, 2, "cmp-bign-ok", nonce=nonce)
+        self.assertEqual(status, 201, body)
+
+    # ---- 比较链 GET /v1/audit-chain ----
+
+    def get_chain(self, path: str = "/v1/audit-chain", **kwargs: object):
+        return self.get_comparison(path, **kwargs)  # type: ignore[arg-type]
+
+    def test_chain_empty_history(self) -> None:
+        status, body = self.get_chain()
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertEqual(list(payload), ["entries", "nextCursor", "head"])
+        self.assertEqual(payload["entries"], [])
+        self.assertIsNone(payload["nextCursor"])
+        self.assertIsNone(payload["head"])
+        self.assertFalse(body.endswith(b"\n"))
+
+    def test_chain_entries_digests_and_head(self) -> None:
+        self.create_checkpoints("cmp-chain-cp1", "cmp-chain-cp2", "cmp-chain-cp3")
+        status, first = self.post_comparison(1, 2, "cmp-chain-1")
+        self.assertEqual(status, 201, first)
+        status, second = self.post_comparison(2, 3, "cmp-chain-2")
+        self.assertEqual(status, 201, second)
+        status, body = self.get_chain()
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertEqual(list(payload), ["entries", "nextCursor", "head"])
+        entries = payload["entries"]
+        self.assertEqual([e["comparisonSeq"] for e in entries], [1, 2])
+        self.assertEqual(
+            [list(e) for e in entries],
+            [
+                ["comparisonSeq", "responseDigest", "previousChainDigest",
+                 "chainDigest"],
+                ["comparisonSeq", "responseDigest", "previousChainDigest",
+                 "chainDigest"],
+            ],
+        )
+        zeros = "0" * 64
+        rd1 = hashlib.sha256(first).hexdigest()
+        rd2 = hashlib.sha256(second).hexdigest()
+        cd1 = hashlib.sha256(
+            "\n".join(("audit-chain-v1", "1", rd1, zeros)).encode("utf-8")
+        ).hexdigest()
+        cd2 = hashlib.sha256(
+            "\n".join(("audit-chain-v1", "2", rd2, cd1)).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(entries[0]["responseDigest"], rd1)
+        self.assertEqual(entries[0]["previousChainDigest"], zeros)
+        self.assertEqual(entries[0]["chainDigest"], cd1)
+        self.assertEqual(entries[1]["responseDigest"], rd2)
+        self.assertEqual(entries[1]["previousChainDigest"], cd1)
+        self.assertEqual(entries[1]["chainDigest"], cd2)
+        self.assertEqual(payload["head"], {"comparisonSeq": 2, "chainDigest": cd2})
+        self.assertIsNone(payload["nextCursor"])
+
+    def test_chain_paging_and_stable_cut(self) -> None:
+        self.create_checkpoints("cmp-chp-cp1", "cmp-chp-cp2", "cmp-chp-cp3")
+        self.post_comparison(1, 2, "cmp-chp-1")
+        self.post_comparison(2, 3, "cmp-chp-2")
+        status, body = self.get_chain("/v1/audit-chain?limit=1")
+        self.assertEqual(status, 200, body)
+        first_page = json.loads(body)
+        self.assertEqual(
+            [e["comparisonSeq"] for e in first_page["entries"]], [1]
+        )
+        self.assertEqual(first_page["nextCursor"], "2:1")
+        self.assertEqual(first_page["head"]["comparisonSeq"], 2)
+        # 旧游标携带 cut=2：此后新增比较不进入续页，head 仍停在 cut 末项。
+        self.post_comparison(1, 2, "cmp-chp-3")
+        status, body = self.get_chain(
+            f"/v1/audit-chain?limit=1&cursor={first_page['nextCursor']}"
+        )
+        self.assertEqual(status, 200, body)
+        second_page = json.loads(body)
+        self.assertEqual(
+            [e["comparisonSeq"] for e in second_page["entries"]], [2]
+        )
+        self.assertIsNone(second_page["nextCursor"])
+        self.assertEqual(second_page["head"]["comparisonSeq"], 2)
+
+    def test_chain_invalid_params_and_cursors(self) -> None:
+        self.create_checkpoints("cmp-chb-cp1", "cmp-chb-cp2")
+        self.post_comparison(1, 2, "cmp-chb-1")
+        for query in (
+            "limit=0",
+            "limit=101",
+            "limit=x",
+            "foo=1",
+            "cursor=1",
+            "cursor=x:1",
+            "limit=1&limit=2",
+            "cursor=99:1",
+            "cursor=1:5",
+        ):
+            status, _ = self.get_chain(f"/v1/audit-chain?{query}")
+            self.assertEqual(status, 400, query)
+            # 参数结构非法时不消费随机数：同一请求再打一次仍为 400。
+            status, _ = self.get_chain(f"/v1/audit-chain?{query}")
+            self.assertEqual(status, 400, query)
+
+    def test_chain_requires_auditor_and_auth_structure(self) -> None:
+        status, _ = self.get_chain(
+            seed=PUBLIC_KEY_SEED_B, actor=self.consumer_id
+        )
+        self.assertEqual(status, 403)
+        status, _ = self.get_chain(omit_auth=True)
+        self.assertEqual(status, 400)
+        request = Request(self.url("/v1/audit-chain"), data=b"", method="GET")
+        request.add_header("SLA-Delegation", "d;0;1;n;s")
+        try:
+            with urlopen(request, timeout=5) as response:
+                status = response.status
+        except HTTPError as error:
+            status = error.code
+        self.assertEqual(status, 400)
+
+    def test_chain_nonce_consumed_only_on_success(self) -> None:
+        self.create_checkpoints("cmp-chn-cp1", "cmp-chn-cp2")
+        self.post_comparison(1, 2, "cmp-chn-1")
+        nonce = f"nonce-chain-{time.time_ns()}"
+        status, _ = self.get_chain(nonce=nonce)
+        self.assertEqual(status, 200)
+        status, body = self.get_chain(nonce=nonce)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "replay_detected"})
+        failed_nonce = f"nonce-chain-fail-{time.time_ns()}"
+        for _ in range(2):
+            status, _ = self.get_chain(
+                "/v1/audit-chain?cursor=99:1", nonce=failed_nonce
+            )
+            self.assertEqual(status, 400)
+
+    def test_chain_backfilled_after_restart(self) -> None:
+        self.create_checkpoints("cmp-chm-cp1", "cmp-chm-cp2", "cmp-chm-cp3")
+        status, first = self.post_comparison(1, 2, "cmp-chm-1")
+        self.assertEqual(status, 201)
+        status, second = self.post_comparison(2, 3, "cmp-chm-2")
+        self.assertEqual(status, 201)
+        self.restart()
+        status, body = self.get_chain()
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertEqual([e["comparisonSeq"] for e in payload["entries"]], [1, 2])
+        rd1 = hashlib.sha256(first).hexdigest()
+        rd2 = hashlib.sha256(second).hexdigest()
+        cd1 = hashlib.sha256(
+            "\n".join(("audit-chain-v1", "1", rd1, "0" * 64)).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(payload["entries"][0]["responseDigest"], rd1)
+        self.assertEqual(payload["entries"][0]["previousChainDigest"], "0" * 64)
+        self.assertEqual(payload["entries"][0]["chainDigest"], cd1)
+        self.assertEqual(payload["entries"][1]["responseDigest"], rd2)
+        self.assertEqual(payload["entries"][1]["previousChainDigest"], cd1)
+        self.assertEqual(
+            payload["head"]["chainDigest"], payload["entries"][1]["chainDigest"]
+        )
+        # 补链不改旧响应：单笔与集合读取仍返回原字节。
+        status, reread = self.get_comparison("/v1/audit-comparisons/1")
+        self.assertEqual(status, 200)
+        self.assertEqual(reread, first)
+
 
 class AuditorCliTests(unittest.TestCase):
     # --auditor 启动参数：格式非法退出码 2；合法或省略时服务照常运行。
