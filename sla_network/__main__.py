@@ -26,7 +26,7 @@ def main() -> None:
         action="append",
         default=[],
         metavar="MACHINE_ID",
-        help="machine authorized to create and read audit checkpoints (repeatable)",
+        help="machine authorized to create and read audit checkpoints and comparisons (repeatable)",
     )
     args = parser.parse_args()
     for arbitrator in args.arbitrator:

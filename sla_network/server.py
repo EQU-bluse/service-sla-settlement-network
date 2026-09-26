@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import sqlite3
+from collections import Counter
 from collections.abc import Iterable
 from contextlib import closing
 from datetime import UTC, datetime
@@ -58,6 +59,7 @@ DISPUTE_ARBITRATIONS_PATH_PATTERN = re.compile(
 DISPUTE_RESOLUTION_PATH_PATTERN = re.compile(r"/v1/disputes/([^/]+)/resolution")
 EVIDENCE_PROOFS_PATH_PATTERN = re.compile(r"/v1/evidence/([^/]+)/proofs")
 AUDIT_CHECKPOINT_ITEM_PATH_PATTERN = re.compile(r"/v1/audit-checkpoints/([^/]+)")
+AUDIT_COMPARISON_ITEM_PATH_PATTERN = re.compile(r"/v1/audit-comparisons/([^/]+)")
 CAPABILITY_FIELDS = {"expectedVersion", "name", "protocol", "region", "unit", "capacity"}
 SLA_TEMPLATE_FIELDS = {
     "id",
@@ -84,6 +86,7 @@ ADJUDICATION_PROPOSAL_FIELDS = {"actorId", "snapshotSeq", "decision", "reasonDig
 ESCALATION_FIELDS = {"actorId"}
 ARBITRATION_FIELDS = {"decision"}
 EVIDENCE_PROOF_FIELDS = {"evidenceSeq", "actorId", "signature"}
+AUDIT_COMPARISON_FIELDS = {"fromCheckpointSeq", "toCheckpointSeq"}
 KEY_ROTATION_FIELDS = {
     "expectedVersion",
     "publicKey",
@@ -111,6 +114,7 @@ MACHINE_DELEGATIONS_QUERY_PARAMS = {"limit", "cursor"}
 DELEGATION_EVENTS_QUERY_PARAMS = {"limit", "cursor"}
 DELEGATION_CONSUMPTIONS_QUERY_PARAMS = {"limit", "cursor"}
 AUDIT_CHECKPOINTS_QUERY_PARAMS = {"limit", "cursor"}
+AUDIT_COMPARISONS_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTE_SNAPSHOT_STATES = {"open", "released", "refunded", "escalated"}
 ESCALATION_DELAY_MS = 86_400_000
 TELEMETRY_TIME_MAX = 2147483648000
@@ -344,6 +348,17 @@ class Handler(BaseHTTPRequestHandler):
             return
         if target.path == "/v1/audit-checkpoints":
             self._get_audit_checkpoints(target.query)
+            return
+        comparison_item_match = AUDIT_COMPARISON_ITEM_PATH_PATTERN.fullmatch(
+            target.path
+        )
+        if comparison_item_match is not None:
+            self._get_audit_comparison(
+                comparison_item_match.group(1), target.query
+            )
+            return
+        if target.path == "/v1/audit-comparisons":
+            self._get_audit_comparisons(target.query)
             return
         sla_match = SLA_PATH_PATTERN.fullmatch(target.path)
         if sla_match is not None:
@@ -1645,6 +1660,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if urlsplit(self.path).path == "/v1/audit-checkpoints":
             self._create_audit_checkpoint()
+            return
+        if urlsplit(self.path).path == "/v1/audit-comparisons":
+            self._create_audit_comparison()
             return
         delegation_revocation_match = DELEGATION_PATH_PATTERN.fullmatch(
             urlsplit(self.path).path
@@ -6924,6 +6942,394 @@ class Handler(BaseHTTPRequestHandler):
                         "SELECT response_json FROM audit_checkpoints"
                         " WHERE checkpoint_seq = ?",
                         (checkpoint_seq,),
+                    ).fetchone()
+                if record is None:
+                    database.execute("ROLLBACK")
+                    self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                    return
+                payload = json.loads(record["response_json"])
+                # 仅成功读取才在同一事务消费随机数。
+                self._consume_request_nonce(database, auth)
+                database.execute("COMMIT")
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+        self._json(HTTPStatus.OK, payload)
+
+    def _create_audit_comparison(self) -> None:
+        idempotency_key = self.headers.get("Idempotency-Key")
+        if (
+            idempotency_key is None
+            or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None
+        ):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 比较创建拒绝查询参数：参数校验先于体校验与认证结构。
+        if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 正文恰含 fromCheckpointSeq,toCheckpointSeq（非布尔正整数，键不得重复）。
+        raw_body = self._read_raw_body()
+        fields = (
+            None
+            if raw_body is None
+            else self._read_audit_comparison_object(raw_body)
+        )
+        if fields is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 仅接受单一 SLA-Auth：代理头、缺失、重复或结构非法均为非法请求。
+        if self.headers.get_all(SLA_DELEGATION_HEADER):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        auth = self._parse_sla_auth()
+        if auth is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        body_digest = hashlib.sha256(raw_body).hexdigest()
+        status, payload = self._apply_audit_comparison(
+            fields, auth, body_digest, idempotency_key
+        )
+        self._json(status, payload)
+
+    def _read_audit_comparison_object(self, body: bytes) -> dict[str, Any] | None:
+        parsed = self._read_json_object(body)
+        if parsed is None or set(parsed) != AUDIT_COMPARISON_FIELDS:
+            return None
+        from_seq = parsed["fromCheckpointSeq"]
+        to_seq = parsed["toCheckpointSeq"]
+        # 正整数：非布尔、整类型且 >= 1（INT64 上界与路径序号一致）。
+        if not _bounded_int(from_seq, 1, INT64_MAX):
+            return None
+        if not _bounded_int(to_seq, 1, INT64_MAX):
+            return None
+        return parsed
+
+    @staticmethod
+    def _checkpoint_public_document(payload: dict[str, Any]) -> dict[str, Any]:
+        # 比较仅使用检查点对象的公开字段；逐项字段名与键序沿 POST 检查点。
+        return {
+            "checkpointSeq": payload["checkpointSeq"],
+            "entrySeqBound": payload["entrySeqBound"],
+            "digest": payload["digest"],
+            "createdBy": payload["createdBy"],
+            "createdAt": payload["createdAt"],
+            "consistent": payload["consistent"],
+            "accounts": payload["accounts"],
+            "disputes": payload["disputes"],
+            "escalations": payload["escalations"],
+            "arbitrations": payload["arbitrations"],
+            "clearing": payload["clearing"],
+            "differences": payload["differences"],
+        }
+
+    @staticmethod
+    def _multiset_difference(
+        minuend: list[Any], subtrahend: list[Any]
+    ) -> list[Any]:
+        # 多重集合差：逐项相等匹配并按出现次数扣减，重复项保留且不合并不去重。
+        # 差异项为 JSON 对象（不可哈希），以规范化紧凑 JSON（键排序）作为相等键：
+        # 对象按键名无关、数组按顺序、数字/布尔/null 按语义比较。
+        def canonical(item: Any) -> str:
+            return json.dumps(item, sort_keys=True, separators=(",", ":"),
+                              ensure_ascii=False)
+
+        remaining: Counter = Counter(canonical(item) for item in subtrahend)
+        result: list[Any] = []
+        for item in minuend:
+            key = canonical(item)
+            if remaining[key] > 0:
+                remaining[key] -= 1
+            else:
+                result.append(item)
+        return result
+
+    def _apply_audit_comparison(
+        self,
+        fields: dict[str, Any],
+        auth: SlaAuth,
+        body_digest: str,
+        idempotency_key: str,
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        from_seq = fields["fromCheckpointSeq"]
+        to_seq = fields["toCheckpointSeq"]
+        request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+        standard_path = "/v1/audit-comparisons"
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                # 幂等判定先于授权与认证：同键更换正文或认证五段均冲突。
+                record = database.execute(
+                    "SELECT request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature"
+                    " FROM audit_comparison_idempotency_records WHERE key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    if (
+                        record["request_json"] == request_json
+                        and self._auth_record_matches(record, auth)
+                    ):
+                        return HTTPStatus(record["status"]), json.loads(
+                            record["response_json"]
+                        )
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                # 认证机器须为启动时配置的审计机器；未获审计授权一律 403。
+                if auth.machine_id not in self.server.auditors:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
+                try:
+                    self._verify_request_principal(
+                        database, auth, standard_path, body_digest
+                    )
+                    self._check_request_nonce(database, auth)
+                except AuthRejected as rejected:
+                    database.execute("ROLLBACK")
+                    return rejected.status, {"error": rejected.error}
+                # 仅读取两端冻结内容：先查存在性（任一缺失为 404），再判端点顺序。
+                from_record = database.execute(
+                    "SELECT response_json FROM audit_checkpoints"
+                    " WHERE checkpoint_seq = ?",
+                    (from_seq,),
+                ).fetchone()
+                to_record = database.execute(
+                    "SELECT response_json FROM audit_checkpoints"
+                    " WHERE checkpoint_seq = ?",
+                    (to_seq,),
+                ).fetchone()
+                if from_record is None or to_record is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                if from_seq >= to_seq:
+                    # 端点相同或逆序均冲突，不重新检查或修改任何业务数据。
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                from_payload = json.loads(from_record["response_json"])
+                to_payload = json.loads(to_record["response_json"])
+                from_document = self._checkpoint_public_document(from_payload)
+                to_document = self._checkpoint_public_document(to_payload)
+                # 多重集合运算：added 保持终点顺序、resolved 保持起点顺序、
+                # persistent 保持起点匹配顺序；重复项按出现次数匹配，不合并。
+                added = self._multiset_difference(
+                    to_document["differences"], from_document["differences"]
+                )
+                resolved = self._multiset_difference(
+                    from_document["differences"], to_document["differences"]
+                )
+                persistent = self._multiset_difference(
+                    from_document["differences"], resolved
+                )
+                result = {
+                    "fromCheckpointSeq": from_seq,
+                    "toCheckpointSeq": to_seq,
+                    "fromCheckpointDigest": from_document["digest"],
+                    "toCheckpointDigest": to_document["digest"],
+                    "added": added,
+                    "resolved": resolved,
+                    "persistent": persistent,
+                }
+                # 摘要对象（结果正文）依次为两端序号、原摘要及三组数组；
+                # 紧凑 UTF-8 JSON、无尾换行，其 SHA-256 小写十六进制为结果摘要。
+                result_bytes = json.dumps(
+                    result, ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
+                digest = hashlib.sha256(result_bytes).hexdigest()
+                # 全库唯一持久递增比较序号：取写锁后取最大序号 + 1（空表 1）。
+                comparison_seq = database.execute(
+                    "SELECT COALESCE(MAX(comparison_seq), 0) + 1 AS next_seq"
+                    " FROM audit_comparisons"
+                ).fetchone()["next_seq"]
+                created_at_ms = int(datetime.now(UTC).timestamp() * 1000)
+                # 完整响应：全局比较序号在前，结果正文保持连续，末尾追加结果摘要、
+                # 创建身份与毫秒时间。
+                payload = {
+                    "comparisonSeq": comparison_seq,
+                    "fromCheckpointSeq": from_seq,
+                    "toCheckpointSeq": to_seq,
+                    "fromCheckpointDigest": result["fromCheckpointDigest"],
+                    "toCheckpointDigest": result["toCheckpointDigest"],
+                    "added": added,
+                    "resolved": resolved,
+                    "persistent": persistent,
+                    "digest": digest,
+                    "createdBy": auth.machine_id,
+                    "createdAt": created_at_ms,
+                }
+                response_json = json.dumps(payload, separators=(",", ":"))
+                database.execute(
+                    "INSERT INTO audit_comparisons"
+                    "(comparison_seq, from_checkpoint_seq, to_checkpoint_seq,"
+                    " digest, created_by, created_at_ms, result_json,"
+                    " response_json)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        comparison_seq,
+                        from_seq,
+                        to_seq,
+                        digest,
+                        auth.machine_id,
+                        created_at_ms,
+                        result_bytes.decode("utf-8"),
+                        response_json,
+                    ),
+                )
+                database.execute(
+                    "INSERT INTO audit_comparison_idempotency_records"
+                    "(key, request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        request_json,
+                        int(HTTPStatus.CREATED),
+                        response_json,
+                        auth.machine_id,
+                        auth.key_version,
+                        auth.request_time_ms,
+                        auth.nonce,
+                        auth.signature,
+                    ),
+                )
+                # 比较、完整结果、幂等结果与随机数同一事务原子持久化；
+                # 失败、重放或并发败者不消费随机数、不推进比较序号。
+                self._consume_request_nonce(database, auth)
+                database.execute("COMMIT")
+                return HTTPStatus.CREATED, payload
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+
+    def _audit_comparison_collection_page(
+        self, database: Any, cut: int, last_seq: int, limit: int
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        rows = database.execute(
+            "SELECT comparison_seq, response_json FROM audit_comparisons"
+            " WHERE comparison_seq <= ? AND comparison_seq > ?"
+            " ORDER BY comparison_seq ASC LIMIT ?",
+            (cut, last_seq, limit + 1),
+        ).fetchall()
+        has_next = len(rows) > limit
+        page = rows[:limit]
+        comparisons = [json.loads(row["response_json"]) for row in page]
+        next_cursor = f"{cut}:{page[-1]['comparison_seq']}" if has_next else None
+        return comparisons, next_cursor
+
+    def _get_audit_comparisons(self, query: str) -> None:
+        # 集合分页沿用检查点集合的 limit 与 cursor=cut:lastSeq。
+        parsed = self._parse_evaluation_query(query, AUDIT_COMPARISONS_QUERY_PARAMS)
+        if parsed is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        limit, cursor = parsed
+        if self.headers.get_all(SLA_DELEGATION_HEADER):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        auth = self._parse_sla_auth()
+        if auth is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        body_digest = hashlib.sha256(b"").hexdigest()
+        standard_path = "/v1/audit-comparisons"
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                if auth.machine_id not in self.server.auditors:
+                    database.execute("ROLLBACK")
+                    self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                    return
+                try:
+                    self._verify_request_principal(
+                        database, auth, standard_path, body_digest
+                    )
+                    self._check_request_nonce(database, auth)
+                except AuthRejected as rejected:
+                    database.execute("ROLLBACK")
+                    self._json(rejected.status, {"error": rejected.error})
+                    return
+                current_max = database.execute(
+                    "SELECT COALESCE(MAX(comparison_seq), 0) AS current_max"
+                    " FROM audit_comparisons"
+                ).fetchone()["current_max"]
+                if cursor is None:
+                    cut, last_seq = current_max, 0
+                else:
+                    cut, last_seq = cursor
+                    if cut > current_max:
+                        database.execute("ROLLBACK")
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                        )
+                        return
+                    anchor = database.execute(
+                        "SELECT 1 FROM audit_comparisons"
+                        " WHERE comparison_seq = ? AND comparison_seq <= ?",
+                        (last_seq, cut),
+                    ).fetchone()
+                    if anchor is None:
+                        database.execute("ROLLBACK")
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                        )
+                        return
+                comparisons, next_cursor = self._audit_comparison_collection_page(
+                    database, cut, last_seq, limit
+                )
+                # 仅成功读取才消费随机数。
+                self._consume_request_nonce(database, auth)
+                database.execute("COMMIT")
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+        self._json(
+            HTTPStatus.OK,
+            {"comparisons": comparisons, "nextCursor": next_cursor},
+        )
+
+    def _get_audit_comparison(self, seq_text: str, query: str) -> None:
+        # 单笔读取不接受任何查询参数：参数校验先于认证结构。
+        if parse_qsl(query, keep_blank_values=True):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 序号须为无前导零十进制正整数；非法按不存在处理。
+        comparison_seq: int | None = None
+        if DECIMAL_PATTERN.fullmatch(seq_text) is not None:
+            value = int(seq_text)
+            if 1 <= value <= INT64_MAX:
+                comparison_seq = value
+        if self.headers.get_all(SLA_DELEGATION_HEADER):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        auth = self._parse_sla_auth()
+        if auth is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        body_digest = hashlib.sha256(b"").hexdigest()
+        standard_path = f"/v1/audit-comparisons/{seq_text}"
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                if auth.machine_id not in self.server.auditors:
+                    database.execute("ROLLBACK")
+                    self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                    return
+                try:
+                    self._verify_request_principal(
+                        database, auth, standard_path, body_digest
+                    )
+                    self._check_request_nonce(database, auth)
+                except AuthRejected as rejected:
+                    database.execute("ROLLBACK")
+                    self._json(rejected.status, {"error": rejected.error})
+                    return
+                record = None
+                if comparison_seq is not None:
+                    record = database.execute(
+                        "SELECT response_json FROM audit_comparisons"
+                        " WHERE comparison_seq = ?",
+                        (comparison_seq,),
                     ).fetchone()
                 if record is None:
                     database.execute("ROLLBACK")

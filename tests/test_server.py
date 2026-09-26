@@ -11674,6 +11674,562 @@ class AuditCheckpointTests(_EvidenceScenario, unittest.TestCase):
         self.assertEqual(payload["differences"], [])
 
 
+class AuditComparisonTests(_EvidenceScenario, unittest.TestCase):
+    # 检查点比较：审计机器对两个已保存且先后有序的检查点做多重集合差异比较；
+    # added/resolved/persistent 保持各自顺序且重复项不合并，结果可验证摘要。
+    AUDITOR_SEED = ARBITRATOR_SEED
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.auditor_id = machine_id(ARBITRATOR_PUBLIC)
+        self.server.auditors = frozenset({self.auditor_id})
+        status, _ = self.post_json(
+            "/v1/machines", {"publicKey": ARBITRATOR_PUBLIC}, "register-auditor-cmp"
+        )
+        self.assertEqual(status, 201)
+
+    def restart(self) -> None:
+        super().restart()
+        self.server.auditors = frozenset({self.auditor_id})
+
+    def post_comparison_raw(
+        self,
+        path: str,
+        body: bytes,
+        key: str | None,
+        *,
+        seed: bytes | None = None,
+        actor: str | None = None,
+        nonce: str | None = None,
+        auth_header: str | None = None,
+        delegation: str | None = None,
+        omit_auth: bool = False,
+    ) -> tuple[int, bytes]:
+        request = Request(self.url(path), data=body, method="POST")
+        if key is not None:
+            request.add_header("Idempotency-Key", key)
+        if delegation is not None:
+            request.add_header("SLA-Delegation", delegation)
+        elif not omit_auth:
+            request.add_header(
+                "SLA-Auth",
+                auth_header
+                if auth_header is not None
+                else make_sla_auth(
+                    self.server,
+                    key,
+                    seed if seed is not None else self.AUDITOR_SEED,
+                    actor if actor is not None else self.auditor_id,
+                    "POST",
+                    urlsplit(path).path,
+                    body,
+                    1,
+                    nonce=nonce,
+                ),
+            )
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def post_comparison(
+        self,
+        from_seq: int,
+        to_seq: int,
+        key: str = "cmp-1",
+        **kwargs: object,
+    ) -> tuple[int, bytes]:
+        body = json.dumps(
+            {"fromCheckpointSeq": from_seq, "toCheckpointSeq": to_seq}
+        ).encode()
+        return self.post_comparison_raw(
+            "/v1/audit-comparisons", body, key, **kwargs  # type: ignore[arg-type]
+        )
+
+    def get_comparison(
+        self,
+        path: str,
+        *,
+        seed: bytes | None = None,
+        actor: str | None = None,
+        nonce: str | None = None,
+        auth_header: str | None = None,
+        omit_auth: bool = False,
+    ) -> tuple[int, bytes]:
+        request = Request(self.url(path), data=b"", method="GET")
+        if not omit_auth and auth_header is None:
+            nonce = nonce or f"nonce-cmp-get-{time.time_ns()}"
+            auth_header = make_sla_auth(
+                self.server,
+                None,
+                seed if seed is not None else self.AUDITOR_SEED,
+                actor if actor is not None else self.auditor_id,
+                "GET",
+                urlsplit(path).path,
+                b"",
+                1,
+                nonce=nonce,
+            )
+        if not omit_auth:
+            request.add_header("SLA-Auth", auth_header)
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def create_checkpoints(self, *keys: str) -> list[dict]:
+        checkpoints = []
+        for index, key in enumerate(keys, start=1):
+            status, body = self.post_comparison_raw(
+                "/v1/audit-checkpoints", b"{}", key
+            )
+            self.assertEqual(status, 201, body)
+            checkpoints.append(json.loads(body))
+        return checkpoints
+
+    def tamper_consumer_balance(self, value: int) -> None:
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            connection.execute(
+                "UPDATE ledger_accounts SET balance_micros = ?"
+                " WHERE account_id = ?",
+                (value, self.consumer_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def insert_checkpoint(self, payload: dict) -> None:
+        # 直接写入检查点记录以构造受控差异内容（比较只读取冻结内容）。
+        response_json = json.dumps(payload, separators=(",", ":"))
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            connection.execute(
+                "INSERT INTO audit_checkpoints"
+                "(checkpoint_seq, entry_seq_bound, digest, created_by,"
+                " created_at_ms, document_json, response_json)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    payload["checkpointSeq"],
+                    payload["entrySeqBound"],
+                    payload["digest"],
+                    self.auditor_id,
+                    payload["createdAt"],
+                    response_json,
+                    response_json,
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def difference(
+        self, account: str, difference_type: str, entry: object, reference: object
+    ) -> dict:
+        return {
+            "accountId": account,
+            "type": difference_type,
+            "entrySeq": entry,
+            "referenceSeq": reference,
+            "expected": 1,
+            "actual": 2,
+        }
+
+    def checkpoint_payload(self, seq: int, digest: str, differences: list) -> dict:
+        return {
+            "checkpointSeq": seq,
+            "entrySeqBound": seq,
+            "digest": digest,
+            "createdBy": self.auditor_id,
+            "createdAt": 1000 + seq,
+            "consistent": not differences,
+            "accounts": [],
+            "disputes": [],
+            "escalations": [],
+            "arbitrations": [],
+            "clearing": {
+                "accountId": "external:clearing",
+                "storedBalance": 0,
+                "depositTotal": 0,
+                "escrowLiability": 0,
+                "expectedBalance": 0,
+            },
+            "differences": differences,
+        }
+
+    # ---- 创建成功路径 ----
+
+    def test_compare_two_consistent_checkpoints(self) -> None:
+        cps = self.create_checkpoints("cmp-cp-1", "cmp-cp-2")
+        status, body = self.post_comparison(1, 2, "cmp-ok-1")
+        self.assertEqual(status, 201, body)
+        payload = json.loads(body)
+        self.assertEqual(
+            list(payload),
+            [
+                "comparisonSeq",
+                "fromCheckpointSeq",
+                "toCheckpointSeq",
+                "fromCheckpointDigest",
+                "toCheckpointDigest",
+                "added",
+                "resolved",
+                "persistent",
+                "digest",
+                "createdBy",
+                "createdAt",
+            ],
+        )
+        self.assertEqual(payload["comparisonSeq"], 1)
+        self.assertEqual(payload["fromCheckpointSeq"], 1)
+        self.assertEqual(payload["toCheckpointSeq"], 2)
+        self.assertEqual(payload["fromCheckpointDigest"], cps[0]["digest"])
+        self.assertEqual(payload["toCheckpointDigest"], cps[1]["digest"])
+        self.assertEqual(payload["added"], [])
+        self.assertEqual(payload["resolved"], [])
+        self.assertEqual(payload["persistent"], [])
+        self.assertEqual(payload["createdBy"], self.auditor_id)
+        self.assertIsInstance(payload["createdAt"], int)
+        self.assertGreaterEqual(payload["createdAt"], 0)
+        self.assertFalse(body.endswith(b"\n"))
+        result_object = {
+            "fromCheckpointSeq": 1,
+            "toCheckpointSeq": 2,
+            "fromCheckpointDigest": cps[0]["digest"],
+            "toCheckpointDigest": cps[1]["digest"],
+            "added": [],
+            "resolved": [],
+            "persistent": [],
+        }
+        expected_digest = hashlib.sha256(
+            json.dumps(result_object, separators=(",", ":")).encode()
+        ).hexdigest()
+        self.assertEqual(payload["digest"], expected_digest)
+
+    def test_comparison_only_reads_frozen_content(self) -> None:
+        # 起点检查点含差异、终点检查点前已修复：比较按两端冻结内容报告 resolved；
+        # 终点之后再次篡改当前账本不影响比较结果（不重新审计当前状态）。
+        self.create_checkpoints("cmp-frozen-1")
+        self.tamper_consumer_balance(99001)
+        self.create_checkpoints("cmp-frozen-2")
+        self.tamper_consumer_balance(99000)
+        self.create_checkpoints("cmp-frozen-3")
+        # 终点之后重新篡改当前账本：冻结内容不变。
+        self.tamper_consumer_balance(99001)
+        status, body = self.post_comparison(2, 3, "cmp-frozen-4")
+        self.assertEqual(status, 201, body)
+        payload = json.loads(body)
+        self.assertEqual(len(payload["resolved"]), 1)
+        self.assertEqual(payload["resolved"][0]["type"], "balance_mismatch")
+        self.assertEqual(payload["added"], [])
+        self.assertEqual(payload["persistent"], [])
+
+    def test_added_resolved_persistent_multiset_order_and_duplicates(self) -> None:
+        diff_a = self.difference("a", "balance_mismatch", None, None)
+        diff_b = self.difference("b", "step_balance_mismatch", 1, 1)
+        diff_c = self.difference("c", "entry_pair_amount", 2, 2)
+        diff_d = self.difference("d", "clearing_balance_mismatch", None, None)
+        # 起点差异 [A, B, B, C]；终点差异 [B, C, D]（B 出现两次，重复不合并）。
+        self.insert_checkpoint(
+            self.checkpoint_payload(1, "digest-from", [diff_a, diff_b, diff_b, diff_c])
+        )
+        self.insert_checkpoint(
+            self.checkpoint_payload(2, "digest-to", [diff_b, diff_c, diff_d])
+        )
+        status, body = self.post_comparison(1, 2, "cmp-multiset")
+        self.assertEqual(status, 201, body)
+        payload = json.loads(body)
+        # added 保持终点顺序：仅 D。
+        self.assertEqual(
+            [(d["accountId"], d["type"]) for d in payload["added"]],
+            [("d", "clearing_balance_mismatch")],
+        )
+        # resolved 保持起点顺序：A、一个 B（另一个 B 仍保留）。
+        self.assertEqual(
+            [(d["accountId"], d["type"]) for d in payload["resolved"]],
+            [("a", "balance_mismatch"), ("b", "step_balance_mismatch")],
+        )
+        # persistent 保持起点匹配顺序：剩余的 B、C。
+        self.assertEqual(
+            [(d["accountId"], d["type"]) for d in payload["persistent"]],
+            [("b", "step_balance_mismatch"), ("c", "entry_pair_amount")],
+        )
+        self.assertEqual(
+            len(payload["added"]) + len(payload["resolved"]) + len(payload["persistent"]),
+            5,
+        )
+
+    def test_persistent_identical_differences_both_ends(self) -> None:
+        diff = self.difference("a", "balance_mismatch", None, None)
+        self.insert_checkpoint(self.checkpoint_payload(1, "d1", [diff]))
+        self.insert_checkpoint(self.checkpoint_payload(2, "d2", [diff]))
+        status, body = self.post_comparison(1, 2, "cmp-persist")
+        self.assertEqual(status, 201, body)
+        payload = json.loads(body)
+        self.assertEqual(payload["added"], [])
+        self.assertEqual(payload["resolved"], [])
+        self.assertEqual(payload["persistent"], [diff])
+        self.assertEqual(payload["fromCheckpointDigest"], "d1")
+        self.assertEqual(payload["toCheckpointDigest"], "d2")
+
+    # ---- 请求结构校验 ----
+
+    def test_invalid_bodies_are_bad_request(self) -> None:
+        self.create_checkpoints("cmp-inv-cp1", "cmp-inv-cp2")
+        cases = [
+            b"{}",
+            b"[]",
+            b"null",
+            json.dumps({"fromCheckpointSeq": 1}).encode(),
+            json.dumps({"toCheckpointSeq": 2}).encode(),
+            json.dumps({"fromCheckpointSeq": 0, "toCheckpointSeq": 2}).encode(),
+            json.dumps({"fromCheckpointSeq": -1, "toCheckpointSeq": 2}).encode(),
+            json.dumps({"fromCheckpointSeq": "1", "toCheckpointSeq": 2}).encode(),
+            json.dumps({"fromCheckpointSeq": True, "toCheckpointSeq": 2}).encode(),
+            json.dumps({"fromCheckpointSeq": 1.5, "toCheckpointSeq": 2}).encode(),
+            json.dumps(
+                {"fromCheckpointSeq": 1, "toCheckpointSeq": 2, "extra": 3}
+            ).encode(),
+            b'{"fromCheckpointSeq":1,"toCheckpointSeq":2,'
+            b'"fromCheckpointSeq":1}',
+        ]
+        for index, body in enumerate(cases):
+            status, response = self.post_comparison_raw(
+                "/v1/audit-comparisons", body, f"cmp-bad-{index}"
+            )
+            self.assertEqual(status, 400, body)
+            self.assertEqual(json.loads(response), {"error": "invalid_request"})
+
+    def test_query_params_and_auth_structure_rejected(self) -> None:
+        self.create_checkpoints("cmp-struct-cp1", "cmp-struct-cp2")
+        body = json.dumps({"fromCheckpointSeq": 1, "toCheckpointSeq": 2}).encode()
+        status, _ = self.post_comparison_raw(
+            "/v1/audit-comparisons?x=1", body, "cmp-query"
+        )
+        self.assertEqual(status, 400)
+        status, _ = self.post_comparison_raw(
+            "/v1/audit-comparisons", body, "cmp-noauth", omit_auth=True
+        )
+        self.assertEqual(status, 400)
+        status, _ = self.post_comparison_raw(
+            "/v1/audit-comparisons", body, "cmp-deleg", delegation="d;0;1;n;s"
+        )
+        self.assertEqual(status, 400)
+
+    def test_missing_or_invalid_idempotency_key(self) -> None:
+        body = json.dumps({"fromCheckpointSeq": 1, "toCheckpointSeq": 2}).encode()
+        status, _ = self.post_comparison_raw(
+            "/v1/audit-comparisons", body, None
+        )
+        self.assertEqual(status, 400)
+
+    # ---- 幂等、顺序、存在性与权限 ----
+
+    def test_replay_returns_first_bytes_without_advancing_seq(self) -> None:
+        self.create_checkpoints("cmp-rep-cp1", "cmp-rep-cp2")
+        body = json.dumps({"fromCheckpointSeq": 1, "toCheckpointSeq": 2}).encode()
+        status, first = self.post_comparison_raw(
+            "/v1/audit-comparisons", body, "cmp-replay"
+        )
+        self.assertEqual(status, 201)
+        # 同键同请求（认证五段由测试注册表逐字节复用）重放首次响应。
+        status, second = self.post_comparison_raw(
+            "/v1/audit-comparisons", body, "cmp-replay"
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(second, first)
+        # 重放不推进比较序号：异键比较仍为序号 2。
+        status, third = self.post_comparison_raw(
+            "/v1/audit-comparisons", body, "cmp-replay-other"
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(third)["comparisonSeq"], 2)
+
+    def test_same_key_different_endpoints_conflicts(self) -> None:
+        self.create_checkpoints("cmp-ic-cp1", "cmp-ic-cp2", "cmp-ic-cp3")
+        body = json.dumps({"fromCheckpointSeq": 1, "toCheckpointSeq": 2}).encode()
+        status, _ = self.post_comparison_raw(
+            "/v1/audit-comparisons", body, "cmp-idem-conflict"
+        )
+        self.assertEqual(status, 201)
+        other = json.dumps({"fromCheckpointSeq": 2, "toCheckpointSeq": 3}).encode()
+        status, response = self.post_comparison_raw(
+            "/v1/audit-comparisons",
+            other,
+            "cmp-idem-conflict",
+            nonce=f"nonce-conflict-{time.time_ns()}",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(response), {"error": "conflict"})
+
+    def test_same_or_reversed_endpoints_conflict(self) -> None:
+        self.create_checkpoints("cmp-order-cp1", "cmp-order-cp2")
+        status, _ = self.post_comparison(2, 2, "cmp-same")
+        self.assertEqual(status, 409)
+        status, body = self.post_comparison(2, 1, "cmp-reversed")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_missing_checkpoint_is_not_found(self) -> None:
+        self.create_checkpoints("cmp-miss-cp1")
+        status, body = self.post_comparison(1, 99, "cmp-missing-to")
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+        status, _ = self.post_comparison(98, 99, "cmp-missing-both")
+        self.assertEqual(status, 404)
+
+    def test_non_auditor_forbidden(self) -> None:
+        self.create_checkpoints("cmp-fb-cp1", "cmp-fb-cp2")
+        status, _ = self.post_comparison(
+            1,
+            2,
+            "cmp-forbidden",
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+            nonce=f"nonce-fb-{time.time_ns()}",
+        )
+        self.assertEqual(status, 403)
+
+    def test_failure_does_not_consume_nonce_or_advance_seq(self) -> None:
+        self.create_checkpoints("cmp-fail-cp1")
+        nonce = f"nonce-fail-{time.time_ns()}"
+        # 逆序请求失败：不消费随机数。
+        status, _ = self.post_comparison(
+            1, 1, "cmp-fail-rev", nonce=nonce
+        )
+        self.assertEqual(status, 409)
+        # 同随机数用于一次成功请求：未被失败请求消费。
+        cps = self.create_checkpoints("cmp-fail-cp2")
+        status, body = self.post_comparison(
+            1, 2, "cmp-fail-ok", nonce=nonce
+        )
+        self.assertEqual(status, 201, body)
+        self.assertEqual(json.loads(body)["comparisonSeq"], 1)
+
+    def test_replay_survives_restart(self) -> None:
+        self.create_checkpoints("cmp-rs-cp1", "cmp-rs-cp2")
+        body = json.dumps({"fromCheckpointSeq": 1, "toCheckpointSeq": 2}).encode()
+        status, first = self.post_comparison_raw(
+            "/v1/audit-comparisons", body, "cmp-restart"
+        )
+        self.assertEqual(status, 201)
+        self.restart()
+        status, second = self.post_comparison_raw(
+            "/v1/audit-comparisons", body, "cmp-restart"
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(second, first)
+
+    # ---- 集合与单笔读取 ----
+
+    def test_get_collection_returns_full_objects(self) -> None:
+        self.create_checkpoints("cmp-gc-cp1", "cmp-gc-cp2", "cmp-gc-cp3")
+        self.post_comparison(1, 2, "cmp-gc-1")
+        self.post_comparison(2, 3, "cmp-gc-2")
+        status, body = self.get_comparison("/v1/audit-comparisons")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(list(payload), ["comparisons", "nextCursor"])
+        self.assertEqual(payload["nextCursor"], None)
+        self.assertEqual([c["comparisonSeq"] for c in payload["comparisons"]], [1, 2])
+        status, first = self.post_comparison(1, 2, "cmp-gc-1")
+        self.assertEqual(status, 201)
+        self.assertEqual(payload["comparisons"][0], json.loads(first))
+
+    def test_collection_paging_and_stable_cut(self) -> None:
+        self.create_checkpoints("cmp-page-cp1", "cmp-page-cp2", "cmp-page-cp3")
+        self.post_comparison(1, 2, "cmp-page-1")
+        self.post_comparison(2, 3, "cmp-page-2")
+        status, body = self.get_comparison("/v1/audit-comparisons?limit=1")
+        self.assertEqual(status, 200)
+        first_page = json.loads(body)
+        self.assertEqual(len(first_page["comparisons"]), 1)
+        self.assertEqual(first_page["comparisons"][0]["comparisonSeq"], 1)
+        self.assertEqual(first_page["nextCursor"], "2:1")
+        # 旧游标携带 cut=2：此后新增比较不进入续页。
+        self.post_comparison(1, 2, "cmp-page-3")
+        status, body = self.get_comparison(
+            f"/v1/audit-comparisons?limit=1&cursor={first_page['nextCursor']}"
+        )
+        self.assertEqual(status, 200)
+        second_page = json.loads(body)
+        self.assertEqual(
+            [c["comparisonSeq"] for c in second_page["comparisons"]], [2]
+        )
+        self.assertEqual(second_page["nextCursor"], None)
+
+    def test_collection_invalid_params_and_cursors(self) -> None:
+        self.create_checkpoints("cmp-cur-cp1", "cmp-cur-cp2")
+        self.post_comparison(1, 2, "cmp-cur-1")
+        for query in (
+            "limit=0",
+            "limit=101",
+            "limit=x",
+            "foo=1",
+            "cursor=1",
+            "cursor=x:1",
+            "limit=1&limit=2",
+            "cursor=99:1",
+            "cursor=1:5",
+        ):
+            status, _ = self.get_comparison(f"/v1/audit-comparisons?{query}")
+            self.assertEqual(status, 400, query)
+
+    def test_collection_requires_auditor(self) -> None:
+        status, _ = self.get_comparison(
+            "/v1/audit-comparisons",
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+        )
+        self.assertEqual(status, 403)
+        status, _ = self.get_comparison(
+            "/v1/audit-comparisons", omit_auth=True
+        )
+        self.assertEqual(status, 400)
+
+    def test_get_item_returns_full_object(self) -> None:
+        self.create_checkpoints("cmp-gi-cp1", "cmp-gi-cp2")
+        status, first = self.post_comparison(1, 2, "cmp-gi-1")
+        self.assertEqual(status, 201)
+        status, body = self.get_comparison("/v1/audit-comparisons/1")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, first)
+
+    def test_get_item_invalid_missing_and_query(self) -> None:
+        self.create_checkpoints("cmp-gim-cp1", "cmp-gim-cp2")
+        self.post_comparison(1, 2, "cmp-gim-1")
+        for seq_text in ("01", "0", "abc", "999"):
+            status, body = self.get_comparison(
+                f"/v1/audit-comparisons/{seq_text}"
+            )
+            self.assertEqual(status, 404, seq_text)
+            self.assertEqual(json.loads(body), {"error": "not_found"})
+        status, _ = self.get_comparison("/v1/audit-comparisons/1?x=1")
+        self.assertEqual(status, 400)
+
+    def test_get_item_nonce_consumed_only_on_success(self) -> None:
+        self.create_checkpoints("cmp-gn-cp1", "cmp-gn-cp2")
+        self.post_comparison(1, 2, "cmp-gn-1")
+        nonce = f"nonce-cmp-item-{time.time_ns()}"
+        status, _ = self.get_comparison(
+            "/v1/audit-comparisons/1", nonce=nonce
+        )
+        self.assertEqual(status, 200)
+        status, body = self.get_comparison(
+            "/v1/audit-comparisons/1", nonce=nonce
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "replay_detected"})
+        missing_nonce = f"nonce-cmp-missing-{time.time_ns()}"
+        for _ in range(2):
+            status, _ = self.get_comparison(
+                "/v1/audit-comparisons/999", nonce=missing_nonce
+            )
+            self.assertEqual(status, 404)
+
+
 class AuditorCliTests(unittest.TestCase):
     # --auditor 启动参数：格式非法退出码 2；合法或省略时服务照常运行。
 
