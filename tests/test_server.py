@@ -21732,6 +21732,23 @@ class FinalAuditProofWitnessTests(FinalAuditProofChainTests):
         )
         self.assertEqual(status, 404)
         self.assertEqual(json.loads(body), {"error": "not_found"})
+        # 零与负整数为结构合法但目标不存在：404/not_found（非正链位置违约修正）。
+        status, body = self.post_final_witness(0, chain_digest, "fapw-err-zero")
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+        status, body = self.post_final_witness(-1, chain_digest, "fapw-err-neg")
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+        # 布尔与非整数仍为非法请求：400/invalid_request。
+        status, _ = self.post_final_witness(True, chain_digest, "fapw-err-bool")
+        self.assertEqual(status, 400)
+        status, _ = self.request_raw(
+            "/v1/final-audit-proof-witnesses",
+            json.dumps({"proofSeq": "1", "chainDigest": chain_digest}).encode(),
+            "fapw-err-str",
+            "POST",
+        )
+        self.assertEqual(status, 400)
         status, body = self.post_final_witness(1, "a" * 64, "fapw-err-mismatch")
         self.assertEqual(status, 409)
         self.assertEqual(json.loads(body), {"error": "conflict"})
@@ -21994,6 +22011,410 @@ class FinalAuditProofWitnessTests(FinalAuditProofChainTests):
         self.assertEqual(witnesses[0], first_payload)
         self.assertEqual(witnesses[0]["publicKey"], ARBITRATOR_PUBLIC)
         self.assertEqual(witnesses[0]["keyVersion"], 1)
+
+
+class FinalAuditProofVerificationTests(FinalAuditProofWitnessTests):
+    # 终局证明复核一致性报告：对截至某终局证明的终局证明链与链头见证生成
+    # 不可变报告。调用形态、摘要对象、响应字段与分页均沿用证明复核一致性
+    # 报告（proof-check-proof-verifications），仅更换为终局证明数据源。
+    # 辅助方法复用 FinalAuditProofWitnessTests；屏蔽继承来的既有测试。
+    for _inherited in dir(FinalAuditProofWitnessTests):
+        if _inherited.startswith("test_"):
+            locals()[_inherited] = None
+
+    def post_final_verification(
+        self, proof_seq: object, key: str, **kwargs: object
+    ) -> tuple[int, bytes]:
+        return self.request_raw(
+            "/v1/final-audit-proof-verifications",
+            json.dumps({"proofSeq": proof_seq}).encode(),
+            key,
+            "POST",
+            **kwargs,
+        )
+
+    @staticmethod
+    def expected_final_report_digest(payload: dict[str, Any]) -> str:
+        summary = {
+            "proofSeqBound": payload["proofSeqBound"],
+            "witnessSeqBound": payload["witnessSeqBound"],
+            "chainConsistent": payload["chainConsistent"],
+            "fullyCovered": payload["fullyCovered"],
+            "invalidChainNodes": payload["invalidChainNodes"],
+            "invalidWitnesses": payload["invalidWitnesses"],
+            "uncoveredNodes": payload["uncoveredNodes"],
+        }
+        return hashlib.sha256(
+            json.dumps(summary, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def setup_three_final_proofs(self, key: str) -> None:
+        self.setup_two_final_proofs(f"{key}-a")
+        target2 = self.setup_second_target_report(f"{key}-b")
+        status, _ = self.post_final_proof(2, target2, f"{key}-p3")
+        self.assertEqual(status, 201)
+
+    def test_final_verification_clean_and_fully_covered(self) -> None:
+        self.setup_two_final_proofs("fapv-clean")
+        cd1 = self.final_chain_digest_for(1)
+        cd2 = self.final_chain_digest_for(2)
+        self.assertEqual(self.post_final_witness(1, cd1, "fapv-clean-w1")[0], 201)
+        self.assertEqual(self.post_final_witness(2, cd2, "fapv-clean-w2")[0], 201)
+        status, response = self.post_final_verification(2, "fapv-clean-r")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(
+            list(payload),
+            [
+                "verificationSeq",
+                "proofSeqBound",
+                "witnessSeqBound",
+                "digest",
+                "createdBy",
+                "createdAt",
+                "chainConsistent",
+                "fullyCovered",
+                "invalidChainNodes",
+                "invalidWitnesses",
+                "uncoveredNodes",
+            ],
+        )
+        # 独立序号空间：即便证明复核一致性报告已存在，本类报告序号仍自 1 起。
+        self.assertEqual(payload["verificationSeq"], 1)
+        self.assertEqual(payload["proofSeqBound"], 2)
+        self.assertEqual(payload["witnessSeqBound"], 2)
+        self.assertTrue(payload["chainConsistent"])
+        self.assertTrue(payload["fullyCovered"])
+        self.assertEqual(payload["invalidChainNodes"], [])
+        self.assertEqual(payload["invalidWitnesses"], [])
+        self.assertEqual(payload["uncoveredNodes"], [])
+        self.assertEqual(payload["digest"], self.expected_final_report_digest(payload))
+        self.assertEqual(payload["createdBy"], self.auditor_id)
+        self.assertFalse(response.endswith(b"\n"))
+
+    def test_final_verification_partial_coverage(self) -> None:
+        self.setup_two_final_proofs("fapv-part")
+        cd2 = self.final_chain_digest_for(2)
+        self.assertEqual(self.post_final_witness(2, cd2, "fapv-part-w2")[0], 201)
+        status, response = self.post_final_verification(2, "fapv-part-r")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertTrue(payload["chainConsistent"])
+        self.assertFalse(payload["fullyCovered"])
+        self.assertEqual(payload["uncoveredNodes"], [1])
+        self.assertEqual(payload["witnessSeqBound"], 1)
+
+    def test_final_verification_missing_proof_no_cascade(self) -> None:
+        self.setup_three_final_proofs("fapv-gap")
+        cd2 = self.final_chain_digest_for(2)
+        cd3 = self.final_chain_digest_for(3)
+        self.assertEqual(self.post_final_witness(2, cd2, "fapv-gap-w2")[0], 201)
+        self.assertEqual(self.post_final_witness(3, cd3, "fapv-gap-w3")[0], 201)
+        # 删除证明 1（链项保留）：只标记节点 1；节点 2 重新锚定、节点 3 全量核对。
+        self.db_execute("DELETE FROM final_audit_proofs WHERE proof_seq = 1")
+        status, response = self.post_final_verification(3, "fapv-gap-r")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertFalse(payload["chainConsistent"])
+        self.assertEqual(payload["invalidChainNodes"], [1])
+        self.assertEqual(payload["invalidWitnesses"], [])
+        self.assertEqual(payload["uncoveredNodes"], [1])
+        self.assertFalse(payload["fullyCovered"])
+
+    def test_final_verification_missing_chain_item_no_cascade(self) -> None:
+        self.setup_three_final_proofs("fapv-cgap")
+        cd1 = self.final_chain_digest_for(1)
+        cd3 = self.final_chain_digest_for(3)
+        self.assertEqual(self.post_final_witness(1, cd1, "fapv-cgap-w1")[0], 201)
+        self.assertEqual(self.post_final_witness(3, cd3, "fapv-cgap-w3")[0], 201)
+        self.db_execute("DELETE FROM final_audit_proof_chain WHERE proof_seq = 2")
+        status, response = self.post_final_verification(3, "fapv-cgap-r")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(payload["invalidChainNodes"], [2])
+        self.assertEqual(payload["uncoveredNodes"], [2])
+        self.assertFalse(payload["chainConsistent"])
+
+    def test_final_verification_tampered_chain_and_witness(self) -> None:
+        self.setup_three_final_proofs("fapv-tamper")
+        cd2 = self.final_chain_digest_for(2)
+        cd3 = self.final_chain_digest_for(3)
+        self.assertEqual(self.post_final_witness(2, cd2, "fapv-tamper-w2")[0], 201)
+        self.assertEqual(self.post_final_witness(3, cd3, "fapv-tamper-w3")[0], 201)
+        # 替换节点 3 的链摘要：节点 3 坏，指向它的见证 2 同时失效。
+        self.db_execute(
+            "UPDATE final_audit_proof_chain SET chain_digest = ? WHERE proof_seq = 3",
+            ("e" * 64,),
+        )
+        status, response = self.post_final_verification(3, "fapv-tamper-r")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(payload["invalidChainNodes"], [3])
+        self.assertEqual(payload["invalidWitnesses"], [2])
+        self.assertEqual(payload["uncoveredNodes"], [1, 3])
+        self.assertFalse(payload["chainConsistent"])
+        self.assertFalse(payload["fullyCovered"])
+
+    def test_final_verification_out_of_segment_witness_ignored(self) -> None:
+        self.setup_three_final_proofs("fapv-out")
+        # 见证只落在节点 3；报告上界取证明 2 时，该见证指向段外，忽略且不判坏。
+        cd3 = self.final_chain_digest_for(3)
+        self.assertEqual(self.post_final_witness(3, cd3, "fapv-out-w3")[0], 201)
+        status, response = self.post_final_verification(2, "fapv-out-r2")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(payload["proofSeqBound"], 2)
+        self.assertEqual(payload["witnessSeqBound"], 1)
+        self.assertEqual(payload["invalidWitnesses"], [])
+        self.assertEqual(payload["uncoveredNodes"], [1, 2])
+        # 上界扩大到 3 后同一见证进入复核范围并覆盖节点 3。
+        status, response = self.post_final_verification(3, "fapv-out-r3")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(payload["uncoveredNodes"], [1, 2])
+
+    def test_final_verification_freezes_witness_bound(self) -> None:
+        self.setup_two_final_proofs("fapv-bound")
+        cd1 = self.final_chain_digest_for(1)
+        self.assertEqual(self.post_final_witness(1, cd1, "fapv-bound-w1")[0], 201)
+        status, first = self.post_final_verification(2, "fapv-bound-r1")
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(first)["witnessSeqBound"], 1)
+        # 新增见证后旧报告不改变；新报告冻结更大的见证上界。
+        cd2 = self.final_chain_digest_for(2)
+        self.assertEqual(self.post_final_witness(2, cd2, "fapv-bound-w2")[0], 201)
+        status, replay = self.post_final_verification(2, "fapv-bound-r1")
+        self.assertEqual(status, 201)
+        self.assertEqual(replay, first)
+        status, second = self.post_final_verification(2, "fapv-bound-r2")
+        self.assertEqual(status, 201)
+        second_payload = json.loads(second)
+        self.assertEqual(second_payload["verificationSeq"], 2)
+        self.assertEqual(second_payload["witnessSeqBound"], 2)
+        self.assertTrue(second_payload["fullyCovered"])
+
+    def test_final_verification_target_missing_and_oversized(self) -> None:
+        self.setup_two_final_proofs("fapv-miss")
+        status, body = self.post_final_verification(99, "fapv-miss-1")
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+        status, body = self.post_final_verification(
+            9223372036854775808, "fapv-miss-2"
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+
+    def test_final_verification_structure_errors(self) -> None:
+        self.setup_two_final_proofs("fapv-struct")
+        # 缺字段、零、负整数、布尔、非整数均为 400/invalid_request。
+        for bad_body in (
+            b"{}",
+            b'{"proofSeq":0}',
+            b'{"proofSeq":-1}',
+            b'{"proofSeq":true}',
+            b'{"proofSeq":"1"}',
+            b'{"proofSeq":1.5}',
+            b'{"proofSeq":1,"extra":2}',
+        ):
+            status, _ = self.request_raw(
+                "/v1/final-audit-proof-verifications",
+                bad_body,
+                f"fapv-struct-{bad_body.decode()}",
+                "POST",
+            )
+            self.assertEqual(status, 400, bad_body)
+        # 查询参数非法。
+        status, _ = self.request_raw(
+            "/v1/final-audit-proof-verifications?x=1",
+            json.dumps({"proofSeq": 1}).encode(),
+            "fapv-struct-query",
+            "POST",
+        )
+        self.assertEqual(status, 400)
+        # 代理头非法。
+        request = Request(
+            self.url("/v1/final-audit-proof-verifications"),
+            data=json.dumps({"proofSeq": 1}).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "fapv-struct-deleg")
+        request.add_header("SLA-Delegation", "d;0;1;n;" + "ab" * 64)
+        try:
+            with urlopen(request, timeout=5) as response:
+                status = response.status
+        except HTTPError as error:
+            status = error.code
+        self.assertEqual(status, 400)
+        # 缺失认证头。
+        status, _ = self.request_raw(
+            "/v1/final-audit-proof-verifications",
+            json.dumps({"proofSeq": 1}).encode(),
+            "fapv-struct-noauth",
+            "POST",
+            omit_auth=True,
+        )
+        self.assertEqual(status, 400)
+
+    def test_final_verification_permission_and_nonce(self) -> None:
+        self.setup_two_final_proofs("fapv-auth")
+        # 非审计机器 403，且不借此探测目标存在性。
+        status, _ = self.post_final_verification(
+            2,
+            "fapv-auth-forbidden",
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+        )
+        self.assertEqual(status, 403)
+        status, _ = self.post_final_verification(
+            99,
+            "fapv-auth-forbidden-miss",
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+        )
+        self.assertEqual(status, 403)
+        # 失败不消费随机数：404 后同一随机数可用于成功请求。
+        nonce = f"nonce-fapv-auth-{time.time_ns()}"
+        status, _ = self.post_final_verification(99, "fapv-auth-fail", nonce=nonce)
+        self.assertEqual(status, 404)
+        status, _ = self.post_final_verification(2, "fapv-auth-ok", nonce=nonce)
+        self.assertEqual(status, 201)
+        # 成功后随机数已消费：异键复用为 replay_detected。
+        status, body = self.post_final_verification(1, "fapv-auth-replay", nonce=nonce)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "replay_detected"})
+
+    def test_final_verification_same_key_conflict(self) -> None:
+        self.setup_two_final_proofs("fapv-conf")
+        status, _ = self.post_final_verification(1, "fapv-conf-1")
+        self.assertEqual(status, 201)
+        # 同键异体。
+        status, body = self.request_raw(
+            "/v1/final-audit-proof-verifications",
+            json.dumps({"proofSeq": 2}).encode(),
+            "fapv-conf-1",
+            "POST",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+        # 同键同体异认证五段。
+        status, body = self.request_raw(
+            "/v1/final-audit-proof-verifications",
+            json.dumps({"proofSeq": 1}).encode(),
+            "fapv-conf-1",
+            "POST",
+            nonce=f"nonce-fapv-conf-{time.time_ns()}",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_final_verification_replay_restart_and_no_seq_advance(self) -> None:
+        self.setup_two_final_proofs("fapv-rep")
+        status, first = self.post_final_verification(2, "fapv-rep-1")
+        self.assertEqual(status, 201)
+        status, second = self.post_final_verification(2, "fapv-rep-1")
+        self.assertEqual(status, 201)
+        self.assertEqual(second, first)
+        self.restart()
+        status, third = self.post_final_verification(2, "fapv-rep-1")
+        self.assertEqual(status, 201)
+        self.assertEqual(third, first)
+        # 重放不推进报告序号：异键报告为序号 2。
+        status, other = self.post_final_verification(1, "fapv-rep-2")
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(other)["verificationSeq"], 2)
+
+    def test_final_verification_failure_no_side_effects(self) -> None:
+        self.setup_two_final_proofs("fapv-fail")
+        status, _ = self.post_final_verification(99, "fapv-fail-1")
+        self.assertEqual(status, 404)
+        status, created = self.post_final_verification(2, "fapv-fail-2")
+        self.assertEqual(status, 201, created)
+        self.assertEqual(json.loads(created)["verificationSeq"], 1)
+        count_row = sqlite3.connect(self.server.database_path).execute(
+            "SELECT COUNT(*) FROM final_audit_proof_verifications"
+        ).fetchone()
+        self.assertEqual(count_row[0], 1)
+
+    def test_final_verification_collection(self) -> None:
+        # 空集合。
+        status, body = self.get("/v1/final-audit-proof-verifications")
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertEqual(list(payload), ["verifications", "nextCursor"])
+        self.assertEqual(payload["verifications"], [])
+        self.assertIsNone(payload["nextCursor"])
+        # 两份报告完整返回。
+        self.setup_two_final_proofs("fapv-list")
+        cd1 = self.final_chain_digest_for(1)
+        cd2 = self.final_chain_digest_for(2)
+        self.assertEqual(self.post_final_witness(1, cd1, "fapv-list-w1")[0], 201)
+        self.assertEqual(self.post_final_witness(2, cd2, "fapv-list-w2")[0], 201)
+        status, first = self.post_final_verification(1, "fapv-list-r1")
+        self.assertEqual(status, 201)
+        status, second = self.post_final_verification(2, "fapv-list-r2")
+        self.assertEqual(status, 201)
+        status, body = self.get("/v1/final-audit-proof-verifications?limit=1")
+        self.assertEqual(status, 200, body)
+        page = json.loads(body)
+        self.assertEqual(page["verifications"], [json.loads(first)])
+        cursor = page["nextCursor"]
+        self.assertEqual(cursor, "2:1")
+        status, body = self.get(
+            f"/v1/final-audit-proof-verifications?cursor={cursor}"
+        )
+        self.assertEqual(status, 200, body)
+        page = json.loads(body)
+        self.assertEqual(page["verifications"], [json.loads(second)])
+        self.assertIsNone(page["nextCursor"])
+        # 旧游标跨重启稳定且隔离并发新增。
+        self.restart()
+        status, body = self.get(
+            f"/v1/final-audit-proof-verifications?cursor=2:1"
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(
+            json.loads(body)["verifications"], [json.loads(second)]
+        )
+        # 非法参数与游标。
+        for query in (
+            "limit=0",
+            "limit=101",
+            "foo=1",
+            "cursor=99:1",
+            "cursor=1:99",
+            "limit=1&limit=2",
+        ):
+            status, _ = self.get(f"/v1/final-audit-proof-verifications?{query}")
+            self.assertEqual(status, 400, query)
+        # 未配置审计身份 403；缺失认证头 400。
+        status, _ = self.get(
+            "/v1/final-audit-proof-verifications",
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+        )
+        self.assertEqual(status, 403)
+        status, _ = self.get(
+            "/v1/final-audit-proof-verifications", omit_auth=True
+        )
+        self.assertEqual(status, 400)
+
+    def test_final_verification_get_nonce_consumed_only_on_success(self) -> None:
+        self.setup_two_final_proofs("fapv-gnonce")
+        nonce = f"nonce-fapv-gn-{time.time_ns()}"
+        status, _ = self.get("/v1/final-audit-proof-verifications", nonce=nonce)
+        self.assertEqual(status, 200)
+        status, body = self.get(
+            "/v1/final-audit-proof-verifications", nonce=nonce
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "replay_detected"})
+        failed_nonce = f"nonce-fapv-gn-fail-{time.time_ns()}"
+        for _ in range(2):
+            status, _ = self.get(
+                "/v1/final-audit-proof-verifications?cursor=99:1",
+                nonce=failed_nonce,
+            )
+            self.assertEqual(status, 400)
 
 
 class IntegerLimitTests(_EvidenceScenario, unittest.TestCase):
