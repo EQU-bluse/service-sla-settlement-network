@@ -10192,46 +10192,87 @@ class Handler(BaseHTTPRequestHandler):
         invalid_chain_nodes: set[int] = set()
         # 自创世起以证明记录为真相独立重算规范链：规范响应摘要取证明响应字节
         # 重算值，规范前项摘要取上一位置的重算（非保存）链摘要，首项为六十四个
-        # 零。链记录缺失或被替换/重排时，只标记对不上真相的位置，不随后续节点
-        # 级联，也不修正任何历史数据；仅当某位置证明记录缺失、真相不可恢复时，
-        # 规范链才在该处中断。
+        # 零。证明或链记录缺失只标记该位置，不随后续完整节点级联，也不修正任何
+        # 历史数据；每个实际缺口各记录一次。证明缺失使前序真相不可恢复，但链项
+        # 仍在时，缺口后首个证明与链项俱在的位置以其保存的前项摘要为锚点重新
+        # 独立核对（响应摘要与链摘要须与其自身证明响应、保存前项自洽），未知
+        # 上下文不算后继错误，并自此重建规范链；前序可重算的位置仍须同时符合
+        # 重算的前项摘要与链摘要，替换、重排照样落网。
         canonical_previous: str | None = PROOF_CHECK_PROOF_CHAIN_GENESIS_DIGEST
         for seq in range(1, proof_bound + 1):
             proof = proof_map.get(seq)
             chain = chain_map.get(seq)
-            canonical_chain_digest: str | None = None
-            if proof is not None and canonical_previous is not None:
-                canonical_response_digest = hashlib.sha256(
-                    proof["response_json"].encode("utf-8")
+            response_digest = (
+                hashlib.sha256(proof["response_json"].encode("utf-8")).hexdigest()
+                if proof is not None
+                else None
+            )
+            if proof is None or chain is None:
+                # 实际缺口（证明记录或链项缺失）：只记录本序号，不级联。
+                invalid_chain_nodes.add(seq)
+                if proof is None:
+                    # 真相在此中断：前序链摘要无法继续重算，直到缺口后首个
+                    # 完整节点以其保存链项重新锚定。
+                    canonical_previous = None
+                else:
+                    # 仅链项缺失：证明真相仍在；前序可重算时规范链照常沿
+                    # 真相推进，否则继续等待后续完整节点重新锚定。
+                    if canonical_previous is not None:
+                        canonical_chain_text = "\n".join(
+                            (
+                                "proof-check-proof-chain-v1",
+                                str(seq),
+                                response_digest,
+                                canonical_previous,
+                            )
+                        )
+                        canonical_previous = hashlib.sha256(
+                            canonical_chain_text.encode("utf-8")
+                        ).hexdigest()
+                continue
+            if canonical_previous is None:
+                # 前序存在无法重算的证明缺口：以本节点保存的前项摘要为锚点，
+                # 用本节点自己的证明响应与保存链项独立核对，不把未知上下文当
+                # 作后继错误。
+                anchor_previous = chain["previous_chain_digest"]
+                anchored_chain_digest = hashlib.sha256(
+                    "\n".join(
+                        (
+                            "proof-check-proof-chain-v1",
+                            str(seq),
+                            response_digest,
+                            anchor_previous,
+                        )
+                    ).encode("utf-8")
                 ).hexdigest()
-                canonical_chain_text = "\n".join(
+                if (
+                    chain["response_digest"] != response_digest
+                    or chain["chain_digest"] != anchored_chain_digest
+                ):
+                    invalid_chain_nodes.add(seq)
+                    # 锚点自洽性已被破坏，规范链仍无法在此恢复。
+                    continue
+                # 独立核对通过：上下文于本节点重建，此后恢复全量重算核对。
+                canonical_previous = anchored_chain_digest
+                continue
+            canonical_chain_digest = hashlib.sha256(
+                "\n".join(
                     (
                         "proof-check-proof-chain-v1",
                         str(seq),
-                        canonical_response_digest,
+                        response_digest,
                         canonical_previous,
                     )
-                )
-                canonical_chain_digest = hashlib.sha256(
-                    canonical_chain_text.encode("utf-8")
-                ).hexdigest()
-            if proof is None or chain is None:
-                # 链缺失（证明或链记录不存在、连续性不可恢复）。
-                invalid_chain_nodes.add(seq)
-            elif canonical_chain_digest is None:
-                # 前一位置证明真相缺失，规范链摘要无法建立。
-                invalid_chain_nodes.add(seq)
-            elif (
-                chain["response_digest"]
-                != hashlib.sha256(
-                    proof["response_json"].encode("utf-8")
-                ).hexdigest()
+                ).encode("utf-8")
+            ).hexdigest()
+            if (
+                chain["response_digest"] != response_digest
                 or chain["previous_chain_digest"] != canonical_previous
                 or chain["chain_digest"] != canonical_chain_digest
             ):
                 # 替换、重排：响应摘要、前项摘要或链摘要与重算值不符。
                 invalid_chain_nodes.add(seq)
-            # 规范链始终沿真相推进：被删/被改位置之后的节点仍可精确核对。
+            # 规范链始终沿真相推进：被改位置之后的节点仍可精确核对。
             canonical_previous = canonical_chain_digest
         # 见证上界内且指向目标链段的记录逐一复核：以冻结公钥按请求认证规则
         # 重建待验字节复核签名，并核对审计身份（公钥摘要）、链位置与链摘要。
