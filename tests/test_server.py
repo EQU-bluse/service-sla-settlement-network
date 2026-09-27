@@ -12259,18 +12259,16 @@ class AuditComparisonTests(_EvidenceScenario, unittest.TestCase):
         # 超过解释器整数字符串转换位数上限（PEP 682，4300 位）的合法 JSON
         # 端点仍须解析为非布尔正整数：返回 404/not_found，不得断连或判为非法请求。
         self.create_checkpoints("cmp-long-cp1", "cmp-long-cp2")
-        huge = int("9" * 5000)
-        body = json.dumps(
-            {"fromCheckpointSeq": 1, "toCheckpointSeq": huge}
-        ).encode()
+        # 测试进程同样受转换保护约束：超长正文字节直接拼接，不经 int 转换。
+        body = b'{"fromCheckpointSeq":1,"toCheckpointSeq":' + b"9" * 5000 + b"}"
         status, response = self.post_comparison_raw(
             "/v1/audit-comparisons", body, "cmp-long-to"
         )
         self.assertEqual(status, 404, response)
         self.assertEqual(json.loads(response), {"error": "not_found"})
         nonce = f"nonce-long-{time.time_ns()}"
-        status, _ = self.post_comparison(
-            1, huge, "cmp-long-fail", nonce=nonce
+        status, _ = self.post_comparison_raw(
+            "/v1/audit-comparisons", body, "cmp-long-fail", nonce=nonce
         )
         self.assertEqual(status, 404)
         # 失败不落幂等记录、不消费随机数：同键同正文随后不重放，随机数仍可成功使用。
@@ -12715,9 +12713,7 @@ class AuditAnchorTests(_EvidenceScenario, unittest.TestCase):
         self.assertEqual(json.loads(body), {"error": "not_found"})
         status, body = self.post_anchor_raw(
             "/v1/audit-anchors",
-            json.dumps(
-                {"comparisonSeq": int("9" * 5000), "chainDigest": "ab" * 32}
-            ).encode(),
+            b'{"comparisonSeq":' + b"9" * 5000 + b',"chainDigest":"' + b"ab" * 32 + b'"}',
             "anchor-missing-very-long",
         )
         self.assertEqual(status, 404, body)
@@ -13724,7 +13720,7 @@ class AuditVerificationTests(_EvidenceScenario, unittest.TestCase):
             self.assertEqual(json.loads(body), {"error": "not_found"})
         status, body = self.request_raw(
             "/v1/audit-verifications",
-            json.dumps({"comparisonSeq": int("9" * 5000)}).encode(),
+            b'{"comparisonSeq":' + b"9" * 5000 + b"}",
             "vf-missing-huge",
             "POST",
         )
@@ -18392,3 +18388,821 @@ class DelegationProofMigrationTests(unittest.TestCase):
             self.assertEqual(count, 3)
         finally:
             connection.close()
+
+
+class ProofCheckTests(_EvidenceScenario, unittest.TestCase):
+    # 证明复核报告：冻结报告上界（取正文 verificationSeq）与全库证明序号上界，
+    # 以上界内报告原始响应重算响应摘要，以冻结公钥核对证明的摘要、审计身份与
+    # README 既有 audit-proof-v1 签名消息。异常只记录不修正，不一致仍返回 201。
+    AUDITOR_SEED = ARBITRATOR_SEED
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.auditor_id = machine_id(ARBITRATOR_PUBLIC)
+        self.server.auditors = frozenset({self.auditor_id})
+        status, _ = self.post_json(
+            "/v1/machines", {"publicKey": ARBITRATOR_PUBLIC}, "register-auditor-pc"
+        )
+        self.assertEqual(status, 201)
+
+    def restart(self) -> None:
+        super().restart()
+        self.server.auditors = frozenset({self.auditor_id})
+
+    def request_raw(
+        self,
+        path: str,
+        body: bytes,
+        key: str | None,
+        method: str,
+        *,
+        seed: bytes | None = None,
+        actor: str | None = None,
+        nonce: str | None = None,
+        auth_header: str | None = None,
+        delegation: str | None = None,
+        omit_auth: bool = False,
+        key_version: int = 1,
+        request_time_ms: int | None = None,
+    ) -> tuple[int, bytes]:
+        request = Request(self.url(path), data=body, method=method)
+        if key is not None:
+            request.add_header("Idempotency-Key", key)
+        # GET 无幂等键：每次调用都需要新鲜随机数，否则成功读取消费随机数后
+        # 下一次读取被判重放；POST 同键重放仍须复用同一组认证五段。
+        if key is None and nonce is None and auth_header is None:
+            nonce = f"nonce-pc-get-{time.time_ns()}"
+        if delegation is not None:
+            request.add_header("SLA-Delegation", delegation)
+        elif not omit_auth:
+            request.add_header(
+                "SLA-Auth",
+                auth_header
+                if auth_header is not None
+                else make_sla_auth(
+                    self.server,
+                    key,
+                    seed if seed is not None else self.AUDITOR_SEED,
+                    actor if actor is not None else self.auditor_id,
+                    method,
+                    urlsplit(path).path,
+                    body,
+                    key_version,
+                    nonce=nonce,
+                    request_time_ms=request_time_ms,
+                ),
+            )
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def post_check(self, seq: object, key: str, **kwargs: object) -> tuple[int, bytes]:
+        return self.request_raw(
+            "/v1/proof-checks",
+            json.dumps({"verificationSeq": seq}).encode(),
+            key,
+            "POST",
+            **kwargs,
+        )
+
+    def get_checks(
+        self,
+        path: str = "/v1/proof-checks",
+        *,
+        nonce: str | None = None,
+        seed: bytes | None = None,
+        actor: str | None = None,
+        omit_auth: bool = False,
+    ) -> tuple[int, bytes]:
+        return self.request_raw(
+            path,
+            b"",
+            None,
+            "GET",
+            nonce=nonce,
+            seed=seed,
+            actor=actor,
+            omit_auth=omit_auth,
+        )
+
+    def create_checkpoints(self, *keys: str) -> None:
+        for key_value in keys:
+            status, body = self.request_raw(
+                "/v1/audit-checkpoints", b"{}", key_value, "POST"
+            )
+            self.assertEqual(status, 201, body)
+
+    def create_comparison(self, seq: int, key: str) -> None:
+        self.create_checkpoints(f"{key}-cp1", f"{key}-cp2")
+        status, body = self.request_raw(
+            "/v1/audit-comparisons",
+            json.dumps({"fromCheckpointSeq": 1, "toCheckpointSeq": 2}).encode(),
+            key,
+            "POST",
+        )
+        self.assertEqual(status, 201, body)
+        self.assertEqual(json.loads(body)["comparisonSeq"], seq)
+
+    def create_verification(self, seq: int, key: str) -> bytes:
+        self.create_comparison(seq, f"{key}-cmp{seq}")
+        status, body = self.request_raw(
+            "/v1/audit-verifications",
+            json.dumps({"comparisonSeq": seq}).encode(),
+            key,
+            "POST",
+        )
+        self.assertEqual(status, 201, body)
+        self.assertEqual(json.loads(body)["verificationSeq"], seq)
+        return body
+
+    def create_proof(self, verification_seq: int, report_bytes: bytes, key: str) -> dict[str, Any]:
+        report = json.loads(report_bytes)
+        response_digest = hashlib.sha256(report_bytes).hexdigest()
+        message = "\n".join(
+            (
+                "audit-proof-v1",
+                str(verification_seq),
+                response_digest,
+                report["digest"],
+                str(report["comparisonSeqBound"]),
+                str(report["anchorSeqBound"]),
+            )
+        ).encode("utf-8")
+        signature = _ed25519_sign(self.AUDITOR_SEED, message).hex()
+        body = json.dumps(
+            {"verificationSeq": verification_seq, "signature": signature}
+        ).encode()
+        status, response = self.request_raw("/v1/audit-proofs", body, key, "POST")
+        self.assertEqual(status, 201, response)
+        return json.loads(response)
+
+    def db_execute(self, statement: str, parameters: tuple[object, ...] = ()) -> None:
+        with sqlite3.connect(self.server.database_path) as connection:
+            connection.execute(statement, parameters)
+            connection.commit()
+
+    @staticmethod
+    def expected_digest(payload: dict[str, Any]) -> str:
+        summary = {
+            "reportCut": payload["reportCut"],
+            "proofCut": payload["proofCut"],
+            "valid": payload["valid"],
+            "covered": payload["covered"],
+            "badProofs": payload["badProofs"],
+            "uncovered": payload["uncovered"],
+        }
+        return hashlib.sha256(
+            json.dumps(summary, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    # ---- 创建成功路径 ----
+
+    def test_clean_check_valid_and_covered(self) -> None:
+        report = self.create_verification(1, "pc-cl-v1")
+        self.create_proof(1, report, "pc-cl-p1")
+        status, response = self.post_check(1, "pc-clean")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(
+            list(payload),
+            [
+                "checkSeq",
+                "reportCut",
+                "proofCut",
+                "digest",
+                "createdBy",
+                "createdAt",
+                "valid",
+                "covered",
+                "badProofs",
+                "uncovered",
+            ],
+        )
+        self.assertEqual(payload["checkSeq"], 1)
+        self.assertEqual(payload["reportCut"], 1)
+        self.assertEqual(payload["proofCut"], 1)
+        self.assertEqual(payload["createdBy"], self.auditor_id)
+        self.assertIsInstance(payload["createdAt"], int)
+        self.assertGreaterEqual(payload["createdAt"], 0)
+        self.assertTrue(payload["valid"])
+        self.assertTrue(payload["covered"])
+        self.assertEqual(payload["badProofs"], [])
+        self.assertEqual(payload["uncovered"], [])
+        self.assertEqual(payload["digest"], self.expected_digest(payload))
+        self.assertFalse(response.endswith(b"\n"))
+
+    def test_no_proofs_means_uncovered_but_valid(self) -> None:
+        self.create_verification(1, "pc-np-v1")
+        status, response = self.post_check(1, "pc-no-proofs")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(payload["proofCut"], 0)
+        self.assertTrue(payload["valid"])
+        self.assertFalse(payload["covered"])
+        self.assertEqual(payload["badProofs"], [])
+        self.assertEqual(payload["uncovered"], [1])
+
+    def test_partial_coverage_and_frozen_proof_cut(self) -> None:
+        first_report = self.create_verification(1, "pc-pc-v1")
+        second_report = self.create_verification(2, "pc-pc-v2")
+        self.create_proof(1, first_report, "pc-pc-p1")
+        status, first = self.post_check(2, "pc-partial-1")
+        self.assertEqual(status, 201, first)
+        first_payload = json.loads(first)
+        self.assertEqual(first_payload["proofCut"], 1)
+        self.assertFalse(first_payload["covered"])
+        self.assertEqual(first_payload["uncovered"], [2])
+        # 首份复核冻结证明上界为 1：补证明后新复核取新上界，旧复核字节不变。
+        self.create_proof(2, second_report, "pc-pc-p2")
+        status, second = self.post_check(2, "pc-partial-2")
+        self.assertEqual(status, 201, second)
+        second_payload = json.loads(second)
+        self.assertEqual(second_payload["checkSeq"], 2)
+        self.assertEqual(second_payload["proofCut"], 2)
+        self.assertTrue(second_payload["covered"])
+        self.assertEqual(second_payload["uncovered"], [])
+        status, body = self.get_checks("/v1/proof-checks?limit=2")
+        self.assertEqual(status, 200, body)
+        checks = json.loads(body)["checks"]
+        self.assertEqual(checks[0], first_payload)
+        self.assertEqual(checks[1], second_payload)
+
+    def test_proof_outside_report_bound_is_ignored(self) -> None:
+        first_report = self.create_verification(1, "pc-ob-v1")
+        second_report = self.create_verification(2, "pc-ob-v2")
+        self.create_proof(1, first_report, "pc-ob-p1")
+        self.create_proof(2, second_report, "pc-ob-p2")
+        status, response = self.post_check(1, "pc-outside")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        # 证明 2 指向报告上界之外：既不算有效覆盖也不记异常。
+        self.assertEqual(payload["proofCut"], 2)
+        self.assertEqual(payload["badProofs"], [])
+        self.assertEqual(payload["uncovered"], [])
+        self.assertTrue(payload["valid"])
+        self.assertTrue(payload["covered"])
+
+    # ---- 异常检测：引用缺失、摘要、身份、签名 ----
+
+    def test_tampered_proof_signature_is_bad(self) -> None:
+        report = self.create_verification(1, "pc-ts-v1")
+        self.create_proof(1, report, "pc-ts-p1")
+        self.db_execute(
+            "UPDATE audit_proofs SET signature = ? WHERE proof_seq = 1",
+            ("ab" * 64,),
+        )
+        status, response = self.post_check(1, "pc-bad-sig")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertFalse(payload["valid"])
+        self.assertFalse(payload["covered"])
+        self.assertEqual(payload["badProofs"], [1])
+        self.assertEqual(payload["uncovered"], [1])
+        # 异常只记录不修正：库内签名保持篡改值。
+        with sqlite3.connect(self.server.database_path) as connection:
+            stored = connection.execute(
+                "SELECT signature FROM audit_proofs WHERE proof_seq = 1"
+            ).fetchone()[0]
+        self.assertEqual(stored, "ab" * 64)
+
+    def test_tampered_proof_response_digest_is_bad(self) -> None:
+        report = self.create_verification(1, "pc-td-v1")
+        self.create_proof(1, report, "pc-td-p1")
+        self.db_execute(
+            "UPDATE audit_proofs SET response_digest = ? WHERE proof_seq = 1",
+            ("cd" * 32,),
+        )
+        status, response = self.post_check(1, "pc-bad-digest")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(payload["badProofs"], [1])
+        self.assertEqual(payload["uncovered"], [1])
+
+    def test_tampered_report_response_is_bad(self) -> None:
+        report = self.create_verification(1, "pc-tr-v1")
+        self.create_proof(1, report, "pc-tr-p1")
+        # 篡改报告原始响应：重算响应摘要与证明保存值不符。
+        self.db_execute(
+            "UPDATE audit_verifications SET response_json = ?"
+            " WHERE verification_seq = 1",
+            ('{"tampered":true}',),
+        )
+        status, response = self.post_check(1, "pc-bad-report")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(payload["badProofs"], [1])
+        self.assertEqual(payload["uncovered"], [1])
+
+    def test_tampered_proof_identity_is_bad(self) -> None:
+        report = self.create_verification(1, "pc-ti-v1")
+        self.create_proof(1, report, "pc-ti-p1")
+        self.db_execute(
+            "UPDATE audit_proofs SET auditor_machine_id = ? WHERE proof_seq = 1",
+            ("cd" * 32,),
+        )
+        status, response = self.post_check(1, "pc-bad-identity")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(payload["badProofs"], [1])
+        self.assertEqual(payload["uncovered"], [1])
+
+    def test_tampered_proof_public_key_is_bad(self) -> None:
+        report = self.create_verification(1, "pc-tk-v1")
+        self.create_proof(1, report, "pc-tk-p1")
+        self.db_execute(
+            "UPDATE audit_proofs SET public_key = ? WHERE proof_seq = 1",
+            ("ee" * 32,),
+        )
+        status, response = self.post_check(1, "pc-bad-public")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        # 公钥摘要不再等于审计身份（签名同时无法复核）：证明无效。
+        self.assertEqual(payload["badProofs"], [1])
+        self.assertEqual(payload["uncovered"], [1])
+
+    def test_proof_for_missing_report_is_bad(self) -> None:
+        first_report = self.create_verification(1, "pc-mr-v1")
+        second_report = self.create_verification(2, "pc-mr-v2")
+        self.create_proof(1, first_report, "pc-mr-p1")
+        self.create_proof(2, second_report, "pc-mr-p2")
+        # 删除报告 1 并把证明 1 改为引用它：引用缺失报告的证明记为异常。
+        self.db_execute("DELETE FROM audit_verifications WHERE verification_seq = 1")
+        status, response = self.post_check(2, "pc-missing-report")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(payload["badProofs"], [1])
+        self.assertEqual(payload["uncovered"], [1])
+        self.assertFalse(payload["valid"])
+        self.assertFalse(payload["covered"])
+
+    def test_one_valid_proof_suffices_for_coverage(self) -> None:
+        auditor2_seed = b"\x0a" * 32
+        auditor2_public = _ed25519_public_key(auditor2_seed).hex()
+        auditor2_id = machine_id(auditor2_public)
+        status, _ = self.post_json(
+            "/v1/machines", {"publicKey": auditor2_public}, "pc-va-register"
+        )
+        self.assertEqual(status, 201)
+        self.server.auditors = frozenset({self.auditor_id, auditor2_id})
+        report = self.create_verification(1, "pc-va-v1")
+        self.create_proof(1, report, "pc-va-p1")
+        # 第二台审计机器对同一报告再证明一次。
+        report_obj = json.loads(report)
+        response_digest = hashlib.sha256(report).hexdigest()
+        message = "\n".join(
+            (
+                "audit-proof-v1",
+                "1",
+                response_digest,
+                report_obj["digest"],
+                str(report_obj["comparisonSeqBound"]),
+                str(report_obj["anchorSeqBound"]),
+            )
+        ).encode("utf-8")
+        body = json.dumps(
+            {
+                "verificationSeq": 1,
+                "signature": _ed25519_sign(auditor2_seed, message).hex(),
+            }
+        ).encode()
+        status, second = self.request_raw(
+            "/v1/audit-proofs",
+            body,
+            "pc-va-p2",
+            "POST",
+            seed=auditor2_seed,
+            actor=auditor2_id,
+            nonce=f"nonce-pc-va-{time.time_ns()}",
+        )
+        self.assertEqual(status, 201, second)
+        # 篡改证明 1 的签名：证明 1 记为异常，但证明 2 仍有效覆盖报告 1。
+        self.db_execute(
+            "UPDATE audit_proofs SET signature = ? WHERE proof_seq = 1",
+            ("ab" * 64,),
+        )
+        status, response = self.post_check(1, "pc-valid-proof")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(payload["proofCut"], 2)
+        self.assertEqual(payload["badProofs"], [1])
+        self.assertEqual(payload["uncovered"], [])
+        self.assertFalse(payload["valid"])
+        self.assertTrue(payload["covered"])
+
+    # ---- 幂等、重放与序号 ----
+
+    def test_replay_returns_first_bytes_without_advancing_seq(self) -> None:
+        self.create_verification(1, "pc-rp-v1")
+        status, first = self.post_check(1, "pc-replay")
+        self.assertEqual(status, 201)
+        status, second = self.post_check(1, "pc-replay")
+        self.assertEqual(status, 201)
+        self.assertEqual(second, first)
+        status, third = self.post_check(1, "pc-replay-other")
+        self.assertEqual(status, 201, third)
+        self.assertEqual(json.loads(third)["checkSeq"], 2)
+
+    def test_replay_survives_restart(self) -> None:
+        self.create_verification(1, "pc-rs-v1")
+        status, first = self.post_check(1, "pc-restart")
+        self.assertEqual(status, 201)
+        self.restart()
+        status, second = self.post_check(1, "pc-restart")
+        self.assertEqual(status, 201)
+        self.assertEqual(second, first)
+
+    def test_same_key_different_body_or_auth_conflicts(self) -> None:
+        self.create_verification(1, "pc-sk-v1")
+        self.create_verification(2, "pc-sk-v2")
+        status, _ = self.post_check(1, "pc-same-key")
+        self.assertEqual(status, 201)
+        status, body = self.post_check(2, "pc-same-key")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+        status, body = self.post_check(
+            1, "pc-same-key", nonce=f"nonce-pc-sk-{time.time_ns()}"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+        # 同键更换正文即使目标报告不存在也先判冲突。
+        status, body = self.post_check(999, "pc-same-key")
+        self.assertEqual(status, 409)
+
+    def test_missing_report_is_not_found(self) -> None:
+        self.create_verification(1, "pc-nf-v1")
+        for seq in (2, 999, 10**30):
+            status, body = self.post_check(seq, f"pc-missing-{seq}")
+            self.assertEqual(status, 404, seq)
+            self.assertEqual(json.loads(body), {"error": "not_found"})
+        status, body = self.request_raw(
+            "/v1/proof-checks",
+            b'{"verificationSeq":' + b"9" * 5000 + b"}",
+            "pc-missing-huge",
+            "POST",
+        )
+        self.assertEqual(status, 404, body)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+
+    def test_failure_does_not_consume_nonce_or_advance_seq(self) -> None:
+        nonce = f"nonce-pc-fl-{time.time_ns()}"
+        status, _ = self.post_check(999, "pc-fl-fail", nonce=nonce)
+        self.assertEqual(status, 404)
+        self.create_verification(1, "pc-fl-v1")
+        # 随机数未被失败请求消费；成功后复核序号仍自 1 起。
+        status, body = self.post_check(1, "pc-fl-ok", nonce=nonce)
+        self.assertEqual(status, 201, body)
+        self.assertEqual(json.loads(body)["checkSeq"], 1)
+
+    def test_replayed_nonce_with_different_key_conflicts(self) -> None:
+        self.create_verification(1, "pc-nr-v1")
+        nonce = f"nonce-pc-nr-{time.time_ns()}"
+        status, _ = self.post_check(1, "pc-nr-1", nonce=nonce)
+        self.assertEqual(status, 201)
+        status, body = self.post_check(1, "pc-nr-2", nonce=nonce)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "replay_detected"})
+
+    def test_concurrent_same_key_single_success(self) -> None:
+        self.create_verification(1, "pc-cs-v1")
+
+        def check(_index: int) -> tuple[int, bytes]:
+            return self.post_check(
+                1,
+                "pc-cs-same",
+                nonce=f"nonce-pc-csame-{_index:020d}",
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(8) as executor:
+            results = list(executor.map(check, range(8)))
+        statuses = sorted(status for status, _ in results)
+        self.assertEqual(statuses.count(201), 1)
+        self.assertEqual(statuses.count(409), 7)
+        self.assertEqual(
+            {
+                json.loads(response)["error"]
+                for status, response in results
+                if status == 409
+            },
+            {"conflict"},
+        )
+
+    # ---- 请求结构、授权与认证错误 ----
+
+    def test_invalid_body_returns_400(self) -> None:
+        bodies = (
+            b"{}",
+            b"[]",
+            b"not json",
+            json.dumps({"verificationSeq": 1, "extra": 1}).encode(),
+            json.dumps({"comparisonSeq": 1}).encode(),
+            json.dumps({"verificationSeq": 0}).encode(),
+            json.dumps({"verificationSeq": -1}).encode(),
+            json.dumps({"verificationSeq": True}).encode(),
+            json.dumps({"verificationSeq": "1"}).encode(),
+            json.dumps({"verificationSeq": 1.5}).encode(),
+            b'{"verificationSeq":1,"verificationSeq":2}',
+        )
+        for index, body in enumerate(bodies):
+            status, response = self.request_raw(
+                "/v1/proof-checks", body, f"pc-invalid-{index}", "POST"
+            )
+            self.assertEqual(status, 400, body)
+            self.assertEqual(json.loads(response), {"error": "invalid_request"})
+
+    def test_query_params_delegation_and_missing_auth_rejected(self) -> None:
+        body = json.dumps({"verificationSeq": 1}).encode()
+        status, response = self.request_raw(
+            "/v1/proof-checks?x=1", body, "pc-query", "POST"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(response), {"error": "invalid_request"})
+        status, _ = self.request_raw(
+            "/v1/proof-checks",
+            body,
+            "pc-delegation",
+            "POST",
+            delegation="d;0;1;nonnonnonnonnonnonn;s",
+        )
+        self.assertEqual(status, 400)
+        status, _ = self.request_raw(
+            "/v1/proof-checks", body, "pc-no-auth", "POST", omit_auth=True
+        )
+        self.assertEqual(status, 400)
+        request = Request(
+            self.url("/v1/proof-checks"), data=body, method="POST"
+        )
+        try:
+            with urlopen(request, timeout=5) as response:
+                status = response.status
+        except HTTPError as error:
+            status = error.code
+        self.assertEqual(status, 400)
+
+    def test_non_auditor_forbidden(self) -> None:
+        self.create_verification(1, "pc-fb-v1")
+        body = json.dumps({"verificationSeq": 1}).encode()
+        status, response = self.request_raw(
+            "/v1/proof-checks",
+            body,
+            "pc-forbidden",
+            "POST",
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+            nonce=f"nonce-pc-fb-{time.time_ns()}",
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(response), {"error": "forbidden"})
+        status, _ = self.get_checks(seed=PUBLIC_KEY_SEED_B, actor=self.consumer_id)
+        self.assertEqual(status, 403)
+
+    def test_stale_request_is_401(self) -> None:
+        self.create_verification(1, "pc-st-v1")
+        stale = int(time.time() * 1000) - 400_000
+        status, body = self.post_check(1, "pc-stale", request_time_ms=stale)
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(body), {"error": "stale_request"})
+
+    def test_invalid_signature_is_401(self) -> None:
+        self.create_verification(1, "pc-is-v1")
+        body = json.dumps({"verificationSeq": 1}).encode()
+        good = make_sla_auth(
+            self.server,
+            "pc-bad-signature",
+            self.AUDITOR_SEED,
+            self.auditor_id,
+            "POST",
+            "/v1/proof-checks",
+            body,
+            1,
+        )
+        parts = good.split(";")
+        parts[-1] = "ab" * 64
+        status, response = self.request_raw(
+            "/v1/proof-checks",
+            body,
+            "pc-bad-signature",
+            "POST",
+            auth_header=";".join(parts),
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(response), {"error": "invalid_authentication"})
+
+    # ---- 集合读取 ----
+
+    def test_get_empty_collection(self) -> None:
+        status, body = self.get_checks()
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertEqual(list(payload), ["checks", "nextCursor"])
+        self.assertEqual(payload["checks"], [])
+        self.assertIsNone(payload["nextCursor"])
+
+    def test_get_collection_returns_full_reports(self) -> None:
+        self.create_verification(1, "pc-gc-v1")
+        status, first = self.post_check(1, "pc-gc-1")
+        self.assertEqual(status, 201)
+        status, second = self.post_check(1, "pc-gc-2")
+        self.assertEqual(status, 201)
+        status, body = self.get_checks()
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertEqual([c["checkSeq"] for c in payload["checks"]], [1, 2])
+        self.assertEqual(payload["checks"][0], json.loads(first))
+        self.assertEqual(payload["checks"][1], json.loads(second))
+        self.assertIsNone(payload["nextCursor"])
+
+    def test_collection_paging_and_stable_cut(self) -> None:
+        self.create_verification(1, "pc-pg-v1")
+        for index in range(1, 4):
+            status, _ = self.post_check(1, f"pc-pg-{index}")
+            self.assertEqual(status, 201)
+        status, body = self.get_checks("/v1/proof-checks?limit=1")
+        self.assertEqual(status, 200, body)
+        first_page = json.loads(body)
+        self.assertEqual([c["checkSeq"] for c in first_page["checks"]], [1])
+        self.assertEqual(first_page["nextCursor"], "3:1")
+        status, _ = self.post_check(1, "pc-pg-4")
+        self.assertEqual(status, 201)
+        status, body = self.get_checks(
+            f"/v1/proof-checks?limit=1&cursor={first_page['nextCursor']}"
+        )
+        self.assertEqual(status, 200, body)
+        second_page = json.loads(body)
+        self.assertEqual([c["checkSeq"] for c in second_page["checks"]], [2])
+        self.assertEqual(second_page["nextCursor"], "3:2")
+
+    def test_collection_invalid_params_and_cursors(self) -> None:
+        self.create_verification(1, "pc-cu-v1")
+        status, _ = self.post_check(1, "pc-cu-1")
+        self.assertEqual(status, 201)
+        for query in (
+            "limit=0",
+            "limit=101",
+            "limit=x",
+            "foo=1",
+            "cursor=1",
+            "cursor=x:1",
+            "limit=1&limit=2",
+            "cursor=99:1",
+            "cursor=1:5",
+        ):
+            status, _ = self.get_checks(f"/v1/proof-checks?{query}")
+            self.assertEqual(status, 400, query)
+
+    def test_collection_requires_auditor_and_auth(self) -> None:
+        status, _ = self.get_checks(seed=PUBLIC_KEY_SEED_B, actor=self.consumer_id)
+        self.assertEqual(status, 403)
+        status, _ = self.get_checks(omit_auth=True)
+        self.assertEqual(status, 400)
+        request = Request(self.url("/v1/proof-checks"), data=b"", method="GET")
+        request.add_header("SLA-Delegation", "d;0;1;n;s")
+        try:
+            with urlopen(request, timeout=5) as response:
+                status = response.status
+        except HTTPError as error:
+            status = error.code
+        self.assertEqual(status, 400)
+
+    def test_collection_nonce_consumed_only_on_success(self) -> None:
+        nonce = f"nonce-pc-gn-{time.time_ns()}"
+        self.create_verification(1, "pc-gn-v1")
+        status, _ = self.get_checks(nonce=nonce)
+        self.assertEqual(status, 200)
+        status, body = self.get_checks(nonce=nonce)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "replay_detected"})
+        failed_nonce = f"nonce-pc-gnf-{time.time_ns()}"
+        for _ in range(2):
+            status, _ = self.get_checks(
+                "/v1/proof-checks?cursor=99:1", nonce=failed_nonce
+            )
+            self.assertEqual(status, 400)
+
+
+class IntegerLimitTests(_EvidenceScenario, unittest.TestCase):
+    # 进程级整数转换保护（PEP 682）不再全局关闭：仅 README 已声明的审计序号
+    # 入口接受超长整数（超存储范围按不存在处理），其他入口的超长整数一律
+    # 400/invalid_request 且连接保持可用，普通数值边界不因此放宽。
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.auditor_id = machine_id(ARBITRATOR_PUBLIC)
+        self.server.auditors = frozenset({self.auditor_id})
+        status, _ = self.post_json(
+            "/v1/machines", {"publicKey": ARBITRATOR_PUBLIC}, "register-auditor-il"
+        )
+        self.assertEqual(status, 201)
+
+    def auditor_header(self, key: str | None, body: bytes, path: str) -> str:
+        return make_sla_auth(
+            self.server,
+            key,
+            ARBITRATOR_SEED,
+            self.auditor_id,
+            "POST",
+            path,
+            body,
+            1,
+        )
+
+    def test_oversized_json_int_on_normal_endpoint_is_400(self) -> None:
+        huge = "9" * 5000
+        body = (
+            b'{"id":"tpl-huge","machineId":"' + self.machine_id.encode() + b'",'
+            b'"capabilityVersion":1,"priceMicros":1,"maxLatencyMs":'
+            + huge.encode()
+            + b"}"
+        )
+        request = Request(
+            self.url("/v1/sla-templates"), data=body, method="POST"
+        )
+        request.add_header("Idempotency-Key", "il-huge-template")
+        try:
+            with urlopen(request, timeout=5) as response:
+                status, payload = response.status, response.read()
+        except HTTPError as error:
+            status, payload = error.code, error.read()
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(payload), {"error": "invalid_request"})
+        # 连接与服务保持可用：后续正常请求照常处理。
+        status, body = self.post_json(
+            "/v1/sla-templates",
+            {
+                "id": "tpl-after",
+                "machineId": self.machine_id,
+                "capabilityVersion": 1,
+                "priceMicros": 1,
+                "maxLatencyMs": 50,
+            },
+            "il-after",
+        )
+        self.assertEqual(status, 201, body)
+
+    def test_oversized_query_param_is_400(self) -> None:
+        huge = "9" * 5000
+        for path in (
+            f"/v1/slas/sla-1/evaluations?limit={huge}",
+            f"/v1/slas/sla-1/evaluations?cursor={huge}:1",
+            f"/v1/slas/sla-1/telemetry?from=0&to={huge}",
+            f"/v1/slas/sla-1/telemetry?from=0&to=1&cursor={huge}:0:evt-1",
+        ):
+            try:
+                with urlopen(self.url(path), timeout=5) as response:
+                    status = response.status
+            except HTTPError as error:
+                status = error.code
+            self.assertEqual(status, 400, path)
+
+    def test_oversized_path_seq_is_404(self) -> None:
+        huge = "9" * 5000
+        status, _ = self.get_json(f"/v1/evidence/{huge}/proofs")
+        self.assertEqual(status, 404)
+
+    def test_oversized_auth_version_is_400(self) -> None:
+        body = json.dumps({"verificationSeq": 1}).encode()
+        header = (
+            f"{self.auditor_id};{'9' * 5000};{int(time.time() * 1000)};"
+            f"nonce-il-{time.time_ns()};{'ab' * 64}"
+        )
+        request = Request(self.url("/v1/proof-checks"), data=body, method="POST")
+        request.add_header("Idempotency-Key", "il-huge-version")
+        request.add_header("SLA-Auth", header)
+        try:
+            with urlopen(request, timeout=5) as response:
+                status = response.status
+        except HTTPError as error:
+            status = error.code
+        self.assertEqual(status, 400)
+
+    def test_oversized_audit_seq_accepted_as_not_found(self) -> None:
+        # README 已声明的审计序号入口仍接受超长整数：超存储范围按不存在处理。
+        huge_body = b'{"verificationSeq":' + b"9" * 5000 + b"}"
+        request = Request(self.url("/v1/proof-checks"), data=huge_body, method="POST")
+        request.add_header("Idempotency-Key", "il-huge-check")
+        request.add_header(
+            "SLA-Auth", self.auditor_header("il-huge-check", huge_body, "/v1/proof-checks")
+        )
+        try:
+            with urlopen(request, timeout=5) as response:
+                status, payload = response.status, response.read()
+        except HTTPError as error:
+            status, payload = error.code, error.read()
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(payload), {"error": "not_found"})
+        proof_body = (
+            b'{"verificationSeq":' + b"9" * 5000 + b',"signature":"' + b"ab" * 64 + b'"}'
+        )
+        request = Request(self.url("/v1/audit-proofs"), data=proof_body, method="POST")
+        request.add_header("Idempotency-Key", "il-huge-proof")
+        request.add_header(
+            "SLA-Auth", self.auditor_header("il-huge-proof", proof_body, "/v1/audit-proofs")
+        )
+        try:
+            with urlopen(request, timeout=5) as response:
+                status, payload = response.status, response.read()
+        except HTTPError as error:
+            status, payload = error.code, error.read()
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(payload), {"error": "not_found"})
