@@ -19118,6 +19118,7 @@ class ProofCheckChainTests(_EvidenceScenario, unittest.TestCase):
         nonce: str | None = None,
         omit_auth: bool = False,
         key_version: int = 1,
+        request_time_ms: int | None = None,
     ) -> tuple[int, bytes]:
         request = Request(self.url(path), data=body, method=method)
         if key is not None:
@@ -19136,6 +19137,7 @@ class ProofCheckChainTests(_EvidenceScenario, unittest.TestCase):
                     urlsplit(path).path,
                     body,
                     key_version,
+                    request_time_ms=request_time_ms,
                     nonce=nonce,
                 ),
             )
@@ -19750,6 +19752,372 @@ class ProofCheckChainTests(_EvidenceScenario, unittest.TestCase):
         status, second = self.post_check_verification(1, "pcc-vrep-r")
         self.assertEqual(status, 201)
         self.assertEqual(second, first)
+
+    # ---- 一致性报告签名证明 ----
+
+    def setup_clean_verification_report(self, key: str) -> bytes:
+        self.setup_clean_check(key)
+        cd1 = self.chain_digest_for(1)
+        status, _ = self.post_witness(1, cd1, f"{key}-w")
+        self.assertEqual(status, 201)
+        status, report = self.post_check_verification(1, f"{key}-r")
+        self.assertEqual(status, 201, report)
+        return report
+
+    def check_proof_body(
+        self,
+        verification_seq: int,
+        report_bytes: bytes,
+        seed: bytes | None = None,
+    ) -> bytes:
+        report = json.loads(report_bytes)
+        response_digest = hashlib.sha256(report_bytes).hexdigest()
+        message = "\n".join(
+            (
+                "proof-check-verification-proof-v1",
+                str(verification_seq),
+                response_digest,
+                report["digest"],
+                str(report["checkSeqBound"]),
+                str(report["witnessSeqBound"]),
+            )
+        ).encode("utf-8")
+        signature = _ed25519_sign(
+            seed if seed is not None else self.AUDITOR_SEED, message
+        ).hex()
+        return json.dumps(
+            {"verificationSeq": verification_seq, "signature": signature}
+        ).encode()
+
+    def post_check_proof(
+        self,
+        verification_seq: int,
+        report_bytes: bytes,
+        key: str,
+        **kwargs: object,
+    ) -> tuple[int, bytes]:
+        seed = kwargs.get("seed")
+        body = self.check_proof_body(
+            verification_seq,
+            report_bytes,
+            seed if isinstance(seed, bytes) else None,
+        )
+        return self.request_raw(
+            "/v1/proof-check-proofs", body, key, "POST", **kwargs
+        )
+
+    def test_check_proof_created_with_frozen_fields(self) -> None:
+        from sla_network.ed25519 import verify as ed25519_verify
+
+        report = self.setup_clean_verification_report("pcp-create")
+        status, response = self.post_check_proof(1, report, "pcp-create-1")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(
+            list(payload),
+            [
+                "proofSeq",
+                "verificationSeq",
+                "responseDigest",
+                "auditorId",
+                "publicKey",
+                "keyVersion",
+                "signature",
+                "createdAt",
+            ],
+        )
+        self.assertEqual(payload["proofSeq"], 1)
+        self.assertEqual(payload["verificationSeq"], 1)
+        self.assertEqual(
+            payload["responseDigest"], hashlib.sha256(report).hexdigest()
+        )
+        self.assertEqual(payload["auditorId"], self.auditor_id)
+        self.assertEqual(payload["publicKey"], ARBITRATOR_PUBLIC)
+        self.assertEqual(payload["keyVersion"], 1)
+        # 冻结字段足以独立复验业务签名。
+        parsed = json.loads(report)
+        message = "\n".join(
+            (
+                "proof-check-verification-proof-v1",
+                "1",
+                payload["responseDigest"],
+                parsed["digest"],
+                str(parsed["checkSeqBound"]),
+                str(parsed["witnessSeqBound"]),
+            )
+        ).encode("utf-8")
+        self.assertTrue(
+            ed25519_verify(
+                bytes.fromhex(payload["publicKey"]),
+                message,
+                bytes.fromhex(payload["signature"]),
+            )
+        )
+        self.assertFalse(response.endswith(b"\n"))
+
+    def test_check_proof_replay_and_restart(self) -> None:
+        report = self.setup_clean_verification_report("pcp-rep")
+        status, first = self.post_check_proof(1, report, "pcp-rep-1")
+        self.assertEqual(status, 201)
+        status, second = self.post_check_proof(1, report, "pcp-rep-1")
+        self.assertEqual(status, 201)
+        self.assertEqual(second, first)
+        self.restart()
+        status, third = self.post_check_proof(1, report, "pcp-rep-1")
+        self.assertEqual(status, 201)
+        self.assertEqual(third, first)
+        # 重放不推进证明序号：另一审计机器异键证明仍为序号 2。
+        status, other = self.post_check_proof(
+            1,
+            report,
+            "pcp-rep-2",
+            seed=self.AUDITOR2_SEED,
+            actor=self.auditor2_id,
+        )
+        self.assertEqual(status, 201, other)
+        self.assertEqual(json.loads(other)["proofSeq"], 2)
+
+    def test_check_proof_same_key_different_body_or_auth_conflicts(self) -> None:
+        report = self.setup_clean_verification_report("pcp-conf")
+        status, _ = self.post_check_proof(1, report, "pcp-conf-1")
+        self.assertEqual(status, 201)
+        # 同键异体（结构合法即可，冲突判定先于资源查询）。
+        body = self.check_proof_body(2, report)
+        status, response = self.request_raw(
+            "/v1/proof-check-proofs", body, "pcp-conf-1", "POST"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(response), {"error": "conflict"})
+        # 同键同体异认证五段。
+        body = self.check_proof_body(1, report)
+        status, response = self.request_raw(
+            "/v1/proof-check-proofs",
+            body,
+            "pcp-conf-1",
+            "POST",
+            nonce=f"nonce-pcp-conf-{time.time_ns()}",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(response), {"error": "conflict"})
+
+    def test_check_proof_missing_and_oversized_report_is_404(self) -> None:
+        report = self.setup_clean_verification_report("pcp-miss")
+        status, body = self.post_check_proof(99, report, "pcp-miss-1")
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+        # 合法超大序号同样按报告不存在处理。
+        status, body = self.post_check_proof(
+            9223372036854775808, report, "pcp-miss-2"
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+
+    def test_check_proof_invalid_signature_is_409(self) -> None:
+        report = self.setup_clean_verification_report("pcp-badsig")
+        body = json.dumps(
+            {"verificationSeq": 1, "signature": "ab" * 64}
+        ).encode()
+        status, response = self.request_raw(
+            "/v1/proof-check-proofs", body, "pcp-badsig-1", "POST"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(response), {"error": "invalid_signature"})
+
+    def test_check_proof_duplicate_checked_after_signature(self) -> None:
+        report = self.setup_clean_verification_report("pcp-dup")
+        status, _ = self.post_check_proof(1, report, "pcp-dup-1")
+        self.assertEqual(status, 201)
+        # 异键重复证明：签名有效时判 proof_exists。
+        status, body = self.post_check_proof(1, report, "pcp-dup-2")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "proof_exists"})
+        # 签名无效时先判 invalid_signature（唯一性在验签之后）。
+        bad = json.dumps(
+            {"verificationSeq": 1, "signature": "ab" * 64}
+        ).encode()
+        status, body = self.request_raw(
+            "/v1/proof-check-proofs", bad, "pcp-dup-3", "POST"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "invalid_signature"})
+        # 不同审计机器仍可分别证明同一报告。
+        status, other = self.post_check_proof(
+            1,
+            report,
+            "pcp-dup-4",
+            seed=self.AUDITOR2_SEED,
+            actor=self.auditor2_id,
+        )
+        self.assertEqual(status, 201, other)
+        self.assertEqual(json.loads(other)["proofSeq"], 2)
+
+    def test_check_proof_structure_and_auth_errors(self) -> None:
+        report = self.setup_clean_verification_report("pcp-struct")
+        # 非法正文：缺 signature。
+        status, _ = self.request_raw(
+            "/v1/proof-check-proofs",
+            json.dumps({"verificationSeq": 1}).encode(),
+            "pcp-struct-badbody",
+            "POST",
+        )
+        self.assertEqual(status, 400)
+        # 签名格式非法。
+        status, _ = self.request_raw(
+            "/v1/proof-check-proofs",
+            json.dumps({"verificationSeq": 1, "signature": "zz"}).encode(),
+            "pcp-struct-badsig",
+            "POST",
+        )
+        self.assertEqual(status, 400)
+        # 查询参数非法。
+        status, _ = self.request_raw(
+            "/v1/proof-check-proofs?x=1",
+            self.check_proof_body(1, report),
+            "pcp-struct-query",
+            "POST",
+        )
+        self.assertEqual(status, 400)
+        # 代理头非法。
+        request = Request(
+            self.url("/v1/proof-check-proofs"),
+            data=self.check_proof_body(1, report),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "pcp-struct-deleg")
+        request.add_header("SLA-Delegation", "d;0;1;n;" + "ab" * 64)
+        try:
+            with urlopen(request, timeout=5) as response:
+                status = response.status
+        except HTTPError as error:
+            status = error.code
+        self.assertEqual(status, 400)
+        # 缺失认证头。
+        status, _ = self.request_raw(
+            "/v1/proof-check-proofs",
+            self.check_proof_body(1, report),
+            "pcp-struct-noauth",
+            "POST",
+            omit_auth=True,
+        )
+        self.assertEqual(status, 400)
+        # 未配置审计身份 403。
+        status, _ = self.post_check_proof(
+            1,
+            report,
+            "pcp-struct-forbidden",
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+        )
+        self.assertEqual(status, 403)
+        # 过时请求 401。
+        stale = int(time.time() * 1000) - 400_000
+        status, body = self.post_check_proof(
+            1, report, "pcp-struct-stale", request_time_ms=stale
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(body), {"error": "stale_request"})
+        # 异键复用随机数 409。
+        nonce = f"nonce-pcp-struct-{time.time_ns()}"
+        status, _ = self.post_check_proof(1, report, "pcp-struct-n1", nonce=nonce)
+        self.assertEqual(status, 201)
+        status, body = self.post_check_proof(
+            1,
+            report,
+            "pcp-struct-n2",
+            seed=self.AUDITOR2_SEED,
+            actor=self.auditor2_id,
+            nonce=nonce,
+        )
+        # 不同机器的随机数互不冲突；同机异键复用才判重放。
+        self.assertEqual(status, 201, body)
+        status, body = self.post_check_proof(1, report, "pcp-struct-n3", nonce=nonce)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "replay_detected"})
+
+    def test_check_proof_failure_no_side_effects(self) -> None:
+        report = self.setup_clean_verification_report("pcp-fail")
+        # 失败请求不消费随机数、不推进证明序号。
+        bad = json.dumps(
+            {"verificationSeq": 1, "signature": "ab" * 64}
+        ).encode()
+        status, _ = self.request_raw(
+            "/v1/proof-check-proofs", bad, "pcp-fail-1", "POST"
+        )
+        self.assertEqual(status, 409)
+        status, created = self.post_check_proof(1, report, "pcp-fail-2")
+        self.assertEqual(status, 201, created)
+        self.assertEqual(json.loads(created)["proofSeq"], 1)
+
+    def test_check_proof_collection(self) -> None:
+        # 空集合。
+        status, body = self.get("/v1/proof-check-proofs")
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertEqual(list(payload), ["proofs", "nextCursor"])
+        self.assertEqual(payload["proofs"], [])
+        self.assertIsNone(payload["nextCursor"])
+        # 两份证明（不同审计机器）完整返回。
+        report = self.setup_clean_verification_report("pcp-list")
+        status, first = self.post_check_proof(1, report, "pcp-list-1")
+        self.assertEqual(status, 201)
+        status, second = self.post_check_proof(
+            1,
+            report,
+            "pcp-list-2",
+            seed=self.AUDITOR2_SEED,
+            actor=self.auditor2_id,
+        )
+        self.assertEqual(status, 201)
+        status, body = self.get("/v1/proof-check-proofs?limit=1")
+        self.assertEqual(status, 200, body)
+        page = json.loads(body)
+        self.assertEqual(page["proofs"], [json.loads(first)])
+        self.assertIsNotNone(page["nextCursor"])
+        cursor = page["nextCursor"]
+        status, body = self.get(f"/v1/proof-check-proofs?cursor={cursor}")
+        self.assertEqual(status, 200, body)
+        page = json.loads(body)
+        self.assertEqual(page["proofs"], [json.loads(second)])
+        self.assertIsNone(page["nextCursor"])
+        # 旧游标跨重启稳定且隔离新增。
+        self.restart()
+        status, body = self.get(f"/v1/proof-check-proofs?cursor={cursor}")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["proofs"], [json.loads(second)])
+        # 非法参数与游标。
+        for query in ("limit=0", "cursor=99:1", "cursor=1:99", "foo=1"):
+            status, _ = self.get(f"/v1/proof-check-proofs?{query}")
+            self.assertEqual(status, 400, query)
+        # 未配置审计身份 403；缺失认证头 400。
+        status, _ = self.get(
+            "/v1/proof-check-proofs",
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+        )
+        self.assertEqual(status, 403)
+        status, _ = self.get("/v1/proof-check-proofs", omit_auth=True)
+        self.assertEqual(status, 400)
+
+    def test_invalid_chain_node_not_covered_by_valid_witness(self) -> None:
+        # 篡改链节点后按其保存摘要建立形式有效见证：节点仍须列入未覆盖。
+        self.setup_clean_check("pcc-fix")
+        self.db_execute(
+            "UPDATE proof_check_chain SET chain_digest = ? WHERE check_seq = 1",
+            ("f" * 64,),
+        )
+        status, _ = self.post_witness(1, "f" * 64, "pcc-fix-w")
+        self.assertEqual(status, 201)
+        status, response = self.post_check_verification(1, "pcc-fix-r")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertFalse(payload["chainConsistent"])
+        self.assertEqual(payload["invalidChainNodes"], [1])
+        # 见证形式有效（摘要与签名均符合保存记录），不记为无效见证。
+        self.assertEqual(payload["invalidWitnesses"], [])
+        # 无效链节点不得计入覆盖，也不能贡献完整覆盖。
+        self.assertEqual(payload["uncoveredNodes"], [1])
+        self.assertFalse(payload["fullyCovered"])
+        self.assertEqual(payload["digest"], self.expected_report_digest(payload))
 
 
 class IntegerLimitTests(_EvidenceScenario, unittest.TestCase):
