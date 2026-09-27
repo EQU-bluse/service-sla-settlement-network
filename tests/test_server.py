@@ -20773,6 +20773,504 @@ class ProofCheckProofChainTests(ProofCheckChainTests):
         self.assertEqual(json.loads(body), {"error": "not_found"})
 
 
+class FinalAuditProofTests(ProofCheckProofChainTests):
+    # 面向第三方的冻结签名证明：为已保存的证明复核一致性报告追加
+    # final-audit-proof-v1 业务签名，冻结审计身份、公钥与密钥版本；证明序号
+    # 全库递增，错误次序、幂等重放与分页沿循一致性报告签名证明入口。
+    for _inherited in dir(ProofCheckProofChainTests):
+        if _inherited.startswith("test_"):
+            locals()[_inherited] = None
+
+    FINAL_AUDITOR_NEW_SEED = b"\x09" * 32
+
+    def setup_final_report(self, key: str) -> bytes:
+        # 两份证明签署同一份复核一致性报告，并为证明链节点 1 留见证，随后
+        # 生成证明复核一致性报告（序号 1，证明上界 1）。
+        self.setup_two_proofs(f"{key}-two")
+        chain_digest = self.proof_chain_digest_for(1)
+        status, _ = self.post_proof_witness(1, chain_digest, f"{key}-w1")
+        self.assertEqual(status, 201)
+        status, report = self.post_proof_verification(1, f"{key}-fv")
+        self.assertEqual(status, 201, report)
+        return report
+
+    def setup_second_final_report(self, key: str) -> bytes:
+        # 第二份证明复核一致性报告：证明上界 2，见证覆盖节点 2。
+        chain_digest = self.proof_chain_digest_for(2)
+        status, _ = self.post_proof_witness(2, chain_digest, f"{key}-w2")
+        self.assertEqual(status, 201)
+        status, report = self.post_proof_verification(2, f"{key}-fv2")
+        self.assertEqual(status, 201, report)
+        return report
+
+    def final_proof_body(
+        self,
+        verification_seq: object,
+        report_bytes: bytes,
+        *,
+        seed: bytes | None = None,
+        tamper: bool = False,
+    ) -> bytes:
+        report = json.loads(report_bytes)
+        response_digest = hashlib.sha256(report_bytes).hexdigest()
+        domain = "final-audit-proof-v0" if tamper else "final-audit-proof-v1"
+        message = "\n".join(
+            (
+                domain,
+                str(verification_seq),
+                response_digest,
+                report["digest"],
+                str(report["proofSeqBound"]),
+                str(report["witnessSeqBound"]),
+            )
+        ).encode("utf-8")
+        signature = _ed25519_sign(
+            seed if seed is not None else self.AUDITOR_SEED, message
+        ).hex()
+        return json.dumps(
+            {"verificationSeq": verification_seq, "signature": signature}
+        ).encode()
+
+    def post_final_proof(
+        self,
+        verification_seq: object,
+        report_bytes: bytes,
+        key: str,
+        *,
+        seed: bytes | None = None,
+        tamper: bool = False,
+        **kwargs: object,
+    ) -> tuple[int, bytes]:
+        body = self.final_proof_body(
+            verification_seq,
+            report_bytes,
+            seed=seed,
+            tamper=tamper,
+        )
+        return self.request_raw(
+            "/v1/final-audit-proofs",
+            body,
+            key,
+            "POST",
+            seed=seed,
+            **kwargs,
+        )
+
+    def rotate_auditor_key(self) -> str:
+        new_public = _ed25519_public_key(self.FINAL_AUDITOR_NEW_SEED).hex()
+        current_signature, new_signature = key_rotation_signatures(
+            self.AUDITOR_SEED,
+            self.FINAL_AUDITOR_NEW_SEED,
+            self.auditor_id,
+            1,
+            new_public,
+        )
+        body = json.dumps(
+            {
+                "expectedVersion": 1,
+                "publicKey": new_public,
+                "currentSignature": current_signature,
+                "newSignature": new_signature,
+            }
+        ).encode()
+        request = Request(
+            self.url(f"/v1/machines/{self.auditor_id}/keys"),
+            data=body,
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "fap-rotate")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        return new_public
+
+    def test_final_proof_created_with_frozen_fields(self) -> None:
+        from sla_network.ed25519 import verify as ed25519_verify
+
+        report = self.setup_final_report("fap-create")
+        status, response = self.post_final_proof(1, report, "fap-create-1")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(
+            list(payload),
+            [
+                "proofSeq",
+                "verificationSeq",
+                "responseDigest",
+                "auditorId",
+                "publicKey",
+                "keyVersion",
+                "signature",
+                "createdAt",
+            ],
+        )
+        self.assertEqual(payload["proofSeq"], 1)
+        self.assertEqual(payload["verificationSeq"], 1)
+        self.assertEqual(
+            payload["responseDigest"], hashlib.sha256(report).hexdigest()
+        )
+        self.assertEqual(payload["auditorId"], self.auditor_id)
+        self.assertEqual(payload["publicKey"], ARBITRATOR_PUBLIC)
+        self.assertEqual(payload["keyVersion"], 1)
+        # 冻结身份、公钥与密钥版本足以独立复验业务签名。
+        parsed = json.loads(report)
+        message = "\n".join(
+            (
+                "final-audit-proof-v1",
+                "1",
+                payload["responseDigest"],
+                parsed["digest"],
+                str(parsed["proofSeqBound"]),
+                str(parsed["witnessSeqBound"]),
+            )
+        ).encode("utf-8")
+        self.assertTrue(
+            ed25519_verify(
+                bytes.fromhex(payload["publicKey"]),
+                message,
+                bytes.fromhex(payload["signature"]),
+            )
+        )
+        self.assertFalse(response.endswith(b"\n"))
+
+    def test_final_proof_replay_and_restart(self) -> None:
+        report = self.setup_final_report("fap-rep")
+        status, first = self.post_final_proof(1, report, "fap-rep-1")
+        self.assertEqual(status, 201)
+        status, second = self.post_final_proof(1, report, "fap-rep-1")
+        self.assertEqual(status, 201)
+        self.assertEqual(second, first)
+        self.restart()
+        status, third = self.post_final_proof(1, report, "fap-rep-1")
+        self.assertEqual(status, 201)
+        self.assertEqual(third, first)
+        # 重放不推进证明序号：另一审计机器异键证明为序号 2。
+        status, other = self.post_final_proof(
+            1,
+            report,
+            "fap-rep-2",
+            seed=self.AUDITOR2_SEED,
+            actor=self.auditor2_id,
+        )
+        self.assertEqual(status, 201, other)
+        self.assertEqual(json.loads(other)["proofSeq"], 2)
+
+    def test_final_proof_same_key_changed_body_or_auth_conflicts(self) -> None:
+        report = self.setup_final_report("fap-conf")
+        status, _ = self.post_final_proof(1, report, "fap-conf-1")
+        self.assertEqual(status, 201)
+        # 同键异体：冲突，且先于资源查询（报告 2 尚不存在）。
+        body = self.final_proof_body(2, report)
+        status, response = self.request_raw(
+            "/v1/final-audit-proofs", body, "fap-conf-1", "POST"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(response), {"error": "conflict"})
+        # 同键同体异认证五段：冲突。
+        body = self.final_proof_body(1, report)
+        status, response = self.request_raw(
+            "/v1/final-audit-proofs",
+            body,
+            "fap-conf-1",
+            "POST",
+            nonce=f"nonce-fap-conf-{time.time_ns()}",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(response), {"error": "conflict"})
+        # 原请求仍重放首次字节。
+        status, replay = self.post_final_proof(1, report, "fap-conf-1")
+        self.assertEqual(status, 201)
+
+    def test_final_proof_structure_permission_nonce(self) -> None:
+        report = self.setup_final_report("fap-auth")
+        valid_body = self.final_proof_body(1, report)
+        # 非法正文：缺 signature。
+        status, _ = self.request_raw(
+            "/v1/final-audit-proofs",
+            json.dumps({"verificationSeq": 1}).encode(),
+            "fap-auth-badbody",
+            "POST",
+        )
+        self.assertEqual(status, 400)
+        # 查询参数非法。
+        status, _ = self.request_raw(
+            "/v1/final-audit-proofs?x=1",
+            valid_body,
+            "fap-auth-query",
+            "POST",
+        )
+        self.assertEqual(status, 400)
+        # 缺失认证头。
+        request = Request(
+            self.url("/v1/final-audit-proofs"), data=valid_body, method="POST"
+        )
+        request.add_header("Idempotency-Key", "fap-auth-noauth")
+        try:
+            with urlopen(request, timeout=5) as response:
+                status = response.status
+        except HTTPError as error:
+            status = error.code
+        self.assertEqual(status, 400)
+        # 代理头不被接受。
+        request = Request(
+            self.url("/v1/final-audit-proofs"), data=valid_body, method="POST"
+        )
+        request.add_header("Idempotency-Key", "fap-auth-deleg")
+        request.add_header("SLA-Delegation", "x;0;0;n;0")
+        try:
+            with urlopen(request, timeout=5) as response:
+                status = response.status
+        except HTTPError as error:
+            status = error.code
+        self.assertEqual(status, 400)
+        # 非审计机器 403（先于资源查询与业务验签，业务签名内容无关）。
+        status, body = self.request_raw(
+            "/v1/final-audit-proofs",
+            json.dumps({"verificationSeq": 1, "signature": "ab" * 64}).encode(),
+            "fap-auth-forbidden",
+            "POST",
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+        )
+        self.assertEqual(status, 403, body)
+        # 失败不消费随机数：404 后同一随机数可用于成功请求。
+        nonce = f"nonce-fap-auth-{time.time_ns()}"
+        status, _ = self.post_final_proof(99, report, "fap-auth-fail", nonce=nonce)
+        self.assertEqual(status, 404)
+        status, _ = self.post_final_proof(1, report, "fap-auth-ok", nonce=nonce)
+        self.assertEqual(status, 201)
+        # 成功后随机数已消费：异键复用为 replay_detected。
+        status, body = self.post_final_proof(
+            1, report, "fap-auth-replay", nonce=nonce
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "replay_detected"})
+
+    def test_final_proof_missing_report_is_404(self) -> None:
+        report = self.setup_final_report("fap-miss")
+        status, body = self.post_final_proof(99, report, "fap-miss-r")
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+        # 合法超大序号同样按报告不存在处理。
+        status, body = self.post_final_proof(
+            9223372036854775808, report, "fap-miss-huge"
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+
+    def test_final_proof_target_must_be_proof_verification_report(self) -> None:
+        # 仅有复核一致性报告（proof_check_verifications 序号 1）而证明复核
+        # 一致性报告表为空时，目标仍按资源缺失处理，且先于业务验签。
+        self.setup_clean_verification_report("fap-target")
+        body = json.dumps(
+            {"verificationSeq": 1, "signature": "ab" * 64}
+        ).encode()
+        status, response = self.request_raw(
+            "/v1/final-audit-proofs", body, "fap-target-1", "POST"
+        )
+        self.assertEqual(status, 404, response)
+        self.assertEqual(json.loads(response), {"error": "not_found"})
+
+    def test_final_proof_bad_signature_is_invalid_signature(self) -> None:
+        report = self.setup_final_report("fap-badsig")
+        # 验签失败不推进序号、不消费随机数。
+        nonce = f"nonce-fap-badsig-{time.time_ns()}"
+        status, body = self.post_final_proof(
+            1, report, "fap-badsig-2", tamper=True, nonce=nonce
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "invalid_signature"})
+        status, _ = self.post_final_proof(1, report, "fap-badsig-3", nonce=nonce)
+        self.assertEqual(status, 201)
+
+    def test_final_proof_same_auditor_duplicate_is_proof_exists(self) -> None:
+        report = self.setup_final_report("fap-dup")
+        status, first = self.post_final_proof(1, report, "fap-dup-1")
+        self.assertEqual(status, 201, first)
+        # 同机异键重复：proof_exists。
+        status, body = self.post_final_proof(1, report, "fap-dup-2")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "proof_exists"})
+        # 不同审计机器可分别对同一报告冻结证明，序号继续递增。
+        status, other = self.post_final_proof(
+            1,
+            report,
+            "fap-dup-3",
+            seed=self.AUDITOR2_SEED,
+            actor=self.auditor2_id,
+        )
+        self.assertEqual(status, 201, other)
+        self.assertEqual(json.loads(other)["proofSeq"], 2)
+
+    def test_final_proof_survives_key_rotation(self) -> None:
+        from sla_network.ed25519 import verify as ed25519_verify
+
+        report = self.setup_final_report("fap-rot")
+        # 第二份报告在轮换前建好（其见证与报告均以 v1 认证写入）。
+        report2 = self.setup_second_final_report("fap-rot")
+        status, first = self.post_final_proof(1, report, "fap-rot-1")
+        self.assertEqual(status, 201)
+        frozen = json.loads(first)
+        new_public = self.rotate_auditor_key()
+        # 旧密钥轮换后：既有证明不改写，仍以冻结公钥独立复验通过；集合读取
+        # 以当前版本（v2）认证。
+        status, body = self.get(
+            "/v1/final-audit-proofs",
+            seed=self.FINAL_AUDITOR_NEW_SEED,
+            key_version=2,
+        )
+        self.assertEqual(status, 200, body)
+        saved = next(
+            p for p in json.loads(body)["proofs"] if p["proofSeq"] == 1
+        )
+        self.assertEqual(saved["publicKey"], ARBITRATOR_PUBLIC)
+        self.assertEqual(saved["keyVersion"], 1)
+        self.assertEqual(saved, frozen)
+        parsed = json.loads(report)
+        message = "\n".join(
+            (
+                "final-audit-proof-v1",
+                "1",
+                saved["responseDigest"],
+                parsed["digest"],
+                str(parsed["proofSeqBound"]),
+                str(parsed["witnessSeqBound"]),
+            )
+        ).encode("utf-8")
+        self.assertTrue(
+            ed25519_verify(
+                bytes.fromhex(saved["publicKey"]),
+                message,
+                bytes.fromhex(saved["signature"]),
+            )
+        )
+        # 同机身份对同一报告已证明一次：轮换密钥后重复仍为 proof_exists。
+        status, duplicate = self.post_final_proof(
+            1,
+            report,
+            "fap-rot-dup",
+            seed=self.FINAL_AUDITOR_NEW_SEED,
+            key_version=2,
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(duplicate), {"error": "proof_exists"})
+        # 轮换后对第二份报告以当前版本（v2）密钥冻结证明，序号继续递增。
+        status, second = self.post_final_proof(
+            2,
+            report2,
+            "fap-rot-2",
+            seed=self.FINAL_AUDITOR_NEW_SEED,
+            key_version=2,
+        )
+        self.assertEqual(status, 201, second)
+        payload = json.loads(second)
+        self.assertEqual(payload["proofSeq"], 2)
+        self.assertEqual(payload["publicKey"], new_public)
+        self.assertEqual(payload["keyVersion"], 2)
+
+    def test_final_proofs_paging_and_stable_cut(self) -> None:
+        report1 = self.setup_final_report("fap-page")
+        status, _ = self.post_final_proof(1, report1, "fap-page-p1")
+        self.assertEqual(status, 201)
+        report2 = self.setup_second_final_report("fap-page")
+        status, _ = self.post_final_proof(2, report2, "fap-page-p2")
+        self.assertEqual(status, 201)
+        status, body = self.get("/v1/final-audit-proofs?limit=1")
+        self.assertEqual(status, 200, body)
+        first_page = json.loads(body)
+        self.assertEqual(
+            [p["proofSeq"] for p in first_page["proofs"]], [1]
+        )
+        self.assertEqual(first_page["nextCursor"], "2:1")
+        # 旧游标携带 cut=2：新增证明不进入续页。
+        status, third = self.post_final_proof(
+            2,
+            report2,
+            "fap-page-p3",
+            seed=self.AUDITOR2_SEED,
+            actor=self.auditor2_id,
+        )
+        self.assertEqual(status, 201, third)
+        status, body = self.get(
+            f"/v1/final-audit-proofs?limit=1&cursor={first_page['nextCursor']}"
+        )
+        self.assertEqual(status, 200, body)
+        second_page = json.loads(body)
+        self.assertEqual([p["proofSeq"] for p in second_page["proofs"]], [2])
+        self.assertIsNone(second_page["nextCursor"])
+        # 全新首页取新 cut=3。
+        status, body = self.get("/v1/final-audit-proofs?limit=1")
+        self.assertEqual(
+            [p["proofSeq"] for p in json.loads(body)["proofs"]], [1]
+        )
+        status, body = self.get("/v1/final-audit-proofs")
+        self.assertEqual(
+            [p["proofSeq"] for p in json.loads(body)["proofs"]], [1, 2, 3]
+        )
+        for query in ("limit=0", "cursor=99:1", "cursor=2:9", "foo=1"):
+            status, _ = self.get(f"/v1/final-audit-proofs?{query}")
+            self.assertEqual(status, 400, query)
+
+    def test_final_proof_concurrent_races_have_single_winner(self) -> None:
+        import concurrent.futures
+
+        report = self.setup_final_report("fap-race")
+
+        # 同键并发：不传显式随机数，测试认证注册表按同键同体复用同一组认证
+        # 五段（含时间戳），仅首个事务写入，其余重放首次字节（均为 201）。
+        def submit_same(_: int) -> tuple[int, bytes]:
+            return self.post_final_proof(1, report, "fap-race-same")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            same_results = list(pool.map(submit_same, range(6)))
+        statuses = [status for status, _ in same_results]
+        self.assertEqual(statuses, [201] * 6)
+        first_bytes = same_results[0][1]
+        self.assertTrue(all(body == first_bytes for _, body in same_results))
+
+        # 异键竞争同一身份与报告：auditor2（尚未证明该报告）以各自新鲜随机数
+        # 并发提交，仅一项成功，其余 proof_exists。
+        def submit_diff(index: int) -> tuple[int, bytes]:
+            return self.post_final_proof(
+                1,
+                report,
+                f"fap-race-diff-{index}",
+                seed=self.AUDITOR2_SEED,
+                actor=self.auditor2_id,
+                nonce=f"nonce-fap-race-diff-{index:02d}-{time.time_ns()}",
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            diff_results = list(pool.map(submit_diff, range(6)))
+        created = [body for status, body in diff_results if status == 201]
+        conflicts = [
+            body
+            for status, body in diff_results
+            if json.loads(body) == {"error": "proof_exists"}
+        ]
+        self.assertEqual(len(created), 1)
+        self.assertEqual(len(conflicts), 5)
+        # 同键重放占序号 1；异键竞争唯一成功者占序号 2，序号不重号。
+        self.assertEqual(json.loads(created[0])["proofSeq"], 2)
+
+    def test_final_proofs_read_auth_and_empty_page(self) -> None:        # 空历史对已配置审计机器返回空页。
+        status, body = self.get("/v1/final-audit-proofs")
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertEqual(list(payload), ["proofs", "nextCursor"])
+        self.assertEqual(payload["proofs"], [])
+        self.assertIsNone(payload["nextCursor"])
+        # 非审计机器 403。
+        status, _ = self.get(
+            "/v1/final-audit-proofs",
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+        )
+        self.assertEqual(status, 403)
+        # 缺失认证头 400。
+        status, _ = self.get("/v1/final-audit-proofs", omit_auth=True)
+        self.assertEqual(status, 400)
+
+
 class IntegerLimitTests(_EvidenceScenario, unittest.TestCase):
     # 进程级整数转换保护（PEP 682）不再全局关闭：仅 README 已声明的审计序号
     # 入口接受超长整数（超存储范围按不存在处理），其他入口的超长整数一律
@@ -20890,6 +21388,26 @@ class IntegerLimitTests(_EvidenceScenario, unittest.TestCase):
         request.add_header("Idempotency-Key", "il-huge-proof")
         request.add_header(
             "SLA-Auth", self.auditor_header("il-huge-proof", proof_body, "/v1/audit-proofs")
+        )
+        try:
+            with urlopen(request, timeout=5) as response:
+                status, payload = response.status, response.read()
+        except HTTPError as error:
+            status, payload = error.code, error.read()
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(payload), {"error": "not_found"})
+        final_body = (
+            b'{"verificationSeq":' + b"9" * 5000 + b',"signature":"' + b"ab" * 64 + b'"}'
+        )
+        request = Request(
+            self.url("/v1/final-audit-proofs"), data=final_body, method="POST"
+        )
+        request.add_header("Idempotency-Key", "il-huge-final")
+        request.add_header(
+            "SLA-Auth",
+            self.auditor_header(
+                "il-huge-final", final_body, "/v1/final-audit-proofs"
+            ),
         )
         try:
             with urlopen(request, timeout=5) as response:
