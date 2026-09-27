@@ -20594,6 +20594,193 @@ class ProofCheckProofChainTests(ProofCheckChainTests):
         self.assertEqual(status, 409)
         self.assertEqual(json.loads(body), {"error": "conflict"})
 
+    # ---- 证明复核一致性报告 ----
+
+    def post_proof_verification(
+        self, proof_seq: object, key: str, **kwargs: object
+    ) -> tuple[int, bytes]:
+        return self.request_raw(
+            "/v1/proof-check-proof-verifications",
+            json.dumps({"proofSeq": proof_seq}).encode(),
+            key,
+            "POST",
+            **kwargs,
+        )
+
+    @staticmethod
+    def expected_proof_verification_digest(payload: dict[str, Any]) -> str:
+        summary = {
+            "proofSeqBound": payload["proofSeqBound"],
+            "witnessSeqBound": payload["witnessSeqBound"],
+            "chainConsistent": payload["chainConsistent"],
+            "fullyCovered": payload["fullyCovered"],
+            "invalidChainNodes": payload["invalidChainNodes"],
+            "invalidWitnesses": payload["invalidWitnesses"],
+            "uncoveredNodes": payload["uncoveredNodes"],
+        }
+        return hashlib.sha256(
+            json.dumps(summary, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def setup_three_proofs(self, key: str) -> None:
+        # 证明 1、2 指向一致性报告 1（两台审计机器各一份），证明 3 指向报告 2。
+        self.setup_two_proofs(key)
+        report2 = self.setup_second_verification_report(f"{key}-r2")
+        status, third = self.post_check_proof(2, report2, f"{key}-p3")
+        self.assertEqual(status, 201, third)
+
+    def test_proof_verification_clean_full_coverage(self) -> None:
+        self.setup_two_proofs("ppv-clean")
+        cd1 = self.proof_chain_digest_for(1)
+        cd2 = self.proof_chain_digest_for(2)
+        self.assertEqual(self.post_proof_witness(1, cd1, "ppv-clean-w1")[0], 201)
+        self.assertEqual(self.post_proof_witness(2, cd2, "ppv-clean-w2")[0], 201)
+        status, response = self.post_proof_verification(2, "ppv-clean-r")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(
+            list(payload),
+            [
+                "verificationSeq",
+                "proofSeqBound",
+                "witnessSeqBound",
+                "digest",
+                "createdBy",
+                "createdAt",
+                "chainConsistent",
+                "fullyCovered",
+                "invalidChainNodes",
+                "invalidWitnesses",
+                "uncoveredNodes",
+            ],
+        )
+        self.assertEqual(payload["proofSeqBound"], 2)
+        self.assertEqual(payload["witnessSeqBound"], 2)
+        self.assertTrue(payload["chainConsistent"])
+        self.assertTrue(payload["fullyCovered"])
+        self.assertEqual(payload["invalidChainNodes"], [])
+        self.assertEqual(payload["invalidWitnesses"], [])
+        self.assertEqual(payload["uncoveredNodes"], [])
+        self.assertEqual(
+            payload["digest"], self.expected_proof_verification_digest(payload)
+        )
+        self.assertFalse(response.endswith(b"\n"))
+
+    def test_missing_proof_only_marks_that_node_no_cascade(self) -> None:
+        # 位置 1 的证明与链项整体缺失：仅节点 1 坏；完整节点 2 独立核对通过，
+        # 其有效见证正常贡献覆盖，不被前方缺口连带判坏。
+        self.setup_two_proofs("ppv-gap")
+        cd1 = self.proof_chain_digest_for(1)
+        cd2 = self.proof_chain_digest_for(2)
+        self.assertEqual(self.post_proof_witness(1, cd1, "ppv-gap-w1")[0], 201)
+        self.assertEqual(self.post_proof_witness(2, cd2, "ppv-gap-w2")[0], 201)
+        self.db_execute("DELETE FROM proof_check_proofs WHERE proof_seq = 1")
+        self.db_execute("DELETE FROM proof_check_proof_chain WHERE proof_seq = 1")
+        status, response = self.post_proof_verification(2, "ppv-gap-r")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertFalse(payload["chainConsistent"])
+        self.assertFalse(payload["fullyCovered"])
+        self.assertEqual(payload["invalidChainNodes"], [1])
+        # 见证 1 指向缺失节点（链项不存在）故无效；见证 2 仍逐字段有效。
+        self.assertEqual(payload["invalidWitnesses"], [1])
+        self.assertEqual(payload["uncoveredNodes"], [1])
+        self.assertEqual(
+            payload["digest"], self.expected_proof_verification_digest(payload)
+        )
+
+    def test_consecutive_missing_each_recorded_once_then_independent(self) -> None:
+        # 连续缺失位置 1、2：每个实际缺口各记录一次；缺口后首个完整节点 3
+        # 用自身证明响应与保存链项独立核对，通过且有有效见证即视为已覆盖。
+        self.setup_three_proofs("ppv-multi")
+        cd3 = self.proof_chain_digest_for(3)
+        self.assertEqual(self.post_proof_witness(3, cd3, "ppv-multi-w3")[0], 201)
+        for seq in (1, 2):
+            self.db_execute(
+                f"DELETE FROM proof_check_proofs WHERE proof_seq = {seq}"
+            )
+            self.db_execute(
+                f"DELETE FROM proof_check_proof_chain WHERE proof_seq = {seq}"
+            )
+        status, response = self.post_proof_verification(3, "ppv-multi-r")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(payload["invalidChainNodes"], [1, 2])
+        self.assertEqual(payload["invalidWitnesses"], [])
+        self.assertEqual(payload["uncoveredNodes"], [1, 2])
+        self.assertFalse(payload["chainConsistent"])
+        self.assertFalse(payload["fullyCovered"])
+
+    def test_real_tamper_after_gap_reanchor_is_still_detected(self) -> None:
+        # 缺口后节点 2 独立重新锚定；节点 3 恢复前项/链摘要全核对，其链摘要被
+        # 真实替换仍须判坏——消除级联误报不得放过真实替换或重排。
+        self.setup_three_proofs("ppv-tamper")
+        self.assertEqual(
+            self.post_proof_witness(2, self.proof_chain_digest_for(2), "ppv-tamper-w2")[0],
+            201,
+        )
+        self.db_execute("DELETE FROM proof_check_proofs WHERE proof_seq = 1")
+        self.db_execute("DELETE FROM proof_check_proof_chain WHERE proof_seq = 1")
+        self.db_execute(
+            "UPDATE proof_check_proof_chain SET chain_digest = ? WHERE proof_seq = 3",
+            ("ab" * 32,),
+        )
+        status, response = self.post_proof_verification(3, "ppv-tamper-r")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        # 节点 1 为缺口，节点 2 独立核对有效，节点 3 真实篡改被抓，无级联。
+        self.assertEqual(payload["invalidChainNodes"], [1, 3])
+
+    def test_chain_only_gap_advances_truth_anchor(self) -> None:
+        # 仅删链项、证明仍在：节点 2 记为缺口，但真相锚点沿证明响应继续推进，
+        # 节点 3 仍按真相精确核对通过（保留旧有非级联行为）。
+        self.setup_three_proofs("ppv-conly")
+        for seq in (1, 2, 3):
+            self.assertEqual(
+                self.post_proof_witness(
+                    seq, self.proof_chain_digest_for(seq), f"ppv-conly-w{seq}"
+                )[0],
+                201,
+            )
+        self.db_execute("DELETE FROM proof_check_proof_chain WHERE proof_seq = 2")
+        status, response = self.post_proof_verification(3, "ppv-conly-r")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(payload["invalidChainNodes"], [2])
+        # 指向缺失链项的见证 2 无效；节点 1、3 的见证有效并完成覆盖。
+        self.assertEqual(payload["invalidWitnesses"], [2])
+        self.assertEqual(payload["uncoveredNodes"], [2])
+
+    def test_proof_verification_replay_returns_first_bytes(self) -> None:
+        self.setup_two_proofs("ppv-rep")
+        status, first = self.post_proof_verification(2, "ppv-rep-r")
+        self.assertEqual(status, 201)
+        status, second = self.post_proof_verification(2, "ppv-rep-r")
+        self.assertEqual(status, 201)
+        self.assertEqual(second, first)
+
+    def test_proof_verification_target_missing_and_structure(self) -> None:
+        status, body = self.post_proof_verification(99, "ppv-miss")
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+        # 非法正文 400。
+        status, _ = self.request_raw(
+            "/v1/proof-check-proof-verifications",
+            json.dumps({"proofSeq": "1"}).encode(),
+            "ppv-miss-bad",
+            "POST",
+        )
+        self.assertEqual(status, 400)
+        # 未配置审计身份 403。
+        self.setup_two_proofs("ppv-miss-setup")
+        status, _ = self.post_proof_verification(
+            2,
+            "ppv-miss-forbidden",
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+        )
+        self.assertEqual(status, 403)
+
 
 class IntegerLimitTests(_EvidenceScenario, unittest.TestCase):
     # 进程级整数转换保护（PEP 682）不再全局关闭：仅 README 已声明的审计序号
