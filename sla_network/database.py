@@ -563,6 +563,38 @@ CREATE TABLE IF NOT EXISTS proof_check_proof_idempotency_records (
     auth_nonce TEXT,
     auth_signature TEXT
 );
+CREATE TABLE IF NOT EXISTS proof_check_proof_chain (
+    proof_seq INTEGER PRIMARY KEY,
+    response_digest TEXT NOT NULL,
+    previous_chain_digest TEXT NOT NULL,
+    chain_digest TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS proof_check_proof_witnesses (
+    witness_seq INTEGER PRIMARY KEY,
+    proof_seq INTEGER NOT NULL,
+    chain_digest TEXT NOT NULL,
+    auditor_machine_id TEXT NOT NULL,
+    public_key TEXT NOT NULL,
+    key_version INTEGER NOT NULL,
+    request_time_ms INTEGER NOT NULL,
+    nonce TEXT NOT NULL,
+    body_digest TEXT NOT NULL,
+    auth_signature TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    response_json TEXT NOT NULL,
+    UNIQUE (proof_seq, auditor_machine_id)
+);
+CREATE TABLE IF NOT EXISTS proof_check_proof_witness_idempotency_records (
+    key TEXT PRIMARY KEY,
+    request_json TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    response_json TEXT NOT NULL,
+    auth_machine_id TEXT,
+    auth_key_version INTEGER,
+    auth_request_time_ms INTEGER,
+    auth_nonce TEXT,
+    auth_signature TEXT
+);
 CREATE TABLE IF NOT EXISTS machine_delegations (
     id TEXT PRIMARY KEY,
     issuer_machine_id TEXT NOT NULL,
@@ -650,6 +682,8 @@ AUDIT_CHAIN_MARKER = "audit_comparison_chain_backfilled"
 AUDIT_CHAIN_GENESIS_DIGEST = "0" * 64
 PROOF_CHECK_CHAIN_MARKER = "proof_check_chain_backfilled"
 PROOF_CHECK_CHAIN_GENESIS_DIGEST = "0" * 64
+PROOF_CHECK_PROOF_CHAIN_MARKER = "proof_check_proof_chain_backfilled"
+PROOF_CHECK_PROOF_CHAIN_GENESIS_DIGEST = "0" * 64
 
 AUTH_IDEMPOTENCY_TABLES = (
     "capability_idempotency_records",
@@ -1243,6 +1277,63 @@ def _backfill_proof_check_chain(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _backfill_proof_check_proof_chain(connection: sqlite3.Connection) -> None:
+    # 证明链一次性补链：旧证明按证明序号 proofSeq 升序在单事务内逐行计算链
+    # 摘要；首项以前项摘要六十四个零起链。不改历史响应、时间、序号与幂等字节。
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        if (
+            connection.execute(
+                "SELECT 1 FROM schema_metadata WHERE key = ?",
+                (PROOF_CHECK_PROOF_CHAIN_MARKER,),
+            ).fetchone()
+            is not None
+        ):
+            # 其他连接已完成补链，直接释放写锁，不再重复。
+            connection.execute("COMMIT")
+            return
+        previous_chain_digest = PROOF_CHECK_PROOF_CHAIN_GENESIS_DIGEST
+        rows = connection.execute(
+            "SELECT proof_seq, response_json FROM proof_check_proofs"
+            " ORDER BY proof_seq ASC"
+        ).fetchall()
+        for row in rows:
+            # responseDigest 取首次完整响应紧凑 UTF-8 无尾换行字节的 SHA-256；
+            # response_json 本身即紧凑 JSON 且无尾换行，直接对其 UTF-8 字节摘要。
+            response_digest = hashlib.sha256(
+                row["response_json"].encode("utf-8")
+            ).hexdigest()
+            chain_text = "\n".join(
+                (
+                    "proof-check-proof-chain-v1",
+                    str(row["proof_seq"]),
+                    response_digest,
+                    previous_chain_digest,
+                )
+            )
+            chain_digest = hashlib.sha256(chain_text.encode("utf-8")).hexdigest()
+            connection.execute(
+                "INSERT INTO proof_check_proof_chain"
+                "(proof_seq, response_digest, previous_chain_digest, chain_digest)"
+                " VALUES (?, ?, ?, ?)",
+                (
+                    row["proof_seq"],
+                    response_digest,
+                    previous_chain_digest,
+                    chain_digest,
+                ),
+            )
+            previous_chain_digest = chain_digest
+        connection.execute(
+            "INSERT INTO schema_metadata(key, value) VALUES (?, '1')",
+            (PROOF_CHECK_PROOF_CHAIN_MARKER,),
+        )
+        connection.execute("COMMIT")
+    except BaseException:
+        connection.execute("ROLLBACK")
+        raise
+
+
 def connect(path: str) -> sqlite3.Connection:
     database = Path(path)
     database.parent.mkdir(parents=True, exist_ok=True)
@@ -1365,6 +1456,14 @@ def connect(path: str) -> sqlite3.Connection:
         is None
     ):
         _backfill_proof_check_chain(connection)
+    if (
+        connection.execute(
+            "SELECT 1 FROM schema_metadata WHERE key = ?",
+            (PROOF_CHECK_PROOF_CHAIN_MARKER,),
+        ).fetchone()
+        is None
+    ):
+        _backfill_proof_check_proof_chain(connection)
     # 委托按签发事件序号分页：事件表 join 委托后需 (issuer, issued_seq) 索引。
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_delegation_events_delegation_seq"
