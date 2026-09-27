@@ -20120,6 +20120,481 @@ class ProofCheckChainTests(_EvidenceScenario, unittest.TestCase):
         self.assertEqual(payload["digest"], self.expected_report_digest(payload))
 
 
+class ProofCheckProofChainTests(ProofCheckChainTests):
+    # 证明前向链与链头见证：一致性报告签名证明首次成功在原事务追加
+    # proof-check-proof-chain-v1 前向链记录；旧库按 proofSeq 升序单事务补链。
+    # 辅助方法（request_raw/setup_clean_verification_report/post_check_proof 等）
+    # 复用 ProofCheckChainTests；屏蔽继承来的复核链测试，避免重复运行。
+    for _inherited in dir(ProofCheckChainTests):
+        if _inherited.startswith("test_"):
+            locals()[_inherited] = None
+
+    def proof_chain_digest_for(self, proof_seq: int) -> str:
+        status, body = self.get("/v1/proof-check-proof-chain")
+        self.assertEqual(status, 200, body)
+        entries = json.loads(body)["entries"]
+        return next(
+            entry["chainDigest"]
+            for entry in entries
+            if entry["proofSeq"] == proof_seq
+        )
+
+    def proof_witness_body(self, proof_seq: object, chain_digest: str) -> bytes:
+        return json.dumps(
+            {"proofSeq": proof_seq, "chainDigest": chain_digest}
+        ).encode()
+
+    def post_proof_witness(
+        self, proof_seq: object, chain_digest: str, key: str, **kwargs: object
+    ) -> tuple[int, bytes]:
+        return self.request_raw(
+            "/v1/proof-check-proof-witnesses",
+            self.proof_witness_body(proof_seq, chain_digest),
+            key,
+            "POST",
+            **kwargs,
+        )
+
+    def setup_two_proofs(
+        self, key: str
+    ) -> tuple[bytes, bytes, bytes]:
+        # 两份证明指向同一份一致性报告：第二份由另一审计机器签署，proofSeq 全库递增。
+        report = self.setup_clean_verification_report(f"{key}-r")
+        status, first = self.post_check_proof(1, report, f"{key}-p1")
+        self.assertEqual(status, 201, first)
+        status, second = self.post_check_proof(
+            1,
+            report,
+            f"{key}-p2",
+            seed=self.AUDITOR2_SEED,
+            actor=self.auditor2_id,
+        )
+        self.assertEqual(status, 201, second)
+        return report, first, second
+
+    def setup_second_verification_report(self, key: str) -> bytes:
+        # 序号 2 的审计验证报告 → 复核 2 → 复核链见证 2 → 一致性报告 2。
+        audit_report = self.create_verification(2, f"{key}-v2")
+        self.create_proof(2, audit_report, f"{key}-ap2")
+        status, _ = self.post_check(2, f"{key}-check2")
+        self.assertEqual(status, 201)
+        self.post_witness(2, self.chain_digest_for(2), f"{key}-cw2")
+        status, report = self.post_check_verification(2, f"{key}-r2")
+        self.assertEqual(status, 201, report)
+        return report
+
+    # ---- 证明链 ----
+
+    def test_proof_chain_empty_history(self) -> None:
+        status, body = self.get("/v1/proof-check-proof-chain")
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertEqual(list(payload), ["entries", "nextCursor", "head"])
+        self.assertEqual(payload["entries"], [])
+        self.assertIsNone(payload["nextCursor"])
+        self.assertIsNone(payload["head"])
+        self.assertFalse(body.endswith(b"\n"))
+
+    def test_proof_chain_entries_digests_and_head(self) -> None:
+        _, first, second = self.setup_two_proofs("ppc-cd")
+        status, body = self.get("/v1/proof-check-proof-chain")
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        entries = payload["entries"]
+        self.assertEqual([e["proofSeq"] for e in entries], [1, 2])
+        self.assertEqual(
+            [list(e) for e in entries],
+            [
+                ["proofSeq", "responseDigest", "previousChainDigest", "chainDigest"],
+                ["proofSeq", "responseDigest", "previousChainDigest", "chainDigest"],
+            ],
+        )
+        zeros = "0" * 64
+        rd1 = hashlib.sha256(first).hexdigest()
+        rd2 = hashlib.sha256(second).hexdigest()
+        cd1 = hashlib.sha256(
+            "\n".join(("proof-check-proof-chain-v1", "1", rd1, zeros)).encode("utf-8")
+        ).hexdigest()
+        cd2 = hashlib.sha256(
+            "\n".join(("proof-check-proof-chain-v1", "2", rd2, cd1)).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(entries[0]["responseDigest"], rd1)
+        self.assertEqual(entries[0]["previousChainDigest"], zeros)
+        self.assertEqual(entries[0]["chainDigest"], cd1)
+        self.assertEqual(entries[1]["responseDigest"], rd2)
+        self.assertEqual(entries[1]["previousChainDigest"], cd1)
+        self.assertEqual(entries[1]["chainDigest"], cd2)
+        self.assertEqual(payload["head"], {"proofSeq": 2, "chainDigest": cd2})
+        self.assertIsNone(payload["nextCursor"])
+
+    def test_proof_chain_paging_and_stable_cut(self) -> None:
+        self.setup_two_proofs("ppc-pg")
+        status, body = self.get("/v1/proof-check-proof-chain?limit=1")
+        self.assertEqual(status, 200, body)
+        first_page = json.loads(body)
+        self.assertEqual([e["proofSeq"] for e in first_page["entries"]], [1])
+        self.assertEqual(first_page["nextCursor"], "2:1")
+        self.assertEqual(first_page["head"]["proofSeq"], 2)
+        # 旧游标携带 cut=2：此后新增证明不进入续页，head 仍停在 cut 末项。
+        report = self.setup_second_verification_report("ppc-pg")
+        status, third = self.post_check_proof(2, report, "ppc-pg-p3")
+        self.assertEqual(status, 201, third)
+        status, body = self.get(
+            f"/v1/proof-check-proof-chain?limit=1&cursor={first_page['nextCursor']}"
+        )
+        self.assertEqual(status, 200, body)
+        second_page = json.loads(body)
+        self.assertEqual([e["proofSeq"] for e in second_page["entries"]], [2])
+        self.assertIsNone(second_page["nextCursor"])
+        self.assertEqual(second_page["head"]["proofSeq"], 2)
+        # 全新首页取新 cut=3。
+        status, body = self.get("/v1/proof-check-proof-chain?limit=1")
+        self.assertEqual(json.loads(body)["head"]["proofSeq"], 3)
+
+    def test_proof_chain_invalid_params_and_cursors(self) -> None:
+        self.setup_two_proofs("ppc-bad")
+        for query in (
+            "limit=0",
+            "limit=101",
+            "limit=x",
+            "foo=1",
+            "cursor=1",
+            "cursor=x:1",
+            "limit=1&limit=2",
+            "cursor=99:1",
+            "cursor=1:5",
+        ):
+            status, _ = self.get(f"/v1/proof-check-proof-chain?{query}")
+            self.assertEqual(status, 400, query)
+
+    def test_proof_chain_single_item(self) -> None:
+        _, first, _ = self.setup_two_proofs("ppc-item")
+        status, body = self.get("/v1/proof-check-proof-chain/1")
+        self.assertEqual(status, 200, body)
+        entry = json.loads(body)
+        self.assertEqual(
+            list(entry),
+            ["proofSeq", "responseDigest", "previousChainDigest", "chainDigest"],
+        )
+        self.assertEqual(entry["proofSeq"], 1)
+        self.assertEqual(entry["responseDigest"], hashlib.sha256(first).hexdigest())
+        self.assertEqual(entry["previousChainDigest"], "0" * 64)
+        expected = hashlib.sha256(
+            "\n".join(
+                (
+                    "proof-check-proof-chain-v1",
+                    "1",
+                    entry["responseDigest"],
+                    "0" * 64,
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(entry["chainDigest"], expected)
+        self.assertFalse(body.endswith(b"\n"))
+
+    def test_proof_chain_single_item_errors(self) -> None:
+        self.setup_two_proofs("ppc-item-err")
+        for seq in ("0", "01", "abc", "3"):
+            status, _ = self.get(f"/v1/proof-check-proof-chain/{seq}")
+            self.assertEqual(status, 404, seq)
+        status, _ = self.get("/v1/proof-check-proof-chain/1?x=1")
+        self.assertEqual(status, 400)
+        status, _ = self.get("/v1/proof-check-proof-chain/1", omit_auth=True)
+        self.assertEqual(status, 400)
+        status, _ = self.get(
+            "/v1/proof-check-proof-chain/1",
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+        )
+        self.assertEqual(status, 403)
+
+    def test_proof_chain_requires_auditor_and_auth(self) -> None:
+        status, _ = self.get(
+            "/v1/proof-check-proof-chain",
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+        )
+        self.assertEqual(status, 403)
+        status, _ = self.get("/v1/proof-check-proof-chain", omit_auth=True)
+        self.assertEqual(status, 400)
+
+    def test_proof_chain_nonce_consumed_only_on_success(self) -> None:
+        self.setup_two_proofs("ppc-nonce")
+        nonce = f"nonce-ppc-chain-{time.time_ns()}"
+        status, _ = self.get("/v1/proof-check-proof-chain", nonce=nonce)
+        self.assertEqual(status, 200)
+        status, body = self.get("/v1/proof-check-proof-chain", nonce=nonce)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "replay_detected"})
+        failed_nonce = f"nonce-ppc-chain-fail-{time.time_ns()}"
+        for _ in range(2):
+            status, _ = self.get(
+                "/v1/proof-check-proof-chain?cursor=99:1", nonce=failed_nonce
+            )
+            self.assertEqual(status, 400)
+
+    def test_no_chain_append_on_failed_or_replayed_proof(self) -> None:
+        report = self.setup_clean_verification_report("ppc-fail")
+        # 验签失败（409）不追加链项、不推进序号。
+        bad = json.dumps(
+            {"verificationSeq": 1, "signature": "ab" * 64}
+        ).encode()
+        status, _ = self.request_raw(
+            "/v1/proof-check-proofs", bad, "ppc-fail-badsig", "POST"
+        )
+        self.assertEqual(status, 409)
+        # 目标缺失（404）不追加链项。
+        status, _ = self.post_check_proof(99, report, "ppc-fail-missing")
+        self.assertEqual(status, 404)
+        status, body = self.get("/v1/proof-check-proof-chain")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["entries"], [])
+        # 首次成功追加一条；同键重放不再追加。
+        status, first = self.post_check_proof(1, report, "ppc-fail-ok")
+        self.assertEqual(status, 201, first)
+        status, replay = self.post_check_proof(1, report, "ppc-fail-ok")
+        self.assertEqual(status, 201)
+        self.assertEqual(replay, first)
+        status, body = self.get("/v1/proof-check-proof-chain")
+        self.assertEqual([e["proofSeq"] for e in json.loads(body)["entries"]], [1])
+
+    def test_proof_chain_backfilled_after_restart(self) -> None:
+        _, first, second = self.setup_two_proofs("ppc-mig")
+        # 手工删除链并清除迁移标记，模拟升级前只有证明记录的旧库。
+        self.db_execute("DELETE FROM proof_check_proof_chain")
+        self.db_execute(
+            "DELETE FROM schema_metadata"
+            " WHERE key = 'proof_check_proof_chain_backfilled'"
+        )
+        self.restart()
+        status, body = self.get("/v1/proof-check-proof-chain")
+        self.assertEqual(status, 200, body)
+        entries = json.loads(body)["entries"]
+        self.assertEqual([e["proofSeq"] for e in entries], [1, 2])
+        rd1 = hashlib.sha256(first).hexdigest()
+        rd2 = hashlib.sha256(second).hexdigest()
+        cd1 = hashlib.sha256(
+            "\n".join(("proof-check-proof-chain-v1", "1", rd1, "0" * 64)).encode()
+        ).hexdigest()
+        cd2 = hashlib.sha256(
+            "\n".join(("proof-check-proof-chain-v1", "2", rd2, cd1)).encode()
+        ).hexdigest()
+        self.assertEqual(entries[0]["chainDigest"], cd1)
+        self.assertEqual(entries[1]["chainDigest"], cd2)
+        # 补链不改历史响应、时间、序号与幂等字节。
+        status, reread = self.get("/v1/proof-check-proofs")
+        self.assertEqual(status, 200)
+        proofs = json.loads(reread)["proofs"]
+        self.assertEqual(proofs[0], json.loads(first))
+        self.assertEqual(proofs[1], json.loads(second))
+        # 迁移仅一次：再次重启不重复补链。
+        self.restart()
+        status, body = self.get("/v1/proof-check-proof-chain")
+        self.assertEqual(len(json.loads(body)["entries"]), 2)
+
+    def test_proof_chain_exposes_tampering_without_repair(self) -> None:
+        self.setup_two_proofs("ppc-tamper")
+        self.db_execute(
+            "UPDATE proof_check_proof_chain SET chain_digest = ? WHERE proof_seq = 1",
+            ("f" * 64,),
+        )
+        status, body = self.get("/v1/proof-check-proof-chain/1")
+        self.assertEqual(status, 200)
+        # 服务不修补历史：链项与 head 如实暴露被替换的摘要。
+        self.assertEqual(json.loads(body)["chainDigest"], "f" * 64)
+        status, body = self.get("/v1/proof-check-proof-chain")
+        payload = json.loads(body)
+        self.assertEqual(payload["head"]["proofSeq"], 2)
+        self.assertEqual(payload["entries"][0]["chainDigest"], "f" * 64)
+
+    # ---- 证明链头见证 ----
+
+    def test_proof_witness_created_with_frozen_fields(self) -> None:
+        from sla_network.ed25519 import verify as ed25519_verify
+
+        self.setup_two_proofs("ppw-create")
+        chain_digest = self.proof_chain_digest_for(1)
+        body = self.proof_witness_body(1, chain_digest)
+        status, response = self.post_proof_witness(1, chain_digest, "ppw-create-1")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(
+            list(payload),
+            [
+                "witnessSeq",
+                "proofSeq",
+                "chainDigest",
+                "auditorId",
+                "publicKey",
+                "keyVersion",
+                "requestTimeMs",
+                "nonce",
+                "bodyDigest",
+                "authSignature",
+                "createdAt",
+            ],
+        )
+        self.assertEqual(payload["witnessSeq"], 1)
+        self.assertEqual(payload["proofSeq"], 1)
+        self.assertEqual(payload["chainDigest"], chain_digest)
+        self.assertEqual(payload["auditorId"], self.auditor_id)
+        self.assertEqual(payload["publicKey"], ARBITRATOR_PUBLIC)
+        self.assertEqual(payload["bodyDigest"], hashlib.sha256(body).hexdigest())
+        message = (
+            f"request-auth-v1\nPOST\n/v1/proof-check-proof-witnesses\n"
+            f"{payload['bodyDigest']}\n{payload['requestTimeMs']}\n"
+            f"{payload['nonce']}\n{payload['keyVersion']}\n{self.auditor_id}"
+        ).encode("utf-8")
+        self.assertTrue(
+            ed25519_verify(
+                bytes.fromhex(ARBITRATOR_PUBLIC),
+                message,
+                bytes.fromhex(payload["authSignature"]),
+            )
+        )
+        self.assertFalse(response.endswith(b"\n"))
+
+    def test_proof_witness_replay_restart_and_no_seq_advance(self) -> None:
+        self.setup_two_proofs("ppw-rep")
+        chain_digest = self.proof_chain_digest_for(1)
+        status, first = self.post_proof_witness(1, chain_digest, "ppw-rep-1")
+        self.assertEqual(status, 201)
+        status, second = self.post_proof_witness(1, chain_digest, "ppw-rep-1")
+        self.assertEqual(status, 201)
+        self.assertEqual(second, first)
+        self.restart()
+        status, third = self.post_proof_witness(1, chain_digest, "ppw-rep-1")
+        self.assertEqual(status, 201)
+        self.assertEqual(third, first)
+        # 重放不推进见证序号：异键成功见证 proofSeq=2 仍为序号 2。
+        cd2 = self.proof_chain_digest_for(2)
+        status, other = self.post_proof_witness(2, cd2, "ppw-rep-2")
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(other)["witnessSeq"], 2)
+
+    def test_proof_witness_missing_oversized_and_digest_mismatch(self) -> None:
+        self.setup_two_proofs("ppw-err")
+        chain_digest = self.proof_chain_digest_for(1)
+        status, body = self.post_proof_witness(3, chain_digest, "ppw-err-missing")
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+        # 合法超大序号同样按链节点不存在处理。
+        status, body = self.post_proof_witness(
+            9223372036854775808, chain_digest, "ppw-err-huge"
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+        status, body = self.post_proof_witness(1, "a" * 64, "ppw-err-mismatch")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_proof_witness_duplicate_same_distinct_auditor(self) -> None:
+        self.setup_two_proofs("ppw-dup")
+        chain_digest = self.proof_chain_digest_for(1)
+        status, _ = self.post_proof_witness(1, chain_digest, "ppw-dup-1")
+        self.assertEqual(status, 201)
+        # 同机异键重复见证：witness_exists。
+        status, body = self.post_proof_witness(1, chain_digest, "ppw-dup-2")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "witness_exists"})
+        # 不同审计机器可分别对同一节点签名，序号继续递增。
+        status, other = self.post_proof_witness(
+            1,
+            chain_digest,
+            "ppw-dup-other",
+            seed=self.AUDITOR2_SEED,
+            actor=self.auditor2_id,
+        )
+        self.assertEqual(status, 201, other)
+        payload = json.loads(other)
+        self.assertEqual(payload["witnessSeq"], 2)
+        self.assertEqual(payload["proofSeq"], 1)
+        self.assertEqual(payload["auditorId"], self.auditor2_id)
+
+    def test_proof_witness_structure_permission_nonce(self) -> None:
+        self.setup_two_proofs("ppw-auth")
+        chain_digest = self.proof_chain_digest_for(1)
+        # 非法正文：缺 chainDigest。
+        status, _ = self.request_raw(
+            "/v1/proof-check-proof-witnesses",
+            json.dumps({"proofSeq": 1}).encode(),
+            "ppw-auth-badbody",
+            "POST",
+        )
+        self.assertEqual(status, 400)
+        # 查询参数非法。
+        status, _ = self.request_raw(
+            "/v1/proof-check-proof-witnesses?x=1",
+            self.proof_witness_body(1, chain_digest),
+            "ppw-auth-query",
+            "POST",
+        )
+        self.assertEqual(status, 400)
+        # 缺失认证头。
+        request = Request(
+            self.url("/v1/proof-check-proof-witnesses"),
+            data=self.proof_witness_body(1, chain_digest),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "ppw-auth-noauth")
+        try:
+            with urlopen(request, timeout=5) as response:
+                status = response.status
+        except HTTPError as error:
+            status = error.code
+        self.assertEqual(status, 400)
+        # 非审计机器 403。
+        status, _ = self.post_proof_witness(
+            1,
+            chain_digest,
+            "ppw-auth-forbidden",
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+        )
+        self.assertEqual(status, 403)
+        # 失败不消费随机数：合法请求随后可用同一随机数成功。
+        nonce = f"nonce-ppw-auth-{time.time_ns()}"
+        status, _ = self.post_proof_witness(
+            3, chain_digest, "ppw-auth-fail", nonce=nonce
+        )
+        self.assertEqual(status, 404)
+        status, _ = self.post_proof_witness(
+            1, chain_digest, "ppw-auth-ok", nonce=nonce
+        )
+        self.assertEqual(status, 201)
+        # 成功后随机数已消费：异键复用为 replay_detected。
+        status, body = self.post_proof_witness(
+            2, self.proof_chain_digest_for(2), "ppw-auth-replay", nonce=nonce
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "replay_detected"})
+
+    def test_proof_witness_same_key_changed_body_or_auth_conflict(self) -> None:
+        self.setup_two_proofs("ppw-conf")
+        chain_digest = self.proof_chain_digest_for(1)
+        status, _ = self.post_proof_witness(1, chain_digest, "ppw-conf-1")
+        self.assertEqual(status, 201)
+        # 同键异体：冲突，且先于资源查询。
+        status, body = self.request_raw(
+            "/v1/proof-check-proof-witnesses",
+            self.proof_witness_body(2, chain_digest),
+            "ppw-conf-1",
+            "POST",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+        # 同键同体异认证五段：冲突。
+        status, body = self.request_raw(
+            "/v1/proof-check-proof-witnesses",
+            self.proof_witness_body(1, chain_digest),
+            "ppw-conf-1",
+            "POST",
+            nonce=f"nonce-ppw-conf-{time.time_ns()}",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+
 class IntegerLimitTests(_EvidenceScenario, unittest.TestCase):
     # 进程级整数转换保护（PEP 682）不再全局关闭：仅 README 已声明的审计序号
     # 入口接受超长整数（超存储范围按不存在处理），其他入口的超长整数一律
