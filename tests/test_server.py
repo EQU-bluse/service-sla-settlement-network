@@ -22518,6 +22518,663 @@ class FinalAuditProofVerificationTests(FinalAuditProofWitnessTests):
         self.assertEqual(json.loads(response)["proofSeqBound"], 2)
 
 
+class FinalAuditVerificationProofTests(FinalAuditProofVerificationTests):
+    # 一致性报告冻结签名证明：为已保存的终局证明复核一致性报告
+    # （final_audit_proof_verifications）追加 final-audit-verification-proof-v1
+    # 业务签名证明；冻结审计身份、公钥与密钥版本，独立序号自 1 起。
+    # 辅助方法复用 FinalAuditProofVerificationTests；屏蔽继承来的既有测试。
+    for _inherited in dir(FinalAuditProofVerificationTests):
+        if _inherited.startswith("test_"):
+            locals()[_inherited] = None
+
+    ENDPOINT = "/v1/final-audit-verification-proofs"
+
+    def setup_final_report(self, key: str) -> bytes:
+        # 终局冻结证明 proofSeq=1 → 终局证明复核一致性报告 verificationSeq=1。
+        target = self.setup_target_report(f"{key}-t")
+        status, _ = self.post_final_proof(1, target, f"{key}-fp")
+        self.assertEqual(status, 201)
+        status, report = self.post_final_verification(1, f"{key}-r")
+        self.assertEqual(status, 201, report)
+        return report
+
+    def setup_second_final_report(self, key: str) -> bytes:
+        # 接续全库序号：第二份终局证明 proofSeq=2 → 终局报告 verificationSeq=2
+        # （proofSeqBound=2）。
+        target2 = self.setup_second_target_report(f"{key}-t2")
+        status, _ = self.post_final_proof(2, target2, f"{key}-fp2")
+        self.assertEqual(status, 201)
+        status, report2 = self.post_final_verification(2, f"{key}-r2")
+        self.assertEqual(status, 201, report2)
+        return report2
+
+    def verification_proof_body(
+        self,
+        verification_seq: int,
+        report_bytes: bytes,
+        seed: bytes | None = None,
+    ) -> bytes:
+        report = json.loads(report_bytes)
+        response_digest = hashlib.sha256(report_bytes).hexdigest()
+        message = "\n".join(
+            (
+                "final-audit-verification-proof-v1",
+                str(verification_seq),
+                response_digest,
+                report["digest"],
+                str(report["proofSeqBound"]),
+                str(report["witnessSeqBound"]),
+            )
+        ).encode("utf-8")
+        signature = _ed25519_sign(
+            seed if seed is not None else self.AUDITOR_SEED, message
+        ).hex()
+        return json.dumps(
+            {"verificationSeq": verification_seq, "signature": signature}
+        ).encode()
+
+    def post_verification_proof(
+        self,
+        verification_seq: int,
+        report_bytes: bytes,
+        key: str,
+        **kwargs: object,
+    ) -> tuple[int, bytes]:
+        seed = kwargs.get("seed")
+        body = self.verification_proof_body(
+            verification_seq,
+            report_bytes,
+            seed if isinstance(seed, bytes) else None,
+        )
+        return self.request_raw(self.ENDPOINT, body, key, "POST", **kwargs)
+
+    def test_verification_proof_created_with_frozen_fields(self) -> None:
+        from sla_network.ed25519 import verify as ed25519_verify
+
+        report = self.setup_final_report("favp-create")
+        status, response = self.post_verification_proof(1, report, "favp-create-1")
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(
+            list(payload),
+            [
+                "proofSeq",
+                "verificationSeq",
+                "responseDigest",
+                "auditorId",
+                "publicKey",
+                "keyVersion",
+                "signature",
+                "createdAt",
+            ],
+        )
+        # 独立序号空间：终局冻结证明已占 proofSeq=1，本类证明序号仍自 1 起。
+        self.assertEqual(payload["proofSeq"], 1)
+        self.assertEqual(payload["verificationSeq"], 1)
+        self.assertEqual(
+            payload["responseDigest"], hashlib.sha256(report).hexdigest()
+        )
+        self.assertEqual(payload["auditorId"], self.auditor_id)
+        self.assertEqual(payload["publicKey"], ARBITRATOR_PUBLIC)
+        self.assertEqual(payload["keyVersion"], 1)
+        # 冻结字段足以独立复验业务签名。
+        report_payload = json.loads(report)
+        message = "\n".join(
+            (
+                "final-audit-verification-proof-v1",
+                "1",
+                payload["responseDigest"],
+                report_payload["digest"],
+                str(report_payload["proofSeqBound"]),
+                str(report_payload["witnessSeqBound"]),
+            )
+        ).encode("utf-8")
+        self.assertTrue(
+            ed25519_verify(
+                bytes.fromhex(payload["publicKey"]),
+                message,
+                bytes.fromhex(payload["signature"]),
+            )
+        )
+        self.assertFalse(response.endswith(b"\n"))
+
+    def test_wrong_domain_or_fields_fail_signature(self) -> None:
+        report = self.setup_final_report("favp-domain")
+        report_payload = json.loads(report)
+        response_digest = hashlib.sha256(report).hexdigest()
+        # 用上一级签名域 final-audit-proof-v1 签署：业务验签失败。
+        message = "\n".join(
+            (
+                "final-audit-proof-v1",
+                "1",
+                response_digest,
+                report_payload["digest"],
+                str(report_payload["proofSeqBound"]),
+                str(report_payload["witnessSeqBound"]),
+            )
+        ).encode("utf-8")
+        body = json.dumps(
+            {
+                "verificationSeq": 1,
+                "signature": _ed25519_sign(self.AUDITOR_SEED, message).hex(),
+            }
+        ).encode()
+        status, response = self.request_raw(
+            self.ENDPOINT, body, "favp-domain-1", "POST"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(response), {"error": "invalid_signature"})
+        # 篡改绑定的证明上界同样验签失败。
+        message = "\n".join(
+            (
+                "final-audit-verification-proof-v1",
+                "1",
+                response_digest,
+                report_payload["digest"],
+                str(report_payload["proofSeqBound"] + 1),
+                str(report_payload["witnessSeqBound"]),
+            )
+        ).encode("utf-8")
+        body = json.dumps(
+            {
+                "verificationSeq": 1,
+                "signature": _ed25519_sign(self.AUDITOR_SEED, message).hex(),
+            }
+        ).encode()
+        status, response = self.request_raw(
+            self.ENDPOINT, body, "favp-domain-2", "POST"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(response), {"error": "invalid_signature"})
+
+    def test_replay_and_restart(self) -> None:
+        report = self.setup_final_report("favp-rep")
+        status, first = self.post_verification_proof(1, report, "favp-rep-1")
+        self.assertEqual(status, 201)
+        status, second = self.post_verification_proof(1, report, "favp-rep-1")
+        self.assertEqual(status, 201)
+        self.assertEqual(second, first)
+        self.restart()
+        status, third = self.post_verification_proof(1, report, "favp-rep-1")
+        self.assertEqual(status, 201)
+        self.assertEqual(third, first)
+        # 重放不推进证明序号：另一审计机器异键证明为序号 2。
+        status, other = self.post_verification_proof(
+            1,
+            report,
+            "favp-rep-2",
+            seed=self.AUDITOR2_SEED,
+            actor=self.auditor2_id,
+        )
+        self.assertEqual(status, 201, other)
+        self.assertEqual(json.loads(other)["proofSeq"], 2)
+
+    def test_same_key_changed_body_or_auth_conflicts(self) -> None:
+        report = self.setup_final_report("favp-conf")
+        status, _ = self.post_verification_proof(1, report, "favp-conf-1")
+        self.assertEqual(status, 201)
+        # 同键异体（结构合法即可，冲突判定先于资源查询）。
+        status, body = self.request_raw(
+            self.ENDPOINT,
+            self.verification_proof_body(2, report),
+            "favp-conf-1",
+            "POST",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+        # 同键同体异认证五段。
+        status, body = self.request_raw(
+            self.ENDPOINT,
+            self.verification_proof_body(1, report),
+            "favp-conf-1",
+            "POST",
+            nonce=f"nonce-favp-conf-{time.time_ns()}",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_missing_and_oversized_target_is_404(self) -> None:
+        self.setup_final_report("favp-miss")
+        body_for_missing = json.dumps(
+            {"verificationSeq": 99, "signature": "ab" * 64}
+        ).encode()
+        status, body = self.request_raw(
+            self.ENDPOINT, body_for_missing, "favp-miss-1", "POST"
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+        # 合法超大序号同样按报告不存在处理。
+        huge_body = json.dumps(
+            {"verificationSeq": 9223372036854775808, "signature": "ab" * 64}
+        ).encode()
+        status, body = self.request_raw(
+            self.ENDPOINT, huge_body, "favp-miss-2", "POST"
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+
+    def test_duplicate_checked_after_signature(self) -> None:
+        report = self.setup_final_report("favp-dup")
+        status, _ = self.post_verification_proof(1, report, "favp-dup-1")
+        self.assertEqual(status, 201)
+        # 异键重复证明：签名有效时判 proof_exists。
+        status, body = self.post_verification_proof(1, report, "favp-dup-2")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "proof_exists"})
+        # 签名无效时先判 invalid_signature（唯一性在验签之后）。
+        bad = json.dumps(
+            {"verificationSeq": 1, "signature": "ab" * 64}
+        ).encode()
+        status, body = self.request_raw(
+            self.ENDPOINT, bad, "favp-dup-3", "POST"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "invalid_signature"})
+        # 不同审计机器仍可分别证明同一报告。
+        status, other = self.post_verification_proof(
+            1,
+            report,
+            "favp-dup-4",
+            seed=self.AUDITOR2_SEED,
+            actor=self.auditor2_id,
+        )
+        self.assertEqual(status, 201, other)
+        self.assertEqual(json.loads(other)["proofSeq"], 2)
+
+    def test_structure_and_auth_errors(self) -> None:
+        report = self.setup_final_report("favp-struct")
+        good = self.verification_proof_body(1, report)
+        # 非法正文：缺 signature。
+        status, _ = self.request_raw(
+            self.ENDPOINT,
+            json.dumps({"verificationSeq": 1}).encode(),
+            "favp-struct-body",
+            "POST",
+        )
+        self.assertEqual(status, 400)
+        # 签名格式非法（结构错误先于资源查询，即使目标存在也 400）。
+        status, _ = self.request_raw(
+            self.ENDPOINT,
+            json.dumps({"verificationSeq": 1, "signature": "zz"}).encode(),
+            "favp-struct-sig",
+            "POST",
+        )
+        self.assertEqual(status, 400)
+        # verificationSeq 非正整数。
+        status, _ = self.request_raw(
+            self.ENDPOINT,
+            json.dumps({"verificationSeq": 0, "signature": "ab" * 64}).encode(),
+            "favp-struct-zero",
+            "POST",
+        )
+        self.assertEqual(status, 400)
+        # 查询参数非法。
+        status, _ = self.request_raw(
+            f"{self.ENDPOINT}?x=1",
+            good,
+            "favp-struct-query",
+            "POST",
+        )
+        self.assertEqual(status, 400)
+        # 代理头非法。
+        request = Request(self.url(self.ENDPOINT), data=good, method="POST")
+        request.add_header("Idempotency-Key", "favp-struct-deleg")
+        request.add_header("SLA-Delegation", "d;0;1;n;" + "ab" * 64)
+        try:
+            with urlopen(request, timeout=5) as response:
+                status = response.status
+        except HTTPError as error:
+            status = error.code
+        self.assertEqual(status, 400)
+        # 缺失认证头。
+        status, _ = self.request_raw(
+            self.ENDPOINT,
+            good,
+            "favp-struct-noauth",
+            "POST",
+            omit_auth=True,
+        )
+        self.assertEqual(status, 400)
+        # 未配置审计身份 403（且不查询目标报告）。
+        missing_body = json.dumps(
+            {"verificationSeq": 99, "signature": "ab" * 64}
+        ).encode()
+        status, _ = self.request_raw(
+            self.ENDPOINT,
+            missing_body,
+            "favp-struct-forbidden",
+            "POST",
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+        )
+        self.assertEqual(status, 403)
+        # 失败不消费随机数：同一随机数随后由审计机器成功使用。
+        nonce = f"nonce-favp-struct-{time.time_ns()}"
+        status, _ = self.request_raw(
+            self.ENDPOINT,
+            missing_body,
+            "favp-struct-fb-nonce",
+            "POST",
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+            nonce=nonce,
+        )
+        self.assertEqual(status, 403)
+        status, _ = self.request_raw(
+            self.ENDPOINT,
+            good,
+            "favp-struct-ok-nonce",
+            "POST",
+            nonce=nonce,
+        )
+        self.assertEqual(status, 201)
+        # 过时请求 401。
+        stale = int(time.time() * 1000) - 400_000
+        status, body = self.post_verification_proof(
+            1, report, "favp-struct-stale", request_time_ms=stale
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(body), {"error": "stale_request"})
+        # 同机异键复用随机数 409；不同机器随机数互不冲突。
+        report3 = self.setup_second_final_report("favp-struct-3")
+        nonce2 = f"nonce-favp-struct2-{time.time_ns()}"
+        status, _ = self.post_verification_proof(
+            2, report3, "favp-struct-n1", nonce=nonce2
+        )
+        self.assertEqual(status, 201)
+        status, body = self.post_verification_proof(
+            2,
+            report3,
+            "favp-struct-n2",
+            seed=self.AUDITOR2_SEED,
+            actor=self.auditor2_id,
+            nonce=nonce2,
+        )
+        self.assertEqual(status, 201, body)
+        status, body = self.post_verification_proof(
+            2, report3, "favp-struct-n3", nonce=nonce2
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "replay_detected"})
+
+    def test_failure_no_side_effects(self) -> None:
+        report = self.setup_final_report("favp-fail")
+        bad = json.dumps(
+            {"verificationSeq": 1, "signature": "ab" * 64}
+        ).encode()
+        status, _ = self.request_raw(
+            self.ENDPOINT, bad, "favp-fail-1", "POST"
+        )
+        self.assertEqual(status, 409)
+        status, created = self.post_verification_proof(1, report, "favp-fail-2")
+        self.assertEqual(status, 201, created)
+        # 失败不推进序号：成功请求仍为序号 1。
+        self.assertEqual(json.loads(created)["proofSeq"], 1)
+
+    def test_collection(self) -> None:
+        # 空集合。
+        status, body = self.get(self.ENDPOINT)
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertEqual(list(payload), ["proofs", "nextCursor"])
+        self.assertEqual(payload["proofs"], [])
+        self.assertIsNone(payload["nextCursor"])
+        # 两份冻结证明（不同审计机器）完整返回。
+        report = self.setup_final_report("favp-list")
+        status, first = self.post_verification_proof(1, report, "favp-list-1")
+        self.assertEqual(status, 201)
+        status, second = self.post_verification_proof(
+            1,
+            report,
+            "favp-list-2",
+            seed=self.AUDITOR2_SEED,
+            actor=self.auditor2_id,
+        )
+        self.assertEqual(status, 201)
+        status, body = self.get(f"{self.ENDPOINT}?limit=1")
+        self.assertEqual(status, 200, body)
+        page = json.loads(body)
+        self.assertEqual(page["proofs"], [json.loads(first)])
+        cursor = page["nextCursor"]
+        self.assertEqual(cursor, "2:1")
+        status, body = self.get(f"{self.ENDPOINT}?cursor={cursor}")
+        self.assertEqual(status, 200, body)
+        page = json.loads(body)
+        self.assertEqual(page["proofs"], [json.loads(second)])
+        self.assertIsNone(page["nextCursor"])
+        # 旧游标跨重启稳定。
+        self.restart()
+        status, body = self.get(f"{self.ENDPOINT}?cursor={cursor}")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["proofs"], [json.loads(second)])
+        # 非法参数与游标。
+        for query in (
+            "limit=0",
+            "limit=101",
+            "foo=1",
+            "cursor=99:1",
+            "cursor=1:99",
+            "limit=1&limit=2",
+        ):
+            status, _ = self.get(f"{self.ENDPOINT}?{query}")
+            self.assertEqual(status, 400, query)
+        # 未配置审计身份 403；缺失认证头 400；代理头 400。
+        status, _ = self.get(
+            self.ENDPOINT,
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+        )
+        self.assertEqual(status, 403)
+        status, _ = self.get(self.ENDPOINT, omit_auth=True)
+        self.assertEqual(status, 400)
+        request = Request(self.url(self.ENDPOINT), method="GET")
+        request.add_header("SLA-Delegation", "d;0;1;n;" + "ab" * 64)
+        try:
+            with urlopen(request, timeout=5) as response:
+                status = response.status
+        except HTTPError as error:
+            status = error.code
+        self.assertEqual(status, 400)
+
+    def test_get_nonce_consumed_only_on_success(self) -> None:
+        self.setup_final_report("favp-gnonce")
+        nonce = f"nonce-favp-gn-{time.time_ns()}"
+        status, _ = self.get(self.ENDPOINT, nonce=nonce)
+        self.assertEqual(status, 200)
+        status, body = self.get(self.ENDPOINT, nonce=nonce)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "replay_detected"})
+        failed_nonce = f"nonce-favp-gn-fail-{time.time_ns()}"
+        for _ in range(2):
+            status, _ = self.get(
+                f"{self.ENDPOINT}?cursor=99:1", nonce=failed_nonce
+            )
+            self.assertEqual(status, 400)
+
+    def test_rotation_revocation_and_growth_keep_frozen(self) -> None:
+        from sla_network.ed25519 import verify as ed25519_verify
+
+        report = self.setup_final_report("favp-imm")
+        # 先以版本一密钥备好第二份终局证明（proofSeq=2）；其上的终局报告与
+        # 冻结证明在轮换后再以版本二密钥创建。
+        target2 = self.setup_second_target_report("favp-imm")
+        status, _ = self.post_final_proof(2, target2, "favp-imm-fp2")
+        self.assertEqual(status, 201)
+        status, first = self.post_verification_proof(1, report, "favp-imm-1")
+        self.assertEqual(status, 201)
+        first_payload = json.loads(first)
+        # 轮换审计机器到版本二并吊销版本一。
+        new_seed = b"\x0b" * 32
+        new_public = _ed25519_public_key(new_seed).hex()
+        current_signature, new_signature = key_rotation_signatures(
+            self.AUDITOR_SEED, new_seed, self.auditor_id, 1, new_public
+        )
+        status, _ = self.post_json(
+            f"/v1/machines/{self.auditor_id}/keys",
+            {
+                "expectedVersion": 1,
+                "publicKey": new_public,
+                "currentSignature": current_signature,
+                "newSignature": new_signature,
+            },
+            "favp-imm-rotate",
+        )
+        self.assertEqual(status, 201)
+        status, _ = self.post_json(
+            f"/v1/machines/{self.auditor_id}/keys/1/revocation",
+            {"signature": key_revocation_signature(new_seed, self.auditor_id, 1)},
+            "favp-imm-revoke",
+        )
+        self.assertEqual(status, 200)
+        # 轮换、吊销与审计链增长后，以新版本二生成第二份终局报告并创建冻结证明。
+        status, report2 = self.post_final_verification(
+            2, "favp-imm-r2", seed=new_seed, key_version=2
+        )
+        self.assertEqual(status, 201, report2)
+        status, second = self.post_verification_proof(
+            2, report2, "favp-imm-2", seed=new_seed, key_version=2
+        )
+        self.assertEqual(status, 201, second)
+        second_payload = json.loads(second)
+        self.assertEqual(second_payload["proofSeq"], 2)
+        self.assertEqual(second_payload["keyVersion"], 2)
+        self.assertEqual(second_payload["publicKey"], new_public)
+        # 第一份冻结证明的字节、身份、公钥与版本均不被改写。
+        status, replay = self.post_verification_proof(1, report, "favp-imm-1")
+        self.assertEqual(status, 201)
+        self.assertEqual(replay, first)
+        status, body = self.get(
+            f"{self.ENDPOINT}?limit=2",
+            seed=new_seed,
+            key_version=2,
+        )
+        self.assertEqual(status, 200, body)
+        proofs = json.loads(body)["proofs"]
+        self.assertEqual(len(proofs), 2)
+        self.assertEqual(proofs[0], first_payload)
+        self.assertEqual(proofs[0]["publicKey"], ARBITRATOR_PUBLIC)
+        self.assertEqual(proofs[0]["keyVersion"], 1)
+        # 吊销后仍可用冻结的版本一公钥独立复验第一份业务签名。
+        report_payload = json.loads(report)
+        message = "\n".join(
+            (
+                "final-audit-verification-proof-v1",
+                "1",
+                first_payload["responseDigest"],
+                report_payload["digest"],
+                str(report_payload["proofSeqBound"]),
+                str(report_payload["witnessSeqBound"]),
+            )
+        ).encode("utf-8")
+        self.assertTrue(
+            ed25519_verify(
+                bytes.fromhex(first_payload["publicKey"]),
+                message,
+                bytes.fromhex(first_payload["signature"]),
+            )
+        )
+
+    def test_concurrent_same_key_single_create(self) -> None:
+        report = self.setup_final_report("favp-conc")
+        body = self.verification_proof_body(1, report)
+        nonce = f"nonce-favp-conc-{time.time_ns()}"
+        header = make_sla_auth(
+            self.server,
+            "favp-conc-1",
+            self.AUDITOR_SEED,
+            self.auditor_id,
+            "POST",
+            self.ENDPOINT,
+            body,
+            1,
+            nonce=nonce,
+        )
+        results: list[tuple[int, bytes]] = []
+        lock = threading.Lock()
+
+        def fire() -> None:
+            request = Request(self.url(self.ENDPOINT), data=body, method="POST")
+            request.add_header("Idempotency-Key", "favp-conc-1")
+            request.add_header("SLA-Auth", header)
+            try:
+                with urlopen(request, timeout=10) as response:
+                    outcome = response.status, response.read()
+            except HTTPError as error:
+                outcome = error.code, error.read()
+            with lock:
+                results.append(outcome)
+
+        threads = [threading.Thread(target=fire) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(len(results), 8)
+        self.assertTrue(all(status == 201 for status, _ in results))
+        first_bytes = results[0][1]
+        self.assertTrue(all(payload == first_bytes for _, payload in results))
+        count_row = sqlite3.connect(self.server.database_path).execute(
+            "SELECT COUNT(*) FROM final_audit_verification_proofs"
+        ).fetchone()
+        self.assertEqual(count_row[0], 1)
+        self.assertEqual(json.loads(first_bytes)["proofSeq"], 1)
+
+    def test_concurrent_distinct_keys_single_wins(self) -> None:
+        # 同机同报告异键并发：唯一约束保证至多一项成功，败者 proof_exists，
+        # 不重号、不留部分记录。
+        report = self.setup_final_report("favp-race")
+        results: list[tuple[int, bytes]] = []
+        lock = threading.Lock()
+
+        def fire(index: int) -> None:
+            outcome = self.post_verification_proof(
+                1, report, f"favp-race-{index}"
+            )
+            with lock:
+                results.append(outcome)
+
+        threads = [
+            threading.Thread(target=fire, args=(index,)) for index in range(6)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        statuses = sorted(status for status, _ in results)
+        self.assertEqual(statuses.count(201), 1, results)
+        self.assertEqual(statuses.count(409), 5, results)
+        self.assertTrue(
+            all(json.loads(body) == {"error": "proof_exists"}
+                for status, body in results if status == 409)
+        )
+        row = sqlite3.connect(self.server.database_path).execute(
+            "SELECT COUNT(*) AS count, MIN(proof_seq) AS min_seq,"
+            " MAX(proof_seq) AS max_seq FROM final_audit_verification_proofs"
+        ).fetchone()
+        self.assertEqual(row[0], 1)
+        self.assertEqual(row[1], 1)
+        self.assertEqual(row[2], 1)
+
+    def test_old_database_gains_empty_proof_storage(self) -> None:
+        # 模拟升级前旧库：不存在一致性报告冻结证明存储；重启后仅新增空存储，
+        # 不补造任何历史证明，新证明序号自 1 起。
+        report = self.setup_final_report("favp-mig")
+        status, _ = self.post_verification_proof(1, report, "favp-mig-old")
+        self.assertEqual(status, 201)
+        self.db_execute("DROP TABLE final_audit_verification_proofs")
+        self.db_execute(
+            "DROP TABLE final_audit_verification_proof_idempotency_records"
+        )
+        self.restart()
+        status, body = self.get(self.ENDPOINT)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["proofs"], [])
+        status, response = self.post_verification_proof(1, report, "favp-mig-new")
+        self.assertEqual(status, 201, response)
+        self.assertEqual(json.loads(response)["proofSeq"], 1)
+        self.assertEqual(json.loads(response)["verificationSeq"], 1)
+
+
 class IntegerLimitTests(_EvidenceScenario, unittest.TestCase):
     # 进程级整数转换保护（PEP 682）不再全局关闭：仅 README 已声明的审计序号
     # 入口接受超长整数（超存储范围按不存在处理），其他入口的超长整数一律
