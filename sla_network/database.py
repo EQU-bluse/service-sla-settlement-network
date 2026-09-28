@@ -713,6 +713,12 @@ CREATE TABLE IF NOT EXISTS final_audit_verification_proof_idempotency_records (
     auth_nonce TEXT,
     auth_signature TEXT
 );
+CREATE TABLE IF NOT EXISTS final_audit_verification_proof_chain (
+    proof_seq INTEGER PRIMARY KEY,
+    response_digest TEXT NOT NULL,
+    previous_chain_digest TEXT NOT NULL,
+    chain_digest TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS machine_delegations (
     id TEXT PRIMARY KEY,
     issuer_machine_id TEXT NOT NULL,
@@ -804,6 +810,10 @@ PROOF_CHECK_PROOF_CHAIN_MARKER = "proof_check_proof_chain_backfilled"
 PROOF_CHECK_PROOF_CHAIN_GENESIS_DIGEST = "0" * 64
 FINAL_AUDIT_PROOF_CHAIN_MARKER = "final_audit_proof_chain_backfilled"
 FINAL_AUDIT_PROOF_CHAIN_GENESIS_DIGEST = "0" * 64
+FINAL_AUDIT_VERIFICATION_PROOF_CHAIN_MARKER = (
+    "final_audit_verification_proof_chain_backfilled"
+)
+FINAL_AUDIT_VERIFICATION_PROOF_CHAIN_GENESIS_DIGEST = "0" * 64
 
 AUTH_IDEMPOTENCY_TABLES = (
     "capability_idempotency_records",
@@ -1511,6 +1521,66 @@ def _backfill_final_audit_proof_chain(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _backfill_final_audit_verification_proof_chain(
+    connection: sqlite3.Connection,
+) -> None:
+    # 一致性报告冻结证明链一次性补链：旧冻结证明按证明序号升序在单事务内逐行
+    # 计算链摘要；首项以前项摘要六十四个零起链。不改旧响应、时间、序号、幂等
+    # 字节与重放结果，重启不重复补链。
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        if (
+            connection.execute(
+                "SELECT 1 FROM schema_metadata WHERE key = ?",
+                (FINAL_AUDIT_VERIFICATION_PROOF_CHAIN_MARKER,),
+            ).fetchone()
+            is not None
+        ):
+            # 其他连接已完成补链，直接释放写锁，不再重复。
+            connection.execute("COMMIT")
+            return
+        previous_chain_digest = FINAL_AUDIT_VERIFICATION_PROOF_CHAIN_GENESIS_DIGEST
+        rows = connection.execute(
+            "SELECT proof_seq, response_json"
+            " FROM final_audit_verification_proofs ORDER BY proof_seq ASC"
+        ).fetchall()
+        for row in rows:
+            # responseDigest 取首次完整响应紧凑 UTF-8 无尾换行字节的 SHA-256；
+            # response_json 本身即紧凑 JSON 且无尾换行，直接对其 UTF-8 字节摘要。
+            response_digest = hashlib.sha256(
+                row["response_json"].encode("utf-8")
+            ).hexdigest()
+            chain_text = "\n".join(
+                (
+                    "final-audit-verification-proof-chain-v1",
+                    str(row["proof_seq"]),
+                    response_digest,
+                    previous_chain_digest,
+                )
+            )
+            chain_digest = hashlib.sha256(chain_text.encode("utf-8")).hexdigest()
+            connection.execute(
+                "INSERT INTO final_audit_verification_proof_chain"
+                "(proof_seq, response_digest, previous_chain_digest, chain_digest)"
+                " VALUES (?, ?, ?, ?)",
+                (
+                    row["proof_seq"],
+                    response_digest,
+                    previous_chain_digest,
+                    chain_digest,
+                ),
+            )
+            previous_chain_digest = chain_digest
+        connection.execute(
+            "INSERT INTO schema_metadata(key, value) VALUES (?, '1')",
+            (FINAL_AUDIT_VERIFICATION_PROOF_CHAIN_MARKER,),
+        )
+        connection.execute("COMMIT")
+    except BaseException:
+        connection.execute("ROLLBACK")
+        raise
+
+
 def connect(path: str) -> sqlite3.Connection:
     database = Path(path)
     database.parent.mkdir(parents=True, exist_ok=True)
@@ -1649,6 +1719,14 @@ def connect(path: str) -> sqlite3.Connection:
         is None
     ):
         _backfill_final_audit_proof_chain(connection)
+    if (
+        connection.execute(
+            "SELECT 1 FROM schema_metadata WHERE key = ?",
+            (FINAL_AUDIT_VERIFICATION_PROOF_CHAIN_MARKER,),
+        ).fetchone()
+        is None
+    ):
+        _backfill_final_audit_verification_proof_chain(connection)
     # 委托按签发事件序号分页：事件表 join 委托后需 (issuer, issued_seq) 索引。
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_delegation_events_delegation_seq"
