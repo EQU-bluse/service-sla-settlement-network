@@ -133,6 +133,26 @@ CREATE TABLE IF NOT EXISTS sla_telemetry_idempotency_records (
     status INTEGER NOT NULL,
     response_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS telemetry_batches (
+    producer_id TEXT NOT NULL,
+    sla_id TEXT NOT NULL,
+    batch_id TEXT NOT NULL,
+    sequence_start INTEGER NOT NULL,
+    sequence_end INTEGER NOT NULL,
+    previous_digest TEXT NOT NULL,
+    issued_at TEXT NOT NULL,
+    key_version INTEGER NOT NULL,
+    signature TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    receipt_id TEXT NOT NULL,
+    accepted_count INTEGER NOT NULL,
+    request_json TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (producer_id, sla_id, batch_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_telemetry_batches_receipt
+ON telemetry_batches(receipt_id);
 CREATE TABLE IF NOT EXISTS sla_evaluation_idempotency_records (
     key TEXT PRIMARY KEY,
     sla_id TEXT NOT NULL,
