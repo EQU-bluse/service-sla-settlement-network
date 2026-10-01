@@ -45,6 +45,9 @@ SLA_EVALUATIONS_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/evaluations")
 SLA_SETTLEMENTS_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/settlements")
 ACCOUNT_LEDGER_PATH_PATTERN = re.compile(r"/v1/accounts/([^/]+)/ledger")
 FUNDS_PATH_PATTERN = re.compile(r"/v1/funds/([^/]+)")
+SETTLEMENT_BATCH_ITEM_PATH_PATTERN = re.compile(
+    r"/v1/settlement-batches/([^/]+)"
+)
 DISPUTE_PATH_PATTERN = re.compile(r"/v1/disputes/([^/]+)")
 DISPUTE_EVENTS_PATH_PATTERN = re.compile(r"/v1/disputes/([^/]+)/events")
 DISPUTE_EVIDENCE_PATH_PATTERN = re.compile(r"/v1/disputes/([^/]+)/evidence")
@@ -97,6 +100,9 @@ SIGNATURE_PATTERN = re.compile(r"[0-9a-f]{128}")
 EVALUATION_FIELDS = {"from", "to"}
 FUND_FIELDS = {"amountMicros", "reference"}
 SETTLEMENT_FIELDS = {"slaId", "evaluationSeq"}
+SETTLEMENT_BATCH_FIELDS = {"id", "items"}
+SETTLEMENT_BATCH_ITEM_FIELDS = {"slaId", "evaluationSeq"}
+SETTLEMENT_BATCH_MAX_ITEMS = 100
 DISPUTE_FIELDS = {"id", "settlementSeq", "claimantId"}
 RESOLUTION_FIELDS = {"decision"}
 EVIDENCE_FIELDS = {"evidenceId", "actorId", "observedAt", "digest"}
@@ -352,6 +358,14 @@ class Handler(BaseHTTPRequestHandler):
         ledger_match = ACCOUNT_LEDGER_PATH_PATTERN.fullmatch(target.path)
         if ledger_match is not None:
             self._get_ledger(ledger_match.group(1), target.query)
+            return
+        settlement_batch_match = SETTLEMENT_BATCH_ITEM_PATH_PATTERN.fullmatch(
+            target.path
+        )
+        if settlement_batch_match is not None:
+            self._get_settlement_batch(
+                settlement_batch_match.group(1), target.query
+            )
             return
         if target.path == "/v1/disputes":
             self._get_disputes(target.query)
@@ -1777,6 +1791,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/v1/settlements":
             self._create_settlement()
+            return
+        if self.path == "/v1/settlement-batches":
+            self._create_settlement_batch()
             return
         if self.path == "/v1/disputes":
             self._create_dispute()
@@ -4105,6 +4122,312 @@ class Handler(BaseHTTPRequestHandler):
             except BaseException:
                 database.execute("ROLLBACK")
                 raise
+
+    def _create_settlement_batch(self) -> None:
+        # 批次写入口要求恰好一个合法 Idempotency-Key：缺失、重复或格式非法
+        # 均为 400/invalid_request，且不查询任何资源。
+        values = self.headers.get_all("Idempotency-Key")
+        if values is None or len(values) != 1:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        idempotency_key = values[0]
+        if IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        fields = self._read_settlement_batch_object()
+        if fields is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        status, payload = self._apply_settlement_batch(idempotency_key, fields)
+        self._json(status, payload)
+
+    def _read_settlement_batch_object(self) -> dict[str, Any] | None:
+        parsed = self._read_json_object()
+        if parsed is None or set(parsed) != SETTLEMENT_BATCH_FIELDS:
+            return None
+        batch_id = parsed["id"]
+        if not isinstance(batch_id, str) or TEMPLATE_ID_PATTERN.fullmatch(batch_id) is None:
+            return None
+        items = parsed["items"]
+        if not isinstance(items, list):
+            return None
+        if not 1 <= len(items) <= SETTLEMENT_BATCH_MAX_ITEMS:
+            return None
+        seen: set[tuple[str, int]] = set()
+        normalized_items: list[dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict) or set(item) != SETTLEMENT_BATCH_ITEM_FIELDS:
+                return None
+            sla_id = item["slaId"]
+            if not isinstance(sla_id, str) or TEMPLATE_ID_PATTERN.fullmatch(sla_id) is None:
+                return None
+            evaluation_seq = item["evaluationSeq"]
+            if not isinstance(evaluation_seq, int) or isinstance(evaluation_seq, bool):
+                return None
+            if evaluation_seq < 1:
+                return None
+            reference = (sla_id, evaluation_seq)
+            if reference in seen:
+                return None
+            seen.add(reference)
+            normalized_items.append(
+                {"slaId": sla_id, "evaluationSeq": evaluation_seq}
+            )
+        return {"id": batch_id, "items": normalized_items}
+
+    def _apply_settlement_batch(
+        self, idempotency_key: str, fields: dict[str, Any]
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+        batch_id = fields["id"]
+        items = fields["items"]
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                record = database.execute(
+                    "SELECT batch_id, request_json, status, response_json"
+                    " FROM settlement_batch_idempotency_records WHERE key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    if (
+                        record["batch_id"] == batch_id
+                        and record["request_json"] == request_json
+                    ):
+                        return HTTPStatus(record["status"]), json.loads(
+                            record["response_json"]
+                        )
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                existing_batch = database.execute(
+                    "SELECT 1 FROM settlement_batches WHERE id = ?",
+                    (batch_id,),
+                ).fetchone()
+                if existing_batch is not None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "batch_exists"}
+                # 按数组顺序沿用单笔结算规则逐项判定；前项余额可供后项使用，
+                # 故余额读取后以 working_balances 贯穿整批，仅在提交时落库。
+                working_balances: dict[str, int] = {}
+
+                def account_balance(account_id: str) -> int:
+                    if account_id not in working_balances:
+                        row = database.execute(
+                            "SELECT balance_micros FROM ledger_accounts"
+                            " WHERE account_id = ?",
+                            (account_id,),
+                        ).fetchone()
+                        working_balances[account_id] = (
+                            row["balance_micros"] if row is not None else 0
+                        )
+                    return working_balances[account_id]
+
+                planned: list[dict[str, Any]] = []
+                for item in items:
+                    sla_id = item["slaId"]
+                    evaluation_seq = item["evaluationSeq"]
+                    sla = database.execute(
+                        "SELECT machine_id, consumer_id, price_micros, state"
+                        " FROM slas WHERE id = ?",
+                        (sla_id,),
+                    ).fetchone()
+                    if sla is None:
+                        database.execute("ROLLBACK")
+                        return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                    if sla["state"] != "active":
+                        database.execute("ROLLBACK")
+                        return HTTPStatus.CONFLICT, {"error": "conflict"}
+                    evaluation = None
+                    if evaluation_seq <= INT64_MAX:
+                        evaluation = database.execute(
+                            "SELECT sla_id, response_json"
+                            " FROM sla_evaluation_idempotency_records"
+                            " WHERE evaluation_seq = ?",
+                            (evaluation_seq,),
+                        ).fetchone()
+                    if evaluation is None:
+                        database.execute("ROLLBACK")
+                        return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                    # 评估归属错误为 conflict。
+                    if evaluation["sla_id"] != sla_id:
+                        database.execute("ROLLBACK")
+                        return HTTPStatus.CONFLICT, {"error": "conflict"}
+                    existing = database.execute(
+                        "SELECT 1 FROM settlements WHERE evaluation_seq = ?",
+                        (evaluation_seq,),
+                    ).fetchone()
+                    if existing is not None:
+                        database.execute("ROLLBACK")
+                        return HTTPStatus.CONFLICT, {"error": "settlement_exists"}
+                    snapshot = json.loads(evaluation["response_json"])
+                    outcome = snapshot["outcome"]
+                    if outcome == "fulfilled":
+                        result = "charged"
+                        amount = sla["price_micros"] * snapshot["count"]
+                        payer_id = sla["consumer_id"]
+                        payee_id = sla["machine_id"]
+                    elif outcome == "breached":
+                        result = "compensated"
+                        amount = sla["price_micros"] * snapshot["violations"]
+                        payer_id = sla["machine_id"]
+                        payee_id = sla["consumer_id"]
+                    else:
+                        result = "pending"
+                        amount = 0
+                        payer_id = None
+                        payee_id = None
+                    if amount > AMOUNT_CAP_MICROS:
+                        database.execute("ROLLBACK")
+                        return HTTPStatus.CONFLICT, {"error": "amount_overflow"}
+                    if payer_id is not None:
+                        payer_balance = account_balance(payer_id)
+                        payee_balance = account_balance(payee_id)
+                        if payee_balance + amount > AMOUNT_CAP_MICROS:
+                            database.execute("ROLLBACK")
+                            return HTTPStatus.CONFLICT, {"error": "amount_overflow"}
+                        # 可用余额为总余额扣除全部 open 争议冻结后与零的较大值；
+                        # 批次内前项过账只改变 working_balances，冻结额不随批次变化。
+                        frozen_record = database.execute(
+                            "SELECT COALESCE(SUM(amount_micros), 0) AS frozen"
+                            " FROM disputes WHERE payee_id = ? AND state = 'open'",
+                            (payer_id,),
+                        ).fetchone()
+                        payer_available = max(
+                            0, payer_balance - frozen_record["frozen"]
+                        )
+                        if payer_available < amount:
+                            database.execute("ROLLBACK")
+                            return HTTPStatus.CONFLICT, {"error": "insufficient_funds"}
+                        # 前项余额可供后项使用：立即在工作余额上顺序过账本项。
+                        # 付款方与收款方可能为同一账户，须按分录顺序连续更新。
+                        working_balances[payer_id] = payer_balance - amount
+                        working_balances[payee_id] = (
+                            working_balances[payee_id] + amount
+                        )
+                    planned.append(
+                        {
+                            "sla_id": sla_id,
+                            "evaluation_seq": evaluation_seq,
+                            "result": result,
+                            "amount": amount,
+                            "payer_id": payer_id,
+                            "payee_id": payee_id,
+                        }
+                    )
+                # 全部项通过后才取序号与时间：任一失败均不消耗序号。
+                next_record = database.execute(
+                    "SELECT COALESCE(MAX(settlement_seq), 0) + 1 AS next_seq"
+                    " FROM settlements"
+                ).fetchone()
+                next_seq = next_record["next_seq"]
+                created_at_ms = int(datetime.now(UTC).timestamp() * 1000)
+                settlement_payloads: list[dict[str, Any]] = []
+                for position, plan in enumerate(planned):
+                    settlement_seq = next_seq + position
+                    payer_id = plan["payer_id"]
+                    payee_id = plan["payee_id"]
+                    amount = plan["amount"]
+                    if payer_id is not None:
+                        payer_after = self._adjust_account(
+                            database, payer_id, -amount
+                        )
+                        payee_after = self._adjust_account(
+                            database, payee_id, amount
+                        )
+                        self._record_entry(
+                            database, "settlement", settlement_seq, payer_id,
+                            -amount, payer_after, created_at_ms,
+                        )
+                        self._record_entry(
+                            database, "settlement", settlement_seq, payee_id,
+                            amount, payee_after, created_at_ms,
+                        )
+                    database.execute(
+                        "INSERT INTO settlements"
+                        "(settlement_seq, sla_id, evaluation_seq, result,"
+                        " amount_micros, payer_id, payee_id, created_at_ms)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            settlement_seq,
+                            plan["sla_id"],
+                            plan["evaluation_seq"],
+                            plan["result"],
+                            amount,
+                            payer_id,
+                            payee_id,
+                            created_at_ms,
+                        ),
+                    )
+                    database.execute(
+                        "INSERT INTO settlement_batch_items"
+                        "(batch_id, position, settlement_seq, sla_id, evaluation_seq)"
+                        " VALUES (?, ?, ?, ?, ?)",
+                        (
+                            batch_id,
+                            position,
+                            settlement_seq,
+                            plan["sla_id"],
+                            plan["evaluation_seq"],
+                        ),
+                    )
+                    settlement_payloads.append(
+                        {
+                            "settlementSeq": settlement_seq,
+                            "evaluationSeq": plan["evaluation_seq"],
+                            "result": plan["result"],
+                            "amount": amount,
+                            "createdAt": created_at_ms,
+                        }
+                    )
+                payload = {
+                    "id": batch_id,
+                    "createdAt": created_at_ms,
+                    "settlements": settlement_payloads,
+                }
+                database.execute(
+                    "INSERT INTO settlement_batches"
+                    "(id, created_at_ms, response_json) VALUES (?, ?, ?)",
+                    (
+                        batch_id,
+                        created_at_ms,
+                        json.dumps(payload, separators=(",", ":")),
+                    ),
+                )
+                database.execute(
+                    "INSERT INTO settlement_batch_idempotency_records"
+                    "(key, batch_id, request_json, status, response_json)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        batch_id,
+                        request_json,
+                        int(HTTPStatus.CREATED),
+                        json.dumps(payload, separators=(",", ":")),
+                    ),
+                )
+                database.execute("COMMIT")
+                return HTTPStatus.CREATED, payload
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+
+    def _get_settlement_batch(self, batch_id: str, query: str) -> None:
+        # 读取入口不接受任何查询参数：参数校验先于批次查询。
+        if parse_qsl(query, keep_blank_values=True):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        if TEMPLATE_ID_PATTERN.fullmatch(batch_id) is None:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        with closing(connect(self.server.database_path)) as database:
+            record = database.execute(
+                "SELECT response_json FROM settlement_batches WHERE id = ?",
+                (batch_id,),
+            ).fetchone()
+        if record is None:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        self._json(HTTPStatus.OK, json.loads(record["response_json"]))
 
     def _create_dispute(self) -> None:
         idempotency_key = self.headers.get("Idempotency-Key")
