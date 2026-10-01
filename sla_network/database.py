@@ -185,6 +185,28 @@ CREATE TABLE IF NOT EXISTS settlement_idempotency_records (
     status INTEGER NOT NULL,
     response_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS settlement_batches (
+    id TEXT PRIMARY KEY,
+    created_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS settlement_batch_items (
+    batch_id TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    settlement_seq INTEGER NOT NULL,
+    sla_id TEXT NOT NULL,
+    evaluation_seq INTEGER NOT NULL,
+    PRIMARY KEY (batch_id, position)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_settlement_batch_items_seq
+ON settlement_batch_items(settlement_seq);
+CREATE INDEX IF NOT EXISTS idx_settlement_batch_items_batch
+ON settlement_batch_items(batch_id, position, settlement_seq);
+CREATE TABLE IF NOT EXISTS settlement_batch_idempotency_records (
+    key TEXT PRIMARY KEY,
+    request_json TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    response_json TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS disputes (
     id TEXT PRIMARY KEY,
     settlement_seq INTEGER NOT NULL UNIQUE,
