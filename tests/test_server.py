@@ -23441,6 +23441,542 @@ class FinalAuditVerificationProofChainTests(FinalAuditVerificationProofTests):
         self.assertEqual(payload["entries"][0]["chainDigest"], "f" * 64)
 
 
+class FinalAuditVerificationProofWitnessTests(FinalAuditVerificationProofChainTests):
+    # 一致性报告冻结证明链头见证：为已保存的冻结证明链节点建立可独立验证的
+    # 见证历史。调用形态沿用终局证明链头见证（final-audit-proof-witnesses），
+    # 目标链换为 final_audit_verification_proof_chain，见证序号独立递增。
+    # 辅助方法复用 FinalAuditVerificationProofChainTests；屏蔽继承来的
+    # 既有测试，避免重复运行。
+    for _inherited in dir(FinalAuditVerificationProofChainTests):
+        if _inherited.startswith("test_"):
+            locals()[_inherited] = None
+
+    WITNESS_ENDPOINT = "/v1/final-audit-verification-proof-witnesses"
+
+    def verification_witness_body(
+        self, proof_seq: object, chain_digest: str
+    ) -> bytes:
+        return json.dumps(
+            {"proofSeq": proof_seq, "chainDigest": chain_digest}
+        ).encode()
+
+    def post_verification_witness(
+        self, proof_seq: object, chain_digest: str, key: str, **kwargs: object
+    ) -> tuple[int, bytes]:
+        return self.request_raw(
+            self.WITNESS_ENDPOINT,
+            self.verification_witness_body(proof_seq, chain_digest),
+            key,
+            "POST",
+            **kwargs,
+        )
+
+    def verification_chain_digest_for(self, proof_seq: int) -> str:
+        status, body = self.get(self.CHAIN)
+        self.assertEqual(status, 200, body)
+        entries = json.loads(body)["entries"]
+        return next(
+            entry["chainDigest"]
+            for entry in entries
+            if entry["proofSeq"] == proof_seq
+        )
+
+    def test_verification_witness_created_with_frozen_fields(self) -> None:
+        from sla_network.ed25519 import verify as ed25519_verify
+
+        self.setup_two_verification_proofs("favpw-create")
+        chain_digest = self.verification_chain_digest_for(1)
+        body = self.verification_witness_body(1, chain_digest)
+        status, response = self.post_verification_witness(
+            1, chain_digest, "favpw-create-1"
+        )
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(
+            list(payload),
+            [
+                "witnessSeq",
+                "proofSeq",
+                "chainDigest",
+                "auditorId",
+                "publicKey",
+                "keyVersion",
+                "requestTimeMs",
+                "nonce",
+                "bodyDigest",
+                "authSignature",
+                "createdAt",
+            ],
+        )
+        # 独立序号空间：首个冻结证明链头见证自 1 起。
+        self.assertEqual(payload["witnessSeq"], 1)
+        self.assertEqual(payload["proofSeq"], 1)
+        self.assertEqual(payload["chainDigest"], chain_digest)
+        self.assertEqual(payload["auditorId"], self.auditor_id)
+        self.assertEqual(payload["publicKey"], ARBITRATOR_PUBLIC)
+        self.assertEqual(payload["keyVersion"], 1)
+        self.assertEqual(payload["bodyDigest"], hashlib.sha256(body).hexdigest())
+        # 冻结字段足以按本入口标准路径独立复验认证签名。
+        message = (
+            f"request-auth-v1\nPOST\n{self.WITNESS_ENDPOINT}\n"
+            f"{payload['bodyDigest']}\n{payload['requestTimeMs']}\n"
+            f"{payload['nonce']}\n{payload['keyVersion']}\n{self.auditor_id}"
+        ).encode("utf-8")
+        self.assertTrue(
+            ed25519_verify(
+                bytes.fromhex(ARBITRATOR_PUBLIC),
+                message,
+                bytes.fromhex(payload["authSignature"]),
+            )
+        )
+        self.assertFalse(response.endswith(b"\n"))
+
+    def test_verification_witness_independent_seq_space_and_storage(self) -> None:
+        # 冻结证明链 proofSeq=1 来自终局证明链 proofSeq=1；两类见证互不共用
+        # 序号空间与存储表。
+        self.setup_two_verification_proofs("favpw-ind")
+        final_digest = self.final_chain_digest_for(1)
+        status, final_witness = self.post_final_witness(
+            1, final_digest, "favpw-ind-final"
+        )
+        self.assertEqual(status, 201, final_witness)
+        self.assertEqual(json.loads(final_witness)["witnessSeq"], 1)
+        chain_digest = self.verification_chain_digest_for(1)
+        status, response = self.post_verification_witness(
+            1, chain_digest, "favpw-ind-vp"
+        )
+        self.assertEqual(status, 201, response)
+        self.assertEqual(json.loads(response)["witnessSeq"], 1)
+        # 新见证只落本功能的表；终局证明链头见证表仍只有一行。
+        connection = sqlite3.connect(self.server.database_path)
+        self.assertEqual(
+            connection.execute(
+                "SELECT COUNT(*) FROM final_audit_verification_proof_witnesses"
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            connection.execute(
+                "SELECT COUNT(*) FROM final_audit_proof_witnesses"
+            ).fetchone()[0],
+            1,
+        )
+        connection.close()
+
+    def test_verification_witness_replay_restart_and_no_seq_advance(self) -> None:
+        self.setup_two_verification_proofs("favpw-rep")
+        chain_digest = self.verification_chain_digest_for(1)
+        status, first = self.post_verification_witness(
+            1, chain_digest, "favpw-rep-1"
+        )
+        self.assertEqual(status, 201)
+        status, second = self.post_verification_witness(
+            1, chain_digest, "favpw-rep-1"
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(second, first)
+        self.restart()
+        status, third = self.post_verification_witness(
+            1, chain_digest, "favpw-rep-1"
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(third, first)
+        # 重放不推进见证序号：异键成功见证 proofSeq=2 仍为序号 2。
+        cd2 = self.verification_chain_digest_for(2)
+        status, other = self.post_verification_witness(2, cd2, "favpw-rep-2")
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(other)["witnessSeq"], 2)
+
+    def test_verification_witness_invalid_seq_and_digest_mismatch(self) -> None:
+        self.setup_two_verification_proofs("favpw-err")
+        chain_digest = self.verification_chain_digest_for(1)
+        # 序号不存在：404。
+        status, body = self.post_verification_witness(
+            3, chain_digest, "favpw-err-missing"
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+        # 合法超大序号同样按链节点不存在处理。
+        status, body = self.post_verification_witness(
+            9223372036854775808, chain_digest, "favpw-err-huge"
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+        # proofSeq 须为非布尔正整数：零、负整数、布尔值、缺字段均为正文非法。
+        for bad_body in (
+            json.dumps({"proofSeq": 0, "chainDigest": chain_digest}).encode(),
+            json.dumps({"proofSeq": -1, "chainDigest": chain_digest}).encode(),
+            json.dumps({"proofSeq": True, "chainDigest": chain_digest}).encode(),
+            json.dumps({"proofSeq": "1", "chainDigest": chain_digest}).encode(),
+            json.dumps({"chainDigest": chain_digest}).encode(),
+            json.dumps(
+                {"proofSeq": 1, "chainDigest": chain_digest, "extra": 1}
+            ).encode(),
+            json.dumps({"proofSeq": 1, "chainDigest": "A" * 64}).encode(),
+            json.dumps({"proofSeq": 1, "chainDigest": "a" * 63}).encode(),
+        ):
+            status, _ = self.request_raw(
+                self.WITNESS_ENDPOINT, bad_body, "favpw-err-badbody", "POST"
+            )
+            self.assertEqual(status, 400, bad_body)
+        # 摘要不符：409/conflict。
+        status, body = self.post_verification_witness(
+            1, "a" * 64, "favpw-err-mismatch"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_verification_witness_duplicate_same_distinct_auditor(self) -> None:
+        self.setup_two_verification_proofs("favpw-dup")
+        chain_digest = self.verification_chain_digest_for(1)
+        status, _ = self.post_verification_witness(
+            1, chain_digest, "favpw-dup-1"
+        )
+        self.assertEqual(status, 201)
+        # 同机异键重复见证：witness_exists。
+        status, body = self.post_verification_witness(
+            1, chain_digest, "favpw-dup-2"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "witness_exists"})
+        # 不同审计机器可分别对同一节点签名，序号继续递增。
+        status, other = self.post_verification_witness(
+            1,
+            chain_digest,
+            "favpw-dup-other",
+            seed=self.AUDITOR2_SEED,
+            actor=self.auditor2_id,
+        )
+        self.assertEqual(status, 201, other)
+        payload = json.loads(other)
+        self.assertEqual(payload["witnessSeq"], 2)
+        self.assertEqual(payload["proofSeq"], 1)
+        self.assertEqual(payload["auditorId"], self.auditor2_id)
+
+    def test_verification_witness_structure_permission_nonce(self) -> None:
+        self.setup_two_verification_proofs("favpw-auth")
+        chain_digest = self.verification_chain_digest_for(1)
+        # 查询参数非法。
+        status, _ = self.request_raw(
+            f"{self.WITNESS_ENDPOINT}?x=1",
+            self.verification_witness_body(1, chain_digest),
+            "favpw-auth-query",
+            "POST",
+        )
+        self.assertEqual(status, 400)
+        # 代理头非法。
+        request = Request(
+            self.url(self.WITNESS_ENDPOINT),
+            data=self.verification_witness_body(1, chain_digest),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "favpw-auth-deleg")
+        request.add_header("SLA-Delegation", "d;0;1;n;" + "ab" * 64)
+        try:
+            with urlopen(request, timeout=5) as response:
+                status = response.status
+        except HTTPError as error:
+            status = error.code
+        self.assertEqual(status, 400)
+        # 缺失认证头。
+        status, _ = self.request_raw(
+            self.WITNESS_ENDPOINT,
+            self.verification_witness_body(1, chain_digest),
+            "favpw-auth-noauth",
+            "POST",
+            omit_auth=True,
+        )
+        self.assertEqual(status, 400)
+        # 非审计机器 403（不得借此探测目标链项：目标缺失也同样 403）。
+        status, _ = self.post_verification_witness(
+            99,
+            chain_digest,
+            "favpw-auth-forbidden",
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+        )
+        self.assertEqual(status, 403)
+        # 失败不消费随机数：合法请求随后可用同一随机数成功。
+        nonce = f"nonce-favpw-auth-{time.time_ns()}"
+        status, _ = self.post_verification_witness(
+            3, chain_digest, "favpw-auth-fail", nonce=nonce
+        )
+        self.assertEqual(status, 404)
+        status, _ = self.post_verification_witness(
+            1, chain_digest, "favpw-auth-ok", nonce=nonce
+        )
+        self.assertEqual(status, 201)
+        # 成功后随机数已消费：异键复用为 replay_detected。
+        status, body = self.post_verification_witness(
+            2,
+            self.verification_chain_digest_for(2),
+            "favpw-auth-replay",
+            nonce=nonce,
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "replay_detected"})
+
+    def test_verification_witness_stale_time(self) -> None:
+        self.setup_two_verification_proofs("favpw-stale")
+        chain_digest = self.verification_chain_digest_for(1)
+        stale_ms = int(time.time() * 1000) - 600_000
+        status, body = self.post_verification_witness(
+            1,
+            chain_digest,
+            "favpw-stale-1",
+            request_time_ms=stale_ms,
+            nonce=f"nonce-favpw-stale-{time.time_ns()}",
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(body), {"error": "stale_request"})
+        # 失败不留记录、不推进序号。
+        status, response = self.post_verification_witness(
+            1, chain_digest, "favpw-stale-ok"
+        )
+        self.assertEqual(status, 201, response)
+        self.assertEqual(json.loads(response)["witnessSeq"], 1)
+
+    def test_verification_witness_same_key_changed_body_or_auth_conflict(self) -> None:
+        self.setup_two_verification_proofs("favpw-conf")
+        chain_digest = self.verification_chain_digest_for(1)
+        status, _ = self.post_verification_witness(
+            1, chain_digest, "favpw-conf-1"
+        )
+        self.assertEqual(status, 201)
+        # 同键异体：冲突，且先于资源查询。
+        status, body = self.request_raw(
+            self.WITNESS_ENDPOINT,
+            self.verification_witness_body(2, chain_digest),
+            "favpw-conf-1",
+            "POST",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+        # 同键同体异认证五段：冲突。
+        status, body = self.request_raw(
+            self.WITNESS_ENDPOINT,
+            self.verification_witness_body(1, chain_digest),
+            "favpw-conf-1",
+            "POST",
+            nonce=f"nonce-favpw-conf-{time.time_ns()}",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_verification_witness_failure_no_side_effects(self) -> None:
+        self.setup_two_verification_proofs("favpw-fail")
+        chain_digest = self.verification_chain_digest_for(1)
+        # 摘要不符（409）不推进见证序号、不留记录。
+        status, _ = self.post_verification_witness(
+            1, "a" * 64, "favpw-fail-1"
+        )
+        self.assertEqual(status, 409)
+        status, created = self.post_verification_witness(
+            1, chain_digest, "favpw-fail-2"
+        )
+        self.assertEqual(status, 201, created)
+        self.assertEqual(json.loads(created)["witnessSeq"], 1)
+        connection = sqlite3.connect(self.server.database_path)
+        self.assertEqual(
+            connection.execute(
+                "SELECT COUNT(*) FROM final_audit_verification_proof_witnesses"
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            connection.execute(
+                "SELECT COUNT(*)"
+                " FROM final_audit_verification_proof_witness_idempotency_records"
+            ).fetchone()[0],
+            1,
+        )
+        connection.close()
+
+    def test_verification_witness_concurrent_same_node_single_success(self) -> None:
+        self.setup_two_verification_proofs("favpw-conc")
+        chain_digest = self.verification_chain_digest_for(1)
+        body = self.verification_witness_body(1, chain_digest)
+
+        def witness(index: int) -> tuple[int, bytes]:
+            return self.request_raw(
+                self.WITNESS_ENDPOINT,
+                body,
+                f"favpw-conc-{index}",
+                "POST",
+                nonce=f"nonce-favpw-conc-{index:020d}",
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(8) as executor:
+            results = list(executor.map(witness, range(8)))
+        statuses = sorted(status for status, _ in results)
+        self.assertEqual(statuses.count(201), 1, results)
+        self.assertEqual(statuses.count(409), 7)
+        self.assertEqual(
+            {
+                json.loads(response)["error"]
+                for status, response in results
+                if status == 409
+            },
+            {"witness_exists"},
+        )
+        # 败者不推进序号、不留部分记录。
+        connection = sqlite3.connect(self.server.database_path)
+        self.assertEqual(
+            connection.execute(
+                "SELECT COUNT(*), COALESCE(MAX(witness_seq), 0)"
+                " FROM final_audit_verification_proof_witnesses"
+            ).fetchone(),
+            (1, 1),
+        )
+        connection.close()
+
+    def test_verification_witness_collection(self) -> None:
+        # 空集合。
+        status, body = self.get(self.WITNESS_ENDPOINT)
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertEqual(list(payload), ["witnesses", "nextCursor"])
+        self.assertEqual(payload["witnesses"], [])
+        self.assertIsNone(payload["nextCursor"])
+        # 两份见证（不同审计机器、同一链节点）完整返回。
+        self.setup_two_verification_proofs("favpw-list")
+        chain_digest = self.verification_chain_digest_for(1)
+        status, first = self.post_verification_witness(
+            1, chain_digest, "favpw-list-1"
+        )
+        self.assertEqual(status, 201)
+        status, second = self.post_verification_witness(
+            1,
+            chain_digest,
+            "favpw-list-2",
+            seed=self.AUDITOR2_SEED,
+            actor=self.auditor2_id,
+        )
+        self.assertEqual(status, 201)
+        status, body = self.get(f"{self.WITNESS_ENDPOINT}?limit=1")
+        self.assertEqual(status, 200, body)
+        page = json.loads(body)
+        self.assertEqual(page["witnesses"], [json.loads(first)])
+        cursor = page["nextCursor"]
+        self.assertEqual(cursor, "2:1")
+        status, body = self.get(f"{self.WITNESS_ENDPOINT}?cursor={cursor}")
+        self.assertEqual(status, 200, body)
+        page = json.loads(body)
+        self.assertEqual(page["witnesses"], [json.loads(second)])
+        self.assertIsNone(page["nextCursor"])
+        # 旧游标跨重启稳定且隔离并发新增。
+        self.restart()
+        status, body = self.get(f"{self.WITNESS_ENDPOINT}?cursor={cursor}")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["witnesses"], [json.loads(second)])
+        # 新见证不进入旧 cut；全新首页取新 cut。
+        cd2 = self.verification_chain_digest_for(2)
+        status, third = self.post_verification_witness(2, cd2, "favpw-list-3")
+        self.assertEqual(status, 201)
+        status, body = self.get(f"{self.WITNESS_ENDPOINT}?cursor={cursor}")
+        self.assertEqual(
+            [w["witnessSeq"] for w in json.loads(body)["witnesses"]], [2]
+        )
+        status, body = self.get(self.WITNESS_ENDPOINT)
+        self.assertEqual(
+            [w["witnessSeq"] for w in json.loads(body)["witnesses"]], [1, 2, 3]
+        )
+        # 非法参数与游标。
+        for query in (
+            "limit=0",
+            "limit=101",
+            "foo=1",
+            "cursor=99:1",
+            "cursor=1:99",
+            "limit=1&limit=2",
+        ):
+            status, _ = self.get(f"{self.WITNESS_ENDPOINT}?{query}")
+            self.assertEqual(status, 400, query)
+        # 未配置审计身份 403；缺失认证头 400。
+        status, _ = self.get(
+            self.WITNESS_ENDPOINT,
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+        )
+        self.assertEqual(status, 403)
+        status, _ = self.get(self.WITNESS_ENDPOINT, omit_auth=True)
+        self.assertEqual(status, 400)
+
+    def test_verification_witness_get_nonce_consumed_only_on_success(self) -> None:
+        self.setup_two_verification_proofs("favpw-gnonce")
+        nonce = f"nonce-favpw-gn-{time.time_ns()}"
+        status, _ = self.get(self.WITNESS_ENDPOINT, nonce=nonce)
+        self.assertEqual(status, 200)
+        status, body = self.get(self.WITNESS_ENDPOINT, nonce=nonce)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "replay_detected"})
+        failed_nonce = f"nonce-favpw-gn-fail-{time.time_ns()}"
+        for _ in range(2):
+            status, _ = self.get(
+                f"{self.WITNESS_ENDPOINT}?cursor=99:1", nonce=failed_nonce
+            )
+            self.assertEqual(status, 400)
+
+    def test_verification_witness_rotation_and_growth_keep_frozen(self) -> None:
+        self.setup_two_verification_proofs("favpw-imm")
+        chain_digest = self.verification_chain_digest_for(1)
+        cd2 = self.verification_chain_digest_for(2)
+        status, first = self.post_verification_witness(
+            1, chain_digest, "favpw-imm-1"
+        )
+        self.assertEqual(status, 201)
+        first_payload = json.loads(first)
+        # 轮换审计机器到版本二并吊销版本一。
+        new_seed = b"\x0d" * 32
+        new_public = _ed25519_public_key(new_seed).hex()
+        current_signature, new_signature = key_rotation_signatures(
+            self.AUDITOR_SEED, new_seed, self.auditor_id, 1, new_public
+        )
+        status, _ = self.post_json(
+            f"/v1/machines/{self.auditor_id}/keys",
+            {
+                "expectedVersion": 1,
+                "publicKey": new_public,
+                "currentSignature": current_signature,
+                "newSignature": new_signature,
+            },
+            "favpw-imm-rotate",
+        )
+        self.assertEqual(status, 201)
+        status, _ = self.post_json(
+            f"/v1/machines/{self.auditor_id}/keys/1/revocation",
+            {"signature": key_revocation_signature(new_seed, self.auditor_id, 1)},
+            "favpw-imm-revoke",
+        )
+        self.assertEqual(status, 200)
+        # 以版本二密钥见证第二链节点；链增长与密钥变化不改写既有见证。
+        status, second = self.post_verification_witness(
+            2, cd2, "favpw-imm-2", seed=new_seed, key_version=2
+        )
+        self.assertEqual(status, 201, second)
+        second_payload = json.loads(second)
+        self.assertEqual(second_payload["witnessSeq"], 2)
+        self.assertEqual(second_payload["keyVersion"], 2)
+        self.assertEqual(second_payload["publicKey"], new_public)
+        # 第一份见证的字节、身份、公钥与版本均不被改写。
+        status, replay = self.post_verification_witness(
+            1, chain_digest, "favpw-imm-1"
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(replay, first)
+        status, body = self.get(
+            f"{self.WITNESS_ENDPOINT}?limit=2",
+            seed=new_seed,
+            key_version=2,
+        )
+        self.assertEqual(status, 200, body)
+        witnesses = json.loads(body)["witnesses"]
+        self.assertEqual(len(witnesses), 2)
+        self.assertEqual(witnesses[0], first_payload)
+        self.assertEqual(witnesses[0]["publicKey"], ARBITRATOR_PUBLIC)
+        self.assertEqual(witnesses[0]["keyVersion"], 1)
+
+
 class IntegerLimitTests(_EvidenceScenario, unittest.TestCase):
     # 进程级整数转换保护（PEP 682）不再全局关闭：仅 README 已声明的审计序号
     # 入口接受超长整数（超存储范围按不存在处理），其他入口的超长整数一律
