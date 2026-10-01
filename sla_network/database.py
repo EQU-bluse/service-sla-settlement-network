@@ -797,6 +797,38 @@ CREATE TABLE IF NOT EXISTS auth_nonce_records (
     request_time_ms INTEGER NOT NULL,
     PRIMARY KEY (machine_id, nonce)
 );
+CREATE TABLE IF NOT EXISTS telemetry_batches (
+    receipt_id TEXT PRIMARY KEY,
+    producer_id TEXT NOT NULL,
+    sla_id TEXT NOT NULL,
+    batch_id TEXT NOT NULL,
+    sequence_from INTEGER NOT NULL,
+    sequence_to INTEGER NOT NULL,
+    previous_digest TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    issued_at_ms INTEGER NOT NULL,
+    accepted_count INTEGER NOT NULL,
+    key_version INTEGER NOT NULL,
+    request_digest TEXT NOT NULL,
+    canonical_digest TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    response_json TEXT NOT NULL,
+    UNIQUE (producer_id, sla_id, batch_id)
+);
+CREATE TABLE IF NOT EXISTS telemetry_batch_events (
+    producer_id TEXT NOT NULL,
+    sla_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    event_id TEXT NOT NULL,
+    observed_at_ms INTEGER NOT NULL,
+    latency_ms INTEGER NOT NULL,
+    digest TEXT NOT NULL,
+    receipt_id TEXT NOT NULL,
+    PRIMARY KEY (producer_id, sla_id, sequence)
+);
+CREATE INDEX IF NOT EXISTS idx_telemetry_batch_events_receipt
+ON telemetry_batch_events(receipt_id);
 CREATE INDEX IF NOT EXISTS idx_dispute_evidences_dispute_seq
 ON dispute_evidences(dispute_id, evidence_seq);
 CREATE INDEX IF NOT EXISTS idx_dispute_evidence_snapshots_dispute_seq

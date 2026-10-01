@@ -41,6 +41,8 @@ TEMPLATE_ID_PATTERN = re.compile(r"[a-z0-9-]{1,64}")
 SLA_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)")
 SLA_CONFIRMATIONS_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/confirmations")
 SLA_TELEMETRY_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/telemetry")
+TELEMETRY_BATCHES_PATH = "/v1/telemetry-batches"
+TELEMETRY_RECEIPTS_PATH_PATTERN = re.compile(r"/v1/telemetry-receipts/([^/]+)")
 SLA_EVALUATIONS_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/evaluations")
 SLA_SETTLEMENTS_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/settlements")
 ACCOUNT_LEDGER_PATH_PATTERN = re.compile(r"/v1/accounts/([^/]+)/ledger")
@@ -93,6 +95,26 @@ CONFIRMATION_PARTIES = {"producer", "consumer"}
 TELEMETRY_FIELDS = {"eventId", "timestamp", "latencyMs", "digest"}
 TELEMETRY_V1_SIGNED_FIELDS = TELEMETRY_FIELDS | {"signature"}
 TELEMETRY_SIGNED_FIELDS = TELEMETRY_FIELDS | {"keyVersion", "signature"}
+TELEMETRY_BATCH_FIELDS = {
+    "producerId",
+    "slaId",
+    "batchId",
+    "sequenceFrom",
+    "sequenceTo",
+    "previousDigest",
+    "issuedAt",
+    "events",
+    "keyVersion",
+    "signature",
+}
+TELEMETRY_BATCH_EVENT_FIELDS = {
+    "sequence",
+    "eventId",
+    "observedAt",
+    "latencyMs",
+}
+TELEMETRY_BATCH_CONTEXT = "telemetry-batch-v1"
+TELEMETRY_BATCH_GENESIS_DIGEST = "0" * 64
 SIGNATURE_PATTERN = re.compile(r"[0-9a-f]{128}")
 EVALUATION_FIELDS = {"from", "to"}
 FUND_FIELDS = {"amountMicros", "reference"}
@@ -318,6 +340,10 @@ class Handler(BaseHTTPRequestHandler):
         telemetry_match = SLA_TELEMETRY_PATH_PATTERN.fullmatch(target.path)
         if telemetry_match is not None:
             self._get_telemetry(telemetry_match.group(1), target.query)
+            return
+        receipt_match = TELEMETRY_RECEIPTS_PATH_PATTERN.fullmatch(target.path)
+        if receipt_match is not None:
+            self._get_telemetry_receipt(receipt_match.group(1), target.query)
             return
         machine_delegations_match = MACHINE_DELEGATIONS_PATH_PATTERN.fullmatch(
             target.path
@@ -1766,6 +1792,9 @@ class Handler(BaseHTTPRequestHandler):
         telemetry_match = SLA_TELEMETRY_PATH_PATTERN.fullmatch(self.path)
         if telemetry_match is not None:
             self._post_telemetry(telemetry_match.group(1))
+            return
+        if self.path == TELEMETRY_BATCHES_PATH:
+            self._post_telemetry_batch()
             return
         evaluations_match = SLA_EVALUATIONS_PATH_PATTERN.fullmatch(self.path)
         if evaluations_match is not None:
@@ -3664,6 +3693,449 @@ class Handler(BaseHTTPRequestHandler):
             except BaseException:
                 database.execute("ROLLBACK")
                 raise
+
+    def _post_telemetry_batch(self) -> None:
+        # 批次摄取不使用 Idempotency-Key：batch_id（连同 producer、sla）即天然幂等键。
+        body = self._read_raw_body()
+        parsed = self._read_json_object(body)
+        fields = self._read_telemetry_batch_object(parsed)
+        if fields is None:
+            self._json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "invalid_telemetry_batch"},
+            )
+            return
+        status, payload = self._apply_telemetry_batch(body, fields)
+        self._json(status, payload)
+
+    def _read_telemetry_batch_object(
+        self, parsed: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        if parsed is None or set(parsed) != TELEMETRY_BATCH_FIELDS:
+            return None
+        producer_id = parsed["producerId"]
+        sla_id = parsed["slaId"]
+        batch_id = parsed["batchId"]
+        previous_digest = parsed["previousDigest"]
+        if not isinstance(producer_id, str) or PUBLIC_KEY_PATTERN.fullmatch(producer_id) is None:
+            return None
+        if not isinstance(sla_id, str) or TEMPLATE_ID_PATTERN.fullmatch(sla_id) is None:
+            return None
+        if not isinstance(batch_id, str) or TEMPLATE_ID_PATTERN.fullmatch(batch_id) is None:
+            return None
+        if (
+            not isinstance(previous_digest, str)
+            or DIGEST_PATTERN.fullmatch(previous_digest) is None
+        ):
+            return None
+        sequence_from = parsed["sequenceFrom"]
+        sequence_to = parsed["sequenceTo"]
+        if not _bounded_int(sequence_from, 1, 2147483647):
+            return None
+        if not _bounded_int(sequence_to, 1, 2147483647):
+            return None
+        # issuedAt 为带时区的 RFC 3339 时间：统一解析后存 UTC 毫秒。
+        issued_at_ms = self._parse_offset_datetime_ms(parsed["issuedAt"])
+        if issued_at_ms is None:
+            return None
+        key_version = parsed["keyVersion"]
+        if not _bounded_int(key_version, 1, INT64_MAX):
+            return None
+        signature = parsed["signature"]
+        if not isinstance(signature, str) or SIGNATURE_PATTERN.fullmatch(signature) is None:
+            return None
+        events_value = parsed["events"]
+        if not isinstance(events_value, list) or not events_value:
+            return None
+        events: list[dict[str, Any]] = []
+        for event in events_value:
+            if not isinstance(event, dict) or set(event) != TELEMETRY_BATCH_EVENT_FIELDS:
+                return None
+            sequence = event["sequence"]
+            event_id = event["eventId"]
+            observed_at_text = event["observedAt"]
+            latency_ms = event["latencyMs"]
+            if not _bounded_int(sequence, 1, 2147483647):
+                return None
+            if not isinstance(event_id, str) or TEMPLATE_ID_PATTERN.fullmatch(event_id) is None:
+                return None
+            if not isinstance(observed_at_text, str):
+                return None
+            observed_at_ms = self._parse_offset_datetime_ms(observed_at_text)
+            if observed_at_ms is None:
+                return None
+            if not _bounded_int(latency_ms, 0, 2147483647):
+                return None
+            events.append(
+                {
+                    "sequence": sequence,
+                    "eventId": event_id,
+                    "observedAt": observed_at_text,
+                    "observedAtMs": observed_at_ms,
+                    "latencyMs": latency_ms,
+                }
+            )
+        # 序列范围必须与事件数相符；事件序列须稠密连续且与声明范围一致。
+        if sequence_to - sequence_from + 1 != len(events):
+            return None
+        expected = sequence_from
+        for event in events:
+            if event["sequence"] != expected:
+                return None
+            expected += 1
+        return {
+            "producerId": producer_id,
+            "slaId": sla_id,
+            "batchId": batch_id,
+            "sequenceFrom": sequence_from,
+            "sequenceTo": sequence_to,
+            "previousDigest": previous_digest,
+            "issuedAt": parsed["issuedAt"],
+            "issuedAtMs": issued_at_ms,
+            "events": events,
+            "keyVersion": key_version,
+            "signature": signature,
+        }
+
+    @staticmethod
+    def _parse_offset_datetime_ms(value: Any) -> int | None:
+        # 仅接受带时区偏移的 RFC 3339/ISO 8601 时间（Z 或 ±HH:MM），朴素时间拒绝。
+        if not isinstance(value, str) or len(value) < 20:
+            return None
+        normalized = value
+        if normalized.endswith("Z") or normalized.endswith("z"):
+            normalized = normalized[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        return int(parsed.timestamp() * 1000)
+
+    def _telemetry_batch_canonical(self, fields: dict[str, Any]) -> bytes:
+        # telemetry-batch-v1：路由字段（producer、sla）与全部批次、事件字段逐行连接。
+        lines = [
+            TELEMETRY_BATCH_CONTEXT,
+            fields["producerId"],
+            fields["slaId"],
+            fields["batchId"],
+            str(fields["sequenceFrom"]),
+            str(fields["sequenceTo"]),
+            fields["previousDigest"],
+            str(fields["issuedAtMs"]),
+            str(fields["keyVersion"]),
+        ]
+        for event in fields["events"]:
+            lines.append(
+                "|".join(
+                    (
+                        str(event["sequence"]),
+                        event["eventId"],
+                        str(event["observedAtMs"]),
+                        str(event["latencyMs"]),
+                    )
+                )
+            )
+        return "\n".join(lines).encode("utf-8")
+
+    @staticmethod
+    def _telemetry_receipt_id(
+        producer_id: str,
+        sla_id: str,
+        batch_id: str,
+        sequence_from: int,
+        sequence_to: int,
+    ) -> str:
+        # 回执标识为路由与批次标识（不含内容）的 SHA-256：重放稳定，冲突时
+        # 亦可凭同键定位原回执而无须先接受后批。
+        basis = "\n".join(
+            (
+                "telemetry-receipt-v1",
+                producer_id,
+                sla_id,
+                batch_id,
+                str(sequence_from),
+                str(sequence_to),
+            )
+        ).encode("utf-8")
+        return hashlib.sha256(basis).hexdigest()
+
+    def _apply_telemetry_batch(
+        self, raw_body: bytes, fields: dict[str, Any]
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        producer_id = fields["producerId"]
+        sla_id = fields["slaId"]
+        batch_id = fields["batchId"]
+        sequence_from = fields["sequenceFrom"]
+        sequence_to = fields["sequenceTo"]
+        key_version = fields["keyVersion"]
+        request_digest = hashlib.sha256(raw_body).hexdigest()
+        canonical = self._telemetry_batch_canonical(fields)
+        canonical_digest = hashlib.sha256(canonical).hexdigest()
+        # 服务端批次 digest：锚定 canonical 摘要与服务收到的原始正文摘要，
+        # 同批重放逐字节稳定，内容或传输字节变化即产生不同 digest。
+        digest = hashlib.sha256(
+            "\n".join(
+                (
+                    "telemetry-batch-digest-v1",
+                    canonical_digest,
+                    request_digest,
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+        receipt_id = self._telemetry_receipt_id(
+            producer_id, sla_id, batch_id, sequence_from, sequence_to
+        )
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                # 1) 授权：机器须已登记且为该 SLA 的生产方。
+                machine = database.execute(
+                    "SELECT 1 FROM machines WHERE id = ?",
+                    (producer_id,),
+                ).fetchone()
+                sla = database.execute(
+                    "SELECT machine_id, start_unix, end_unix, state, max_latency_ms"
+                    " FROM slas WHERE id = ?",
+                    (sla_id,),
+                ).fetchone()
+                if machine is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.UNAUTHORIZED, {"error": "invalid_telemetry_signature"}
+                if sla is None or sla["machine_id"] != producer_id:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.FORBIDDEN, {"error": "telemetry_forbidden"}
+                # 2) 验签：密钥须存在、未吊销，且批次签发时刻位于该版本激活区间。
+                key = database.execute(
+                    "SELECT public_key, activated_at_ms, revoked FROM machine_keys"
+                    " WHERE machine_id = ? AND version = ?",
+                    (producer_id, key_version),
+                ).fetchone()
+                signature_valid = False
+                if key is not None and not key["revoked"]:
+                    next_activation = database.execute(
+                        "SELECT activated_at_ms FROM machine_keys"
+                        " WHERE machine_id = ? AND version > ?"
+                        " ORDER BY version ASC LIMIT 1",
+                        (producer_id, key_version),
+                    ).fetchone()
+                    within_window = fields["issuedAtMs"] >= key["activated_at_ms"] and (
+                        next_activation is None
+                        or fields["issuedAtMs"] < next_activation["activated_at_ms"]
+                    )
+                    if within_window:
+                        signature_valid = ed25519_verify(
+                            bytes.fromhex(key["public_key"]),
+                            canonical,
+                            bytes.fromhex(fields["signature"]),
+                        )
+                if not signature_valid:
+                    database.execute("ROLLBACK")
+                    return (
+                        HTTPStatus.UNAUTHORIZED,
+                        {"error": "invalid_telemetry_signature"},
+                    )
+                # 3) 同 batch_id 幂等/冲突判定（先于序列状态推进）。
+                existing = database.execute(
+                    "SELECT receipt_id, request_digest, canonical_digest, signature,"
+                    " digest, sequence_from, sequence_to, response_json"
+                    " FROM telemetry_batches"
+                    " WHERE producer_id = ? AND sla_id = ? AND batch_id = ?",
+                    (producer_id, sla_id, batch_id),
+                ).fetchone()
+                if existing is not None:
+                    database.execute("ROLLBACK")
+                    if (
+                        existing["canonical_digest"] == canonical_digest
+                        and existing["signature"] == fields["signature"]
+                    ):
+                        # 相同 batch_id、规范内容与签名的重试（允许 JSON 空白或
+                        # 键序差异）：返回原回执与 duplicate，不重复摄取。
+                        payload = json.loads(existing["response_json"])
+                        payload["status"] = "duplicate"
+                        return HTTPStatus.OK, payload
+                    return HTTPStatus.CONFLICT, {"error": "telemetry_conflict"}
+                # 4) 时序：链状态按 (producer, sla) 稠密推进，不得跳号、重叠或倒退。
+                last = database.execute(
+                    "SELECT sequence_to AS last_seq, digest AS last_digest"
+                    " FROM telemetry_batches"
+                    " WHERE producer_id = ? AND sla_id = ?"
+                    " ORDER BY sequence_to DESC LIMIT 1",
+                    (producer_id, sla_id),
+                ).fetchone()
+                if last is None:
+                    expected_sequence = 1
+                    expected_previous_digest = TELEMETRY_BATCH_GENESIS_DIGEST
+                else:
+                    expected_sequence = last["last_seq"] + 1
+                    expected_previous_digest = last["last_digest"]
+                # 序列范围与已接收序列重叠（含倒退、异 batch_id 重发）：telemetry_conflict。
+                overlap = database.execute(
+                    "SELECT 1 FROM telemetry_batch_events"
+                    " WHERE producer_id = ? AND sla_id = ?"
+                    " AND sequence >= ? AND sequence <= ? LIMIT 1",
+                    (producer_id, sla_id, sequence_from, sequence_to),
+                ).fetchone()
+                if overlap is not None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "telemetry_conflict"}
+                # 缺少前序或跳号/倒退：sequence_gap，并给出唯一 expected_sequence。
+                if sequence_from != expected_sequence:
+                    database.execute("ROLLBACK")
+                    return (
+                        HTTPStatus.CONFLICT,
+                        {
+                            "error": "sequence_gap",
+                            "expectedSequence": expected_sequence,
+                        },
+                    )
+                # 序列衔接正确但摘要链不匹配：telemetry_conflict。
+                if fields["previousDigest"] != expected_previous_digest:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "telemetry_conflict"}
+                # 5) 事件 observed_at 须带时区（解析阶段已保证）且位于 SLA 有效期内。
+                start_ms = sla["start_unix"] * 1000
+                end_ms = sla["end_unix"] * 1000
+                event_ids: set[str] = set()
+                for event in fields["events"]:
+                    if not (start_ms <= event["observedAtMs"] < end_ms):
+                        database.execute("ROLLBACK")
+                        return (
+                            HTTPStatus.UNPROCESSABLE_ENTITY,
+                            {"error": "invalid_telemetry_batch"},
+                        )
+                    if event["eventId"] in event_ids:
+                        database.execute("ROLLBACK")
+                        return (
+                            HTTPStatus.UNPROCESSABLE_ENTITY,
+                            {"error": "invalid_telemetry_batch"},
+                        )
+                    event_ids.add(event["eventId"])
+                # eventId 不得与既有遥测事件（含旧单条入口与先前批次）冲突，
+                # 否则整批拒绝：任一事件无效都不摄取、不推进 commit_seq。
+                placeholders = ",".join("?" for _ in event_ids)
+                collided = database.execute(
+                    f"SELECT 1 FROM sla_telemetry_events"
+                    f" WHERE sla_id = ? AND event_id IN ({placeholders}) LIMIT 1",
+                    (sla_id, *sorted(event_ids)),
+                ).fetchone()
+                if collided is not None:
+                    database.execute("ROLLBACK")
+                    return (
+                        HTTPStatus.UNPROCESSABLE_ENTITY,
+                        {"error": "invalid_telemetry_batch"},
+                    )
+                created_at_ms = int(datetime.now(UTC).timestamp() * 1000)
+                # 6) 事件原子进入既有遥测流程：分配全库 commit_seq，写入既有
+                # 事件表，聚合、履约与结算入口无需改动即可观察。
+                first_commit_record = database.execute(
+                    "SELECT COALESCE(MAX(commit_seq), 0) AS current_max"
+                    " FROM sla_telemetry_events"
+                ).fetchone()
+                next_commit_seq = first_commit_record["current_max"]
+                event_rows: list[tuple[Any, ...]] = []
+                for event in fields["events"]:
+                    next_commit_seq += 1
+                    event_digest = hashlib.sha256(
+                        (
+                            f"{sla_id}\n{event['eventId']}\n{event['observedAtMs']}\n"
+                            f"{event['latencyMs']}\n{producer_id}"
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    database.execute(
+                        "INSERT INTO sla_telemetry_events"
+                        "(sla_id, event_id, timestamp_ms, latency_ms, digest, commit_seq,"
+                        " signature, key_version)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            sla_id,
+                            event["eventId"],
+                            event["observedAtMs"],
+                            event["latencyMs"],
+                            event_digest,
+                            next_commit_seq,
+                            fields["signature"],
+                            key_version,
+                        ),
+                    )
+                    event_rows.append(
+                        (
+                            producer_id,
+                            sla_id,
+                            event["sequence"],
+                            event["eventId"],
+                            event["observedAtMs"],
+                            event["latencyMs"],
+                            event_digest,
+                            receipt_id,
+                        )
+                    )
+                database.executemany(
+                    "INSERT INTO telemetry_batch_events"
+                    "(producer_id, sla_id, sequence, event_id, observed_at_ms,"
+                    " latency_ms, digest, receipt_id)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    event_rows,
+                )
+                payload = {
+                    "receiptId": receipt_id,
+                    "digest": digest,
+                    "receivedCount": len(fields["events"]),
+                    "sequenceFrom": sequence_from,
+                    "sequenceTo": sequence_to,
+                    "status": "accepted",
+                }
+                response_json = json.dumps(payload, separators=(",", ":"))
+                database.execute(
+                    "INSERT INTO telemetry_batches"
+                    "(receipt_id, producer_id, sla_id, batch_id, sequence_from,"
+                    " sequence_to, previous_digest, digest, issued_at_ms,"
+                    " accepted_count, key_version, request_digest, canonical_digest,"
+                    " signature, created_at_ms, response_json)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        receipt_id,
+                        producer_id,
+                        sla_id,
+                        batch_id,
+                        sequence_from,
+                        sequence_to,
+                        fields["previousDigest"],
+                        digest,
+                        fields["issuedAtMs"],
+                        len(fields["events"]),
+                        key_version,
+                        request_digest,
+                        canonical_digest,
+                        fields["signature"],
+                        created_at_ms,
+                        response_json,
+                    ),
+                )
+                database.execute("COMMIT")
+                return HTTPStatus.ACCEPTED, payload
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+
+    def _get_telemetry_receipt(self, receipt_id: str, query: str) -> None:
+        if query:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        if PUBLIC_KEY_PATTERN.fullmatch(receipt_id) is None:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        with closing(connect(self.server.database_path)) as database:
+            record = database.execute(
+                "SELECT response_json FROM telemetry_batches WHERE receipt_id = ?",
+                (receipt_id,),
+            ).fetchone()
+        if record is None:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        # 按 receipt_id 查询稳定返回首次接收时的同一结果（accepted）。
+        self._json(HTTPStatus.OK, json.loads(record["response_json"]))
 
     def _evaluate_sla(self, sla_id: str) -> None:
         idempotency_key = self.headers.get("Idempotency-Key")
