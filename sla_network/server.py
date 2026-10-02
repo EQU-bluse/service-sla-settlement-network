@@ -41,6 +41,12 @@ TEMPLATE_ID_PATTERN = re.compile(r"[a-z0-9-]{1,64}")
 SLA_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)")
 SLA_CONFIRMATIONS_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/confirmations")
 SLA_TELEMETRY_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/telemetry")
+SLA_TELEMETRY_SEALS_PATH_PATTERN = re.compile(
+    r"/v1/slas/([^/]+)/telemetry-seals"
+)
+SLA_TELEMETRY_SEAL_PATH_PATTERN = re.compile(
+    r"/v1/slas/([^/]+)/telemetry-seal"
+)
 SLA_EVALUATIONS_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/evaluations")
 SLA_SETTLEMENTS_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/settlements")
 ACCOUNT_LEDGER_PATH_PATTERN = re.compile(r"/v1/accounts/([^/]+)/ledger")
@@ -98,6 +104,7 @@ TELEMETRY_V1_SIGNED_FIELDS = TELEMETRY_FIELDS | {"signature"}
 TELEMETRY_SIGNED_FIELDS = TELEMETRY_FIELDS | {"keyVersion", "signature"}
 SIGNATURE_PATTERN = re.compile(r"[0-9a-f]{128}")
 EVALUATION_FIELDS = {"from", "to"}
+TELEMETRY_SEAL_FIELDS = {"actorId"}
 FUND_FIELDS = {"amountMicros", "reference"}
 SETTLEMENT_FIELDS = {"slaId", "evaluationSeq"}
 SETTLEMENT_BATCH_FIELDS = {"id", "items"}
@@ -324,6 +331,10 @@ class Handler(BaseHTTPRequestHandler):
         telemetry_match = SLA_TELEMETRY_PATH_PATTERN.fullmatch(target.path)
         if telemetry_match is not None:
             self._get_telemetry(telemetry_match.group(1), target.query)
+            return
+        telemetry_seal_match = SLA_TELEMETRY_SEAL_PATH_PATTERN.fullmatch(target.path)
+        if telemetry_seal_match is not None:
+            self._get_telemetry_seal(telemetry_seal_match.group(1), target.query)
             return
         machine_delegations_match = MACHINE_DELEGATIONS_PATH_PATTERN.fullmatch(
             target.path
@@ -1780,6 +1791,12 @@ class Handler(BaseHTTPRequestHandler):
         telemetry_match = SLA_TELEMETRY_PATH_PATTERN.fullmatch(self.path)
         if telemetry_match is not None:
             self._post_telemetry(telemetry_match.group(1))
+            return
+        telemetry_seals_match = SLA_TELEMETRY_SEALS_PATH_PATTERN.fullmatch(
+            urlsplit(self.path).path
+        )
+        if telemetry_seals_match is not None:
+            self._create_telemetry_seal(telemetry_seals_match.group(1))
             return
         evaluations_match = SLA_EVALUATIONS_PATH_PATTERN.fullmatch(self.path)
         if evaluations_match is not None:
@@ -3733,18 +3750,24 @@ class Handler(BaseHTTPRequestHandler):
                     return HTTPStatus.NOT_FOUND, {"error": "not_found"}
                 start = fields["from"]
                 end = fields["to"]
-                if (
-                    sla["state"] != "active"
-                    or not (sla["start_unix"] * 1000 <= start < end <= sla["end_unix"] * 1000)
+                if sla["state"] not in ("active", "sealed") or not (
+                    sla["start_unix"] * 1000 <= start < end <= sla["end_unix"] * 1000
                 ):
                     database.execute("ROLLBACK")
                     return HTTPStatus.CONFLICT, {"error": "conflict"}
-                cut_record = database.execute(
-                    "SELECT MAX(commit_seq) AS cut FROM sla_telemetry_events"
-                ).fetchone()
-                cut = cut_record["cut"]
-                if cut is None:
-                    cut = 0
+                if sla["state"] == "sealed":
+                    # 封存后评估区间规则不变，但 cut 固定为封存时冻结的 sealCut。
+                    cut = database.execute(
+                        "SELECT seal_cut FROM sla_telemetry_seals WHERE sla_id = ?",
+                        (sla_id,),
+                    ).fetchone()["seal_cut"]
+                else:
+                    cut_record = database.execute(
+                        "SELECT MAX(commit_seq) AS cut FROM sla_telemetry_events"
+                    ).fetchone()
+                    cut = cut_record["cut"]
+                    if cut is None:
+                        cut = 0
                 summary = database.execute(
                     "SELECT COUNT(*) AS count, COALESCE(SUM(latency_ms), 0) AS latency_sum,"
                     " MAX(latency_ms) AS max_latency,"
@@ -3808,6 +3831,197 @@ class Handler(BaseHTTPRequestHandler):
             except BaseException:
                 database.execute("ROLLBACK")
                 raise
+
+    def _create_telemetry_seal(self, sla_id: str) -> None:
+        idempotency_key = self.headers.get("Idempotency-Key")
+        if (
+            idempotency_key is None
+            or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None
+        ):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 封存不接受任何查询参数：参数校验先于体校验与 SLA 查询。
+        if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        raw_body = self._read_raw_body()
+        fields = (
+            None
+            if raw_body is None
+            else self._read_telemetry_seal_object(raw_body)
+        )
+        if fields is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 仅支持单一 SLA-Auth：代理头、头缺失、重复或结构非法均为非法请求，
+        # 且先于 SLA 查询。
+        if self.headers.get_all(SLA_DELEGATION_HEADER):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        auth = self._parse_sla_auth()
+        if auth is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        body_digest = hashlib.sha256(raw_body).hexdigest()
+        status, payload = self._apply_telemetry_seal(
+            idempotency_key, sla_id, fields, auth, body_digest
+        )
+        self._json(status, payload)
+
+    def _read_telemetry_seal_object(self, body: bytes) -> dict[str, Any] | None:
+        parsed = self._read_json_object(body)
+        if parsed is None or set(parsed) != TELEMETRY_SEAL_FIELDS:
+            return None
+        actor_id = parsed["actorId"]
+        if (
+            not isinstance(actor_id, str)
+            or PUBLIC_KEY_PATTERN.fullmatch(actor_id) is None
+        ):
+            return None
+        return parsed
+
+    def _apply_telemetry_seal(
+        self,
+        idempotency_key: str,
+        sla_id: str,
+        fields: dict[str, Any],
+        auth: SlaAuth,
+        body_digest: str,
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+        standard_path = urlsplit(self.path).path
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                # 幂等判定先于资源查询：同键更换路径、正文或认证五段均冲突。
+                record = database.execute(
+                    "SELECT sla_id, request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature"
+                    " FROM sla_telemetry_seal_idempotency_records WHERE key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    if (
+                        record["sla_id"] == sla_id
+                        and record["request_json"] == request_json
+                        and self._auth_record_matches(record, auth)
+                    ):
+                        return HTTPStatus(record["status"]), json.loads(
+                            record["response_json"]
+                        )
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                sla = database.execute(
+                    "SELECT machine_id, end_unix, state FROM slas WHERE id = ?",
+                    (sla_id,),
+                ).fetchone()
+                if sla is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                actor_id = fields["actorId"]
+                # 封存者须为 SLA 快照中的生产机器，且与认证机器标识一致。
+                if actor_id != sla["machine_id"]:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
+                try:
+                    self._verify_request_auth(
+                        database, auth, actor_id, standard_path, body_digest
+                    )
+                    self._check_request_nonce(database, auth)
+                except AuthRejected as rejected:
+                    database.execute("ROLLBACK")
+                    return rejected.status, {"error": rejected.error}
+                # 已封存（含并发胜者先提交）的异键请求为 seal_exists；
+                # 未 active 与未到结束时刻在其后判定。
+                existing_seal = database.execute(
+                    "SELECT 1 FROM sla_telemetry_seals WHERE sla_id = ?",
+                    (sla_id,),
+                ).fetchone()
+                if existing_seal is not None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "seal_exists"}
+                if sla["state"] != "active":
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                now_ms = int(datetime.now(UTC).timestamp() * 1000)
+                if now_ms < sla["end_unix"] * 1000:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "not_due"}
+                # 事务内冻结全库遥测提交序号上界（空库为 0）；写事务串行，
+                # 并发遥测只能完整落在上界一侧：先提交者计入，后提交者因
+                # 状态已封存被拒绝，不存在已接受但未计数的事件。
+                seal_cut = database.execute(
+                    "SELECT COALESCE(MAX(commit_seq), 0) AS cut"
+                    " FROM sla_telemetry_events"
+                ).fetchone()["cut"]
+                event_count = database.execute(
+                    "SELECT COUNT(*) AS count FROM sla_telemetry_events"
+                    " WHERE sla_id = ? AND commit_seq <= ?",
+                    (sla_id, seal_cut),
+                ).fetchone()["count"]
+                payload = {
+                    "slaId": sla_id,
+                    "sealCut": seal_cut,
+                    "eventCount": event_count,
+                    "sealedBy": actor_id,
+                    "sealedAt": now_ms,
+                }
+                response_json = json.dumps(payload, separators=(",", ":"))
+                database.execute(
+                    "INSERT INTO sla_telemetry_seals"
+                    "(sla_id, seal_cut, event_count, sealed_by, sealed_at_ms,"
+                    " response_json)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (sla_id, seal_cut, event_count, actor_id, now_ms, response_json),
+                )
+                database.execute(
+                    "UPDATE slas SET state = 'sealed' WHERE id = ? AND state = 'active'",
+                    (sla_id,),
+                )
+                database.execute(
+                    "INSERT INTO sla_telemetry_seal_idempotency_records"
+                    "(key, sla_id, request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        sla_id,
+                        request_json,
+                        int(HTTPStatus.CREATED),
+                        response_json,
+                        auth.machine_id,
+                        auth.key_version,
+                        auth.request_time_ms,
+                        auth.nonce,
+                        auth.signature,
+                    ),
+                )
+                # 封存记录、状态变更、幂等结果与随机数同一事务原子持久化；
+                # 任何失败路径都不到达此处，不消费随机数、不留记录。
+                self._consume_request_nonce(database, auth)
+                database.execute("COMMIT")
+                return HTTPStatus.CREATED, payload
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+
+    def _get_telemetry_seal(self, sla_id: str, query: str) -> None:
+        # 读取入口不接受任何查询参数：参数校验先于 SLA 查询。
+        if parse_qsl(query, keep_blank_values=True):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        with closing(connect(self.server.database_path)) as database:
+            record = database.execute(
+                "SELECT response_json FROM sla_telemetry_seals WHERE sla_id = ?",
+                (sla_id,),
+            ).fetchone()
+        # SLA 不存在或尚未封存均为 404；封存对象不可变，返回创建时完整字节。
+        if record is None:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        self._json(HTTPStatus.OK, json.loads(record["response_json"]))
 
     def _deposit_funds(self, machine_id: str) -> None:
         idempotency_key = self.headers.get("Idempotency-Key")
@@ -3994,7 +4208,7 @@ class Handler(BaseHTTPRequestHandler):
                 if sla is None:
                     database.execute("ROLLBACK")
                     return HTTPStatus.NOT_FOUND, {"error": "not_found"}
-                if sla["state"] != "active":
+                if sla["state"] not in ("active", "sealed"):
                     database.execute("ROLLBACK")
                     return HTTPStatus.CONFLICT, {"error": "conflict"}
                 evaluation = None
@@ -4234,7 +4448,7 @@ class Handler(BaseHTTPRequestHandler):
                     if sla is None:
                         database.execute("ROLLBACK")
                         return HTTPStatus.NOT_FOUND, {"error": "not_found"}
-                    if sla["state"] != "active":
+                    if sla["state"] not in ("active", "sealed"):
                         database.execute("ROLLBACK")
                         return HTTPStatus.CONFLICT, {"error": "conflict"}
                     evaluation = None

@@ -142,6 +142,26 @@ CREATE TABLE IF NOT EXISTS sla_evaluation_idempotency_records (
     evaluation_seq INTEGER NOT NULL DEFAULT 0,
     created_at_ms INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS sla_telemetry_seals (
+    sla_id TEXT PRIMARY KEY,
+    seal_cut INTEGER NOT NULL,
+    event_count INTEGER NOT NULL,
+    sealed_by TEXT NOT NULL,
+    sealed_at_ms INTEGER NOT NULL,
+    response_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sla_telemetry_seal_idempotency_records (
+    key TEXT PRIMARY KEY,
+    sla_id TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    response_json TEXT NOT NULL,
+    auth_machine_id TEXT,
+    auth_key_version INTEGER,
+    auth_request_time_ms INTEGER,
+    auth_nonce TEXT,
+    auth_signature TEXT
+);
 CREATE TABLE IF NOT EXISTS ledger_accounts (
     account_id TEXT PRIMARY KEY,
     balance_micros INTEGER NOT NULL

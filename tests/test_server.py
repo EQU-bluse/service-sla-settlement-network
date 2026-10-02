@@ -259,6 +259,7 @@ def seed_for_actor(actor_id: str) -> bytes:
 
 _SLA_AUTH_PATH_MACHINE = re.compile(r"^/v1/machines/([0-9a-f]{64})/capabilities$")
 _SLA_AUTH_CONFIRMATION = re.compile(r"^/v1/slas/([^/]+)/confirmations$")
+_SLA_AUTH_TELEMETRY_SEAL = re.compile(r"^/v1/slas/([^/]+)/telemetry-seals$")
 _SLA_AUTH_EVIDENCE = re.compile(r"^/v1/disputes/([^/]+)/evidence$")
 _SLA_AUTH_EVIDENCE_SNAPSHOT = re.compile(
     r"^/v1/disputes/([^/]+)/evidence-snapshots$"
@@ -275,6 +276,7 @@ def _sla_auth_actor(path: str, body: bytes) -> str | None:
         return match.group(1)
     if (
         _SLA_AUTH_CONFIRMATION.fullmatch(path) is not None
+        or _SLA_AUTH_TELEMETRY_SEAL.fullmatch(path) is not None
         or _SLA_AUTH_EVIDENCE.fullmatch(path) is not None
         or _SLA_AUTH_EVIDENCE_SNAPSHOT.fullmatch(path) is not None
         or _SLA_AUTH_ADJUDICATION_PROPOSAL.fullmatch(path) is not None
@@ -3410,6 +3412,884 @@ class EvaluationTests(unittest.TestCase):
             [item["evaluationSeq"] for item in page["evaluations"]], []
         )
         self.assertIsNone(page["nextCursor"])
+
+
+class TelemetrySealTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.machine_id = machine_id(PUBLIC_KEY_A)
+        self.consumer_id = machine_id(PUBLIC_KEY_B)
+        for key, public_key in (("register-1", PUBLIC_KEY_A), ("register-2", PUBLIC_KEY_B)):
+            request = Request(
+                self.url("/v1/machines"),
+                data=json.dumps({"publicKey": public_key}).encode(),
+                method="POST",
+            )
+            request.add_header("Idempotency-Key", key)
+            with urlopen(request, timeout=5) as response:
+                self.assertEqual(response.status, 201)
+        request = Request(
+            self.url(f"/v1/machines/{self.machine_id}/capabilities"),
+            data=json.dumps(
+                {
+                    "expectedVersion": 0,
+                    "name": "pump-01",
+                    "protocol": "mqtt",
+                    "region": "cn",
+                    "unit": "call",
+                    "capacity": 10,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "cap-1")
+        add_sla_auth(request, self.server)
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        request = Request(
+            self.url("/v1/sla-templates"),
+            data=json.dumps(
+                {
+                    "id": "tpl-1",
+                    "machineId": self.machine_id,
+                    "capabilityVersion": 1,
+                    "priceMicros": 1000,
+                    "maxLatencyMs": 50,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "tpl-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        current = int(time.time())
+        self.start = current - 10
+        self.end = current + 3600
+        self.create_sla("sla-1", "sla-create-1")
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temporary.cleanup()
+
+    def url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}{path}"
+
+    def create_sla(self, sla_id: str, key: str) -> None:
+        request = Request(
+            self.url("/v1/slas"),
+            data=json.dumps(
+                {
+                    "id": sla_id,
+                    "templateId": "tpl-1",
+                    "consumerId": self.consumer_id,
+                    "start": self.start,
+                    "end": self.end,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", key)
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+
+    def activate(self, sla_id: str = "sla-1") -> None:
+        for index, (party, actor) in enumerate(
+            (
+                ("producer", self.machine_id),
+                ("consumer", self.consumer_id),
+            )
+        ):
+            request = Request(
+                self.url(f"/v1/slas/{sla_id}/confirmations"),
+                data=json.dumps({"party": party, "actorId": actor}).encode(),
+                method="POST",
+            )
+            request.add_header("Idempotency-Key", f"conf-{sla_id}-{index}")
+            add_sla_auth(request, self.server)
+            with urlopen(request, timeout=5) as response:
+                self.assertEqual(response.status, 200)
+
+    def expire(self, sla_id: str = "sla-1") -> None:
+        # 直接把结束时刻改到过去（start+5 秒），使 SLA 满足封存时间条件；
+        # 窗口内已提交的事件（start+0.1s 起）仍位于新区间内。
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            connection.execute(
+                "UPDATE slas SET end_unix = ? WHERE id = ?",
+                (self.start + 5, sla_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def digest(self, sla_id: str, event_id: str, timestamp: int, latency_ms: int) -> str:
+        message = f"{sla_id}\n{event_id}\n{timestamp}\n{latency_ms}\n{self.machine_id}"
+        return hashlib.sha256(message.encode("utf-8")).hexdigest()
+
+    def add_event(
+        self, index: int, timestamp: int, latency_ms: int, sla_id: str = "sla-1"
+    ) -> tuple[int, bytes]:
+        event_id = f"evt-{index:03d}"
+        digest = self.digest(sla_id, event_id, timestamp, latency_ms)
+        body = json.dumps(
+            {
+                "eventId": event_id,
+                "timestamp": timestamp,
+                "latencyMs": latency_ms,
+                "digest": digest,
+                "keyVersion": 1,
+                "signature": telemetry_signature(
+                    PRODUCER_SEED, sla_id, event_id, timestamp, latency_ms, digest,
+                    self.machine_id,
+                ),
+            }
+        ).encode()
+        request = Request(
+            self.url(f"/v1/slas/{sla_id}/telemetry"), data=body, method="POST"
+        )
+        request.add_header("Idempotency-Key", f"tel-{sla_id}-{index}")
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def seal_body(self, actor: str | None = None) -> bytes:
+        if actor is None:
+            actor = self.machine_id
+        return json.dumps({"actorId": actor}).encode()
+
+    def post_seal(
+        self,
+        body: bytes | None = None,
+        sla_id: str = "sla-1",
+        idempotency_key: str | None = "seal-1",
+        query: str = "",
+        auth: str | None = None,
+        extra_headers: dict[str, str] | None = None,
+    ) -> tuple[int, bytes]:
+        if body is None:
+            body = self.seal_body()
+        suffix = f"?{query}" if query else ""
+        path = f"/v1/slas/{sla_id}/telemetry-seals"
+        request = Request(self.url(f"{path}{suffix}"), data=body, method="POST")
+        if idempotency_key is not None:
+            request.add_header("Idempotency-Key", idempotency_key)
+        if auth is None:
+            add_sla_auth(request, self.server)
+        else:
+            request.add_header("SLA-Auth", auth)
+        for name, value in (extra_headers or {}).items():
+            request.add_header(name, value)
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def get_seal(
+        self, sla_id: str = "sla-1", query: str = ""
+    ) -> tuple[int, bytes]:
+        suffix = f"?{query}" if query else ""
+        try:
+            with urlopen(
+                self.url(f"/v1/slas/{sla_id}/telemetry-seal{suffix}"), timeout=5
+            ) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def get_sla_state(self, sla_id: str = "sla-1") -> str:
+        with urlopen(self.url(f"/v1/slas/{sla_id}"), timeout=5) as response:
+            return json.loads(response.read())["state"]
+
+    def restart(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def test_seal_success_response_and_state(self) -> None:
+        self.activate()
+        base = self.start * 1000
+        self.assertEqual(self.add_event(1, base + 100, 10)[0], 201)
+        self.assertEqual(self.add_event(2, base + 200, 60)[0], 201)
+        self.expire()
+        before = int(time.time() * 1000)
+        status, body = self.post_seal()
+        after = int(time.time() * 1000)
+        self.assertEqual(status, 201)
+        payload = json.loads(body)
+        self.assertEqual(
+            list(payload), ["slaId", "sealCut", "eventCount", "sealedBy", "sealedAt"]
+        )
+        self.assertEqual(payload["slaId"], "sla-1")
+        self.assertEqual(payload["sealCut"], 2)
+        self.assertEqual(payload["eventCount"], 2)
+        self.assertEqual(payload["sealedBy"], self.machine_id)
+        self.assertIsInstance(payload["sealedAt"], int)
+        self.assertNotIsInstance(payload["sealedAt"], bool)
+        self.assertTrue(before <= payload["sealedAt"] <= after)
+        self.assertFalse(body.endswith(b"\n"))
+        self.assertEqual(self.get_sla_state(), "sealed")
+        # GET 返回同一不可变对象。
+        status, got = self.get_seal()
+        self.assertEqual(status, 200)
+        self.assertEqual(got, body)
+
+    def test_seal_empty_telemetry_cut_zero(self) -> None:
+        self.activate()
+        self.expire()
+        status, body = self.post_seal()
+        self.assertEqual(status, 201)
+        payload = json.loads(body)
+        self.assertEqual(payload["sealCut"], 0)
+        self.assertEqual(payload["eventCount"], 0)
+
+    def test_seal_cut_is_global_and_count_is_per_sla(self) -> None:
+        self.activate()
+        self.create_sla("sla-2", "sla-create-2")
+        self.activate("sla-2")
+        base = self.start * 1000
+        self.assertEqual(self.add_event(1, base + 100, 10)[0], 201)
+        self.assertEqual(self.add_event(2, base + 100, 20, sla_id="sla-2")[0], 201)
+        self.assertEqual(self.add_event(3, base + 200, 30)[0], 201)
+        self.expire()
+        status, body = self.post_seal()
+        self.assertEqual(status, 201)
+        payload = json.loads(body)
+        # sealCut 为全库提交序号上界（含其他 SLA），eventCount 仅计本 SLA。
+        self.assertEqual(payload["sealCut"], 3)
+        self.assertEqual(payload["eventCount"], 2)
+
+    def test_seal_requires_active(self) -> None:
+        self.expire()
+        status, body = self.post_seal()
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_seal_not_due_before_end(self) -> None:
+        self.activate()
+        status, body = self.post_seal()
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "not_due"})
+
+    def test_seal_unknown_sla_is_not_found(self) -> None:
+        status, body = self.post_seal(sla_id="missing")
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+
+    def test_seal_actor_must_be_producer(self) -> None:
+        self.activate()
+        self.expire()
+        # 消费者不是生产机器：403。
+        status, body = self.post_seal(
+            self.seal_body(self.consumer_id), idempotency_key="seal-c"
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body), {"error": "forbidden"})
+        # 未知机器同样 403。
+        status, body = self.post_seal(
+            self.seal_body(machine_id(PUBLIC_KEY_C)), idempotency_key="seal-x"
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body), {"error": "forbidden"})
+
+    def test_seal_auth_machine_must_match_actor(self) -> None:
+        self.activate()
+        self.expire()
+        body = self.seal_body()
+        # 正文为生产机器，但认证头由消费者签署：身份不符 403。
+        auth = make_sla_auth(
+            self.server,
+            "seal-mismatch",
+            PUBLIC_KEY_SEED_B,
+            self.consumer_id,
+            "POST",
+            "/v1/slas/sla-1/telemetry-seals",
+            body,
+        )
+        status, response = self.post_seal(
+            body, idempotency_key="seal-mismatch", auth=auth
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(response), {"error": "forbidden"})
+
+    def test_seal_authentication_failures(self) -> None:
+        self.activate()
+        self.expire()
+        body = self.seal_body()
+        path = "/v1/slas/sla-1/telemetry-seals"
+        # 签名与身份密钥不符：401/invalid_authentication。
+        bad_auth = make_sla_auth(
+            self.server,
+            "seal-bad-1",
+            PUBLIC_KEY_SEED_C,
+            self.machine_id,
+            "POST",
+            path,
+            body,
+        )
+        status, response = self.post_seal(
+            body, idempotency_key="seal-bad-1", auth=bad_auth
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(response), {"error": "invalid_authentication"})
+        # 请求时间过旧：401/stale_request。
+        stale_auth = make_sla_auth(
+            self.server,
+            "seal-bad-2",
+            PRODUCER_SEED,
+            self.machine_id,
+            "POST",
+            path,
+            body,
+            request_time_ms=int(time.time() * 1000) - 400_000,
+        )
+        status, response = self.post_seal(
+            body, idempotency_key="seal-bad-2", auth=stale_auth
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(response), {"error": "stale_request"})
+        # 失败不消费随机数：修正后同键可成功。
+        status, _ = self.post_seal(body, idempotency_key="seal-bad-1")
+        self.assertEqual(status, 201)
+
+    def test_seal_nonce_replay_detected(self) -> None:
+        self.activate()
+        self.expire()
+        body = self.seal_body()
+        path = "/v1/slas/sla-1/telemetry-seals"
+        nonce = "nonce-seal-reuse-01"
+        first = make_sla_auth(
+            self.server, "seal-n1", PRODUCER_SEED, self.machine_id,
+            "POST", path, body, nonce=nonce,
+        )
+        status, _ = self.post_seal(body, idempotency_key="seal-n1", auth=first)
+        self.assertEqual(status, 201)
+        # 异键复用同一有效随机数：replay_detected。
+        second = make_sla_auth(
+            self.server, "seal-n2", PRODUCER_SEED, self.machine_id,
+            "POST", path, body, nonce=nonce,
+        )
+        status, response = self.post_seal(body, idempotency_key="seal-n2", auth=second)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(response), {"error": "replay_detected"})
+
+    def test_seal_request_validation(self) -> None:
+        self.activate()
+        self.expire()
+        # 缺 Idempotency-Key。
+        status, body = self.post_seal(idempotency_key=None)
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        # 非法 Idempotency-Key。
+        status, body = self.post_seal(idempotency_key="bad key!")
+        self.assertEqual(status, 400)
+        # 查询参数。
+        status, body = self.post_seal(idempotency_key="seal-q", query="x=1")
+        self.assertEqual(status, 400)
+        # 正文非法：多字段、缺字段、actorId 格式错误、非 JSON、重复键。
+        for index, bad in enumerate(
+            (
+                b"{}",
+                json.dumps({"actorId": self.machine_id, "extra": 1}).encode(),
+                json.dumps({"actorId": "zz"}).encode(),
+                b"not-json",
+                b'{"actorId":"' + self.machine_id.encode() + b'","actorId":"'
+                + self.machine_id.encode() + b'"}',
+            )
+        ):
+            status, body = self.post_seal(bad, idempotency_key=f"seal-badbody-{index}")
+            self.assertEqual(status, 400, bad)
+            self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        # 缺 SLA-Auth 头。
+        request = Request(
+            self.url("/v1/slas/sla-1/telemetry-seals"),
+            data=self.seal_body(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "seal-noauth")
+        try:
+            with urlopen(request, timeout=5) as response:
+                status = response.status
+        except HTTPError as error:
+            status = error.code
+        self.assertEqual(status, 400)
+        # 携带 SLA-Delegation 头。
+        status, body = self.post_seal(
+            idempotency_key="seal-deleg",
+            extra_headers={"SLA-Delegation": "d;0;1;n;" + "0" * 128},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+
+    def test_seal_idempotent_replay_same_key(self) -> None:
+        self.activate()
+        self.expire()
+        status, first = self.post_seal()
+        self.assertEqual(status, 201)
+        # 同键同请求（含并发与重启后）重放首次状态码与响应字节。
+        for _ in range(2):
+            status, body = self.post_seal()
+            self.assertEqual(status, 201)
+            self.assertEqual(body, first)
+        self.restart()
+        status, body = self.post_seal()
+        self.assertEqual(status, 201)
+        self.assertEqual(body, first)
+        # 重启后 GET 仍返回同一不可变对象。
+        status, got = self.get_seal()
+        self.assertEqual(status, 200)
+        self.assertEqual(got, first)
+
+    def test_seal_same_key_different_request_conflicts(self) -> None:
+        self.activate()
+        self.expire()
+        status, _ = self.post_seal()
+        self.assertEqual(status, 201)
+        # 同键异体。
+        status, body = self.post_seal(self.seal_body(self.consumer_id))
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+        # 同键异路径。
+        self.create_sla("sla-2", "sla-create-2")
+        status, body = self.post_seal(sla_id="sla-2")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+        # 同键更换认证五段（换随机数）。
+        other_auth = make_sla_auth(
+            self.server,
+            None,
+            PRODUCER_SEED,
+            self.machine_id,
+            "POST",
+            "/v1/slas/sla-1/telemetry-seals",
+            self.seal_body(),
+            nonce="nonce-seal-other-01",
+        )
+        status, body = self.post_seal(auth=other_auth)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_seal_exists_for_different_key(self) -> None:
+        self.activate()
+        self.expire()
+        status, _ = self.post_seal(idempotency_key="seal-a")
+        self.assertEqual(status, 201)
+        status, body = self.post_seal(idempotency_key="seal-b")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "seal_exists"})
+
+    def test_telemetry_rejected_after_seal(self) -> None:
+        self.activate()
+        base = self.start * 1000
+        self.assertEqual(self.add_event(1, base + 100, 10)[0], 201)
+        self.expire()
+        status, _ = self.post_seal()
+        self.assertEqual(status, 201)
+        status, body = self.add_event(2, base + 200, 20)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_evaluation_after_seal_uses_fixed_cut(self) -> None:
+        self.activate()
+        self.create_sla("sla-2", "sla-create-2")
+        self.activate("sla-2")
+        base = self.start * 1000
+        self.assertEqual(self.add_event(1, base + 100, 10)[0], 201)
+        self.assertEqual(self.add_event(2, base + 200, 20)[0], 201)
+        self.expire()
+        status, body = self.post_seal()
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(body)["sealCut"], 2)
+        # 其他 SLA 继续提交推进全库序号，不影响已封存的 cut。
+        self.assertEqual(self.add_event(3, base + 300, 30, sla_id="sla-2")[0], 201)
+        request = Request(
+            self.url("/v1/slas/sla-1/evaluations"),
+            data=json.dumps({"from": base, "to": (self.start + 5) * 1000}).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "eval-after-seal")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+            payload = json.loads(response.read())
+        self.assertEqual(payload["cut"], 2)
+        self.assertEqual(payload["count"], 2)
+        self.assertEqual(payload["outcome"], "fulfilled")
+        # 区间越界（超过新 end*1000）仍为 conflict。
+        request = Request(
+            self.url("/v1/slas/sla-1/evaluations"),
+            data=json.dumps({"from": base, "to": self.end * 1000}).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "eval-out-of-range")
+        try:
+            with urlopen(request, timeout=5):
+                self.fail("expected 409")
+        except HTTPError as error:
+            self.assertEqual(error.code, 409)
+            self.assertEqual(json.loads(error.read()), {"error": "conflict"})
+
+    def test_settlement_after_seal(self) -> None:
+        self.activate()
+        base = self.start * 1000
+        self.assertEqual(self.add_event(1, base + 100, 10)[0], 201)
+        self.assertEqual(self.add_event(2, base + 200, 20)[0], 201)
+        # 入金给消费者，评估后封存，再单笔结算。
+        request = Request(
+            self.url(f"/v1/funds/{self.consumer_id}"),
+            data=json.dumps({"amountMicros": 5000, "reference": "ref-1"}).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "fund-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        request = Request(
+            self.url("/v1/slas/sla-1/evaluations"),
+            data=json.dumps({"from": base, "to": self.end * 1000}).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "eval-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+            evaluation_seq = json.loads(response.read())["evaluationSeq"]
+        self.expire()
+        status, _ = self.post_seal()
+        self.assertEqual(status, 201)
+        request = Request(
+            self.url("/v1/settlements"),
+            data=json.dumps(
+                {"slaId": "sla-1", "evaluationSeq": evaluation_seq}
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "settle-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+            payload = json.loads(response.read())
+        self.assertEqual(payload["result"], "charged")
+        self.assertEqual(payload["amount"], 2000)
+
+    def test_settlement_batch_after_seal(self) -> None:
+        self.activate()
+        base = self.start * 1000
+        self.assertEqual(self.add_event(1, base + 100, 10)[0], 201)
+        request = Request(
+            self.url(f"/v1/funds/{self.consumer_id}"),
+            data=json.dumps({"amountMicros": 5000, "reference": "ref-1"}).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "fund-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        request = Request(
+            self.url("/v1/slas/sla-1/evaluations"),
+            data=json.dumps({"from": base, "to": self.end * 1000}).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "eval-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+            evaluation_seq = json.loads(response.read())["evaluationSeq"]
+        self.expire()
+        status, _ = self.post_seal()
+        self.assertEqual(status, 201)
+        request = Request(
+            self.url("/v1/settlement-batches"),
+            data=json.dumps(
+                {
+                    "id": "batch-1",
+                    "items": [{"slaId": "sla-1", "evaluationSeq": evaluation_seq}],
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "batch-key-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+            payload = json.loads(response.read())
+        self.assertEqual(payload["settlements"][0]["result"], "charged")
+        self.assertEqual(payload["settlements"][0]["amount"], 1000)
+
+    def test_get_seal_not_found_and_query_rejected(self) -> None:
+        self.activate()
+        # 未封存。
+        status, body = self.get_seal()
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+        # SLA 不存在。
+        status, body = self.get_seal(sla_id="missing")
+        self.assertEqual(status, 404)
+        # 查询参数非法（先于查询）。
+        status, body = self.get_seal(query="x=1")
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        status, body = self.get_seal(sla_id="missing", query="x=1")
+        self.assertEqual(status, 400)
+
+    def test_concurrent_same_key_seal_replays(self) -> None:
+        self.activate()
+        self.expire()
+        body = self.seal_body()
+        path = "/v1/slas/sla-1/telemetry-seals"
+        # 同键同请求并发：认证五段逐字节相同，全部重放首次响应。
+        auth = make_sla_auth(
+            self.server, "seal-conc", PRODUCER_SEED, self.machine_id,
+            "POST", path, body,
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            outcomes = list(
+                executor.map(
+                    lambda _: self.post_seal(
+                        body, idempotency_key="seal-conc", auth=auth
+                    ),
+                    range(4),
+                )
+            )
+        statuses = {status for status, _ in outcomes}
+        self.assertEqual(statuses, {201})
+        bodies = {response for _, response in outcomes}
+        self.assertEqual(len(bodies), 1)
+
+    def test_concurrent_distinct_keys_only_one_seals(self) -> None:
+        self.activate()
+        self.expire()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(
+                executor.map(
+                    lambda key: self.post_seal(idempotency_key=key),
+                    ("seal-x", "seal-y"),
+                )
+            )
+        statuses = sorted(status for status, _ in outcomes)
+        self.assertEqual(statuses, [201, 409])
+        loser = [json.loads(body) for status, body in outcomes if status == 409]
+        self.assertEqual(loser, [{"error": "seal_exists"}])
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM sla_telemetry_seals"
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            connection.close()
+
+    def test_concurrent_telemetry_and_seal_are_linearized(self) -> None:
+        self.activate()
+        self.expire()
+        base = self.start * 1000
+
+        def submit_event() -> tuple[int, bytes]:
+            return self.add_event(1, base + 100, 10)
+
+        def submit_seal() -> tuple[int, bytes]:
+            return self.post_seal()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            event_future = executor.submit(submit_event)
+            seal_future = executor.submit(submit_seal)
+            event_status, _ = event_future.result()
+            seal_status, seal_body = seal_future.result()
+        self.assertEqual(seal_status, 201)
+        payload = json.loads(seal_body)
+        if event_status == 201:
+            # 事件先提交：计入 sealCut 与 eventCount。
+            self.assertEqual(payload["eventCount"], 1)
+            self.assertEqual(payload["sealCut"], 1)
+        else:
+            # 封存先提交：事件被拒绝，不得出现已接受但未计数。
+            self.assertEqual(event_status, 409)
+            self.assertEqual(payload["eventCount"], 0)
+            self.assertEqual(payload["sealCut"], 0)
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            stored = connection.execute(
+                "SELECT COUNT(*) FROM sla_telemetry_events WHERE sla_id = 'sla-1'"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(stored, payload["eventCount"])
+
+
+class TelemetrySealMigrationTests(unittest.TestCase):
+    # 旧库（无封存表）升级：不自动封存、不改写既有数据，未封存流程保持原行为。
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.database_path = str(Path(self.temporary.name) / "service.db")
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = self.database_path
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.machine_id = machine_id(PUBLIC_KEY_A)
+        self.consumer_id = machine_id(PUBLIC_KEY_B)
+        for key, public_key in (("register-1", PUBLIC_KEY_A), ("register-2", PUBLIC_KEY_B)):
+            request = Request(
+                self.url("/v1/machines"),
+                data=json.dumps({"publicKey": public_key}).encode(),
+                method="POST",
+            )
+            request.add_header("Idempotency-Key", key)
+            with urlopen(request, timeout=5) as response:
+                self.assertEqual(response.status, 201)
+        request = Request(
+            self.url(f"/v1/machines/{self.machine_id}/capabilities"),
+            data=json.dumps(
+                {
+                    "expectedVersion": 0,
+                    "name": "pump-01",
+                    "protocol": "mqtt",
+                    "region": "cn",
+                    "unit": "call",
+                    "capacity": 10,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "cap-1")
+        add_sla_auth(request, self.server)
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        request = Request(
+            self.url("/v1/sla-templates"),
+            data=json.dumps(
+                {
+                    "id": "tpl-1",
+                    "machineId": self.machine_id,
+                    "capabilityVersion": 1,
+                    "priceMicros": 1000,
+                    "maxLatencyMs": 50,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "tpl-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        current = int(time.time())
+        self.start = current - 10
+        self.end = current + 3600
+        request = Request(
+            self.url("/v1/slas"),
+            data=json.dumps(
+                {
+                    "id": "sla-1",
+                    "templateId": "tpl-1",
+                    "consumerId": self.consumer_id,
+                    "start": self.start,
+                    "end": self.end,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "sla-create-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        for index, (party, actor) in enumerate(
+            (("producer", self.machine_id), ("consumer", self.consumer_id))
+        ):
+            request = Request(
+                self.url("/v1/slas/sla-1/confirmations"),
+                data=json.dumps({"party": party, "actorId": actor}).encode(),
+                method="POST",
+            )
+            request.add_header("Idempotency-Key", f"conf-{index}")
+            add_sla_auth(request, self.server)
+            with urlopen(request, timeout=5) as response:
+                self.assertEqual(response.status, 200)
+        # 模拟旧库：去掉封存相关表后重启，其余数据与标记保持原样。
+        self.restart()
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute("DROP TABLE sla_telemetry_seals")
+            connection.execute("DROP TABLE sla_telemetry_seal_idempotency_records")
+            connection.commit()
+        finally:
+            connection.close()
+        self.restart()
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temporary.cleanup()
+
+    def url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}{path}"
+
+    def restart(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = self.database_path
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def test_upgrade_does_not_auto_seal_or_rewrite(self) -> None:
+        # 既有 SLA 状态不变，不自动封存。
+        with urlopen(self.url("/v1/slas/sla-1"), timeout=5) as response:
+            self.assertEqual(json.loads(response.read())["state"], "active")
+        try:
+            with urlopen(self.url("/v1/slas/sla-1/telemetry-seal"), timeout=5):
+                self.fail("expected 404")
+        except HTTPError as error:
+            self.assertEqual(error.code, 404)
+        # 未封存流程保持原行为：遥测仍可提交。
+        base = self.start * 1000
+        digest = hashlib.sha256(
+            f"sla-1\nevt-1\n{base + 100}\n10\n{self.machine_id}".encode()
+        ).hexdigest()
+        body = json.dumps(
+            {
+                "eventId": "evt-1",
+                "timestamp": base + 100,
+                "latencyMs": 10,
+                "digest": digest,
+                "keyVersion": 1,
+                "signature": telemetry_signature(
+                    PRODUCER_SEED, "sla-1", "evt-1", base + 100, 10, digest,
+                    self.machine_id,
+                ),
+            }
+        ).encode()
+        request = Request(
+            self.url("/v1/slas/sla-1/telemetry"), data=body, method="POST"
+        )
+        request.add_header("Idempotency-Key", "tel-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        # 封存表已重建：过期后可正常封存。
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute(
+                "UPDATE slas SET end_unix = ? WHERE id = 'sla-1'", (self.start + 5,)
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        seal_body = json.dumps({"actorId": self.machine_id}).encode()
+        request = Request(
+            self.url("/v1/slas/sla-1/telemetry-seals"), data=seal_body, method="POST"
+        )
+        request.add_header("Idempotency-Key", "seal-1")
+        add_sla_auth(request, self.server)
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+            payload = json.loads(response.read())
+        self.assertEqual(payload["sealCut"], 1)
+        self.assertEqual(payload["eventCount"], 1)
 
 
 class EvaluationMigrationTests(unittest.TestCase):
