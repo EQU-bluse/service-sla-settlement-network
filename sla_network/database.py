@@ -227,6 +227,29 @@ CREATE TABLE IF NOT EXISTS settlement_batch_idempotency_records (
     status INTEGER NOT NULL,
     response_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS telemetry_batches (
+    id TEXT PRIMARY KEY,
+    sla_id TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    response_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS telemetry_batch_items (
+    batch_id TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    commit_seq INTEGER NOT NULL,
+    event_id TEXT NOT NULL,
+    PRIMARY KEY (batch_id, position)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_telemetry_batch_items_seq
+ON telemetry_batch_items(commit_seq);
+CREATE TABLE IF NOT EXISTS telemetry_batch_idempotency_records (
+    key TEXT PRIMARY KEY,
+    sla_id TEXT NOT NULL,
+    batch_id TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    response_json TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS disputes (
     id TEXT PRIMARY KEY,
     settlement_seq INTEGER NOT NULL UNIQUE,
