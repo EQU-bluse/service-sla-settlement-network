@@ -2768,6 +2768,709 @@ class TelemetryTests(unittest.TestCase):
         self.assertEqual(evaluation["count"], 2)
 
 
+class TelemetryBatchTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.machine_id = machine_id(PUBLIC_KEY_A)
+        self.consumer_id = machine_id(PUBLIC_KEY_B)
+        for key, public_key in (("register-1", PUBLIC_KEY_A), ("register-2", PUBLIC_KEY_B)):
+            request = Request(
+                self.url("/v1/machines"),
+                data=json.dumps({"publicKey": public_key}).encode(),
+                method="POST",
+            )
+            request.add_header("Idempotency-Key", key)
+            with urlopen(request, timeout=5) as response:
+                self.assertEqual(response.status, 201)
+        request = Request(
+            self.url(f"/v1/machines/{self.machine_id}/capabilities"),
+            data=json.dumps(
+                {
+                    "expectedVersion": 0,
+                    "name": "pump-01",
+                    "protocol": "mqtt",
+                    "region": "cn",
+                    "unit": "call",
+                    "capacity": 10,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "cap-1")
+        add_sla_auth(request, self.server)
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        request = Request(
+            self.url("/v1/sla-templates"),
+            data=json.dumps(
+                {
+                    "id": "tpl-1",
+                    "machineId": self.machine_id,
+                    "capabilityVersion": 1,
+                    "priceMicros": 1000,
+                    "maxLatencyMs": 50,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "tpl-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        current = int(time.time())
+        self.start = current - 10
+        self.end = current + 3600
+        request = Request(
+            self.url("/v1/slas"),
+            data=json.dumps(
+                {
+                    "id": "sla-1",
+                    "templateId": "tpl-1",
+                    "consumerId": self.consumer_id,
+                    "start": self.start,
+                    "end": self.end,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "sla-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temporary.cleanup()
+
+    def url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}{path}"
+
+    def restart(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def activate(self, sla_id: str = "sla-1") -> None:
+        for index, (party, actor) in enumerate(
+            (
+                ("producer", self.machine_id),
+                ("consumer", self.consumer_id),
+            )
+        ):
+            request = Request(
+                self.url(f"/v1/slas/{sla_id}/confirmations"),
+                data=json.dumps({"party": party, "actorId": actor}).encode(),
+                method="POST",
+            )
+            request.add_header("Idempotency-Key", f"conf-{sla_id}-{index}")
+            add_sla_auth(request, self.server)
+            with urlopen(request, timeout=5) as response:
+                self.assertEqual(response.status, 200)
+
+    def digest(self, sla_id: str, event_id: str, timestamp: int, latency_ms: int) -> str:
+        message = f"{sla_id}\n{event_id}\n{timestamp}\n{latency_ms}\n{self.machine_id}"
+        return hashlib.sha256(message.encode("utf-8")).hexdigest()
+
+    def event(
+        self,
+        event_id: str,
+        offset_ms: int = 500,
+        latency_ms: int = 12,
+        key_version: int = 1,
+        sla_id: str = "sla-1",
+        digest: str | None = None,
+        signature: str | None = None,
+    ) -> dict[str, object]:
+        timestamp = self.start * 1000 + offset_ms
+        if digest is None:
+            digest = self.digest(sla_id, event_id, timestamp, latency_ms)
+        if signature is None:
+            signature = telemetry_signature(
+                PRODUCER_SEED, sla_id, event_id, timestamp, latency_ms, digest,
+                self.machine_id, key_version,
+            )
+        return {
+            "eventId": event_id,
+            "timestamp": timestamp,
+            "latencyMs": latency_ms,
+            "digest": digest,
+            "keyVersion": key_version,
+            "signature": signature,
+        }
+
+    def batch_body(
+        self,
+        batch_id: str = "batch-1",
+        events: list[dict[str, object]] | None = None,
+    ) -> bytes:
+        if events is None:
+            events = [self.event("evt-1")]
+        return json.dumps({"id": batch_id, "events": events}).encode()
+
+    def post_batch(
+        self,
+        body: bytes,
+        sla_id: str = "sla-1",
+        key: str | None = "batch-1",
+        suffix: str = "",
+    ) -> tuple[int, bytes]:
+        request = Request(
+            self.url(f"/v1/slas/{sla_id}/telemetry-batches{suffix}"),
+            data=body,
+            method="POST",
+        )
+        if key is not None:
+            request.add_header("Idempotency-Key", key)
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def post_batch_duplicate_key(self, body: bytes, key: str = "batch-1") -> tuple[int, bytes]:
+        # http.client 不支持同名头重复，改用原始套接字发送两份幂等头。
+        raw = (
+            b"POST /v1/slas/sla-1/telemetry-batches HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Type: application/json\r\n"
+            + f"Idempotency-Key: {key}\r\n".encode()
+            + f"Idempotency-Key: {key}\r\n".encode()
+            + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+            + body
+        )
+        with socket.create_connection(("127.0.0.1", self.server.server_port), timeout=5) as sock:
+            sock.sendall(raw)
+            chunks = []
+            while True:
+                part = sock.recv(65536)
+                if not part:
+                    break
+                chunks.append(part)
+        response = b"".join(chunks)
+        head, _, payload = response.partition(b"\r\n\r\n")
+        status_line = head.split(b"\r\n", 1)[0]
+        return int(status_line.split()[1]), payload
+
+    def get_batch(self, path: str) -> tuple[int, bytes]:
+        request = Request(self.url(path), method="GET")
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def get_telemetry(self, query: str, sla_id: str = "sla-1") -> tuple[int, object]:
+        try:
+            with urlopen(
+                self.url(f"/v1/slas/{sla_id}/telemetry?{query}"), timeout=5
+            ) as response:
+                return response.status, json.loads(response.read())
+        except HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    def post_single(self, event: dict[str, object], key: str) -> tuple[int, bytes]:
+        request = Request(
+            self.url("/v1/slas/sla-1/telemetry"),
+            data=json.dumps(event).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", key)
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def event_rows(self) -> list[tuple[str, int]]:
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            return [
+                (row[0], row[1])
+                for row in connection.execute(
+                    "SELECT event_id, commit_seq FROM sla_telemetry_events"
+                    " ORDER BY commit_seq"
+                )
+            ]
+        finally:
+            connection.close()
+
+    def table_count(self, table: str) -> int:
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            return connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        finally:
+            connection.close()
+
+    def test_batch_created(self) -> None:
+        self.activate()
+        events = [
+            self.event("evt-1", 100),
+            self.event("evt-2", 200, 60),
+            self.event("evt-3", 300),
+        ]
+        status, body = self.post_batch(self.batch_body(events=events))
+        self.assertEqual(status, 201)
+        self.assertFalse(body.endswith(b"\n"))
+        payload = json.loads(body)
+        self.assertEqual(list(payload), ["id", "slaId", "createdAt", "events"])
+        self.assertEqual(payload["id"], "batch-1")
+        self.assertEqual(payload["slaId"], "sla-1")
+        self.assertIsInstance(payload["createdAt"], int)
+        self.assertEqual(
+            [list(item) for item in payload["events"]],
+            [["eventId", "commitSeq"]] * 3,
+        )
+        self.assertEqual(
+            payload["events"],
+            [
+                {"eventId": "evt-1", "commitSeq": 1},
+                {"eventId": "evt-2", "commitSeq": 2},
+                {"eventId": "evt-3", "commitSeq": 3},
+            ],
+        )
+        # 读取入口返回首次创建的完整对象，逐字节一致。
+        status, fetched = self.get_batch("/v1/telemetry-batches/batch-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(fetched, body)
+
+    def test_batch_events_enter_pagination_and_evaluation(self) -> None:
+        self.activate()
+        events = [
+            self.event("evt-1", 100),
+            self.event("evt-2", 200, 60),  # 违约（> 50）
+            self.event("evt-3", 300),
+        ]
+        self.assertEqual(self.post_batch(self.batch_body(events=events))[0], 201)
+        status, page = self.get_telemetry(
+            f"from={self.start * 1000}&to={self.end * 1000}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [event["eventId"] for event in page["events"]],
+            ["evt-1", "evt-2", "evt-3"],
+        )
+        self.assertEqual(
+            page["summary"],
+            {"count": 3, "latencySum": 84, "maxLatency": 60, "violations": 1},
+        )
+        request = Request(
+            self.url("/v1/slas/sla-1/evaluations"),
+            data=json.dumps(
+                {"from": self.start * 1000, "to": self.end * 1000}
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "eval-1")
+        with urlopen(request, timeout=5) as response:
+            evaluation = json.load(response)
+        self.assertEqual(response.status, 201)
+        self.assertEqual(evaluation["count"], 3)
+        self.assertEqual(evaluation["violations"], 1)
+        self.assertEqual(evaluation["outcome"], "breached")
+
+    def test_commit_seq_shared_and_consecutive_with_single_writes(self) -> None:
+        self.activate()
+        status, _ = self.post_single(self.event("evt-a", 50), "tel-1")
+        self.assertEqual(status, 201)
+        status, body = self.post_batch(
+            self.batch_body(events=[self.event("evt-b", 100), self.event("evt-c", 150)])
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(
+            json.loads(body)["events"],
+            [{"eventId": "evt-b", "commitSeq": 2}, {"eventId": "evt-c", "commitSeq": 3}],
+        )
+        status, _ = self.post_single(self.event("evt-d", 200), "tel-2")
+        self.assertEqual(status, 201)
+        self.assertEqual(
+            self.event_rows(),
+            [("evt-a", 1), ("evt-b", 2), ("evt-c", 3), ("evt-d", 4)],
+        )
+
+    def test_query_parameters_rejected(self) -> None:
+        self.activate()
+        for suffix in ("?x=1", "?from=1&to=2", "?x="):
+            status, body = self.post_batch(self.batch_body(), suffix=suffix)
+            self.assertEqual(status, 400, suffix)
+            self.assertEqual(json.loads(body), {"error": "invalid_request"})
+
+    def test_missing_duplicate_and_invalid_idempotency_key(self) -> None:
+        self.activate()
+        status, body = self.post_batch(self.batch_body(), key=None)
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        status, body = self.post_batch(self.batch_body(), key="bad key!")
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        status, body = self.post_batch_duplicate_key(self.batch_body())
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+
+    def test_invalid_bodies(self) -> None:
+        self.activate()
+        valid = self.event("evt-1")
+        bodies = [
+            b"{}",
+            b'{"id":"batch-1"}',
+            b'{"events":[]}',
+            b'{"id":"BAD","events":[]}',
+            b'{"id":1,"events":[]}',
+            b'{"id":"batch-1","events":{}}',
+            b'{"id":"batch-1","events":[]}',
+            b'{"id":"batch-1","events":[],"extra":1}',
+            b'{"id":"batch-1","events":[{}]}',
+            b'{"id":"batch-1","events":["x"]}',
+            # 缺 keyVersion 的旧五字段与无签名四字段项均非法。
+            json.dumps(
+                {
+                    "id": "batch-1",
+                    "events": [
+                        {k: v for k, v in valid.items() if k != "keyVersion"}
+                    ],
+                }
+            ).encode(),
+            json.dumps(
+                {
+                    "id": "batch-1",
+                    "events": [
+                        {
+                            k: v
+                            for k, v in valid.items()
+                            if k not in ("keyVersion", "signature")
+                        }
+                    ],
+                }
+            ).encode(),
+            json.dumps(
+                {"id": "batch-1", "events": [dict(valid, extra=1)]}
+            ).encode(),
+            json.dumps(
+                {"id": "batch-1", "events": [dict(valid, eventId="BAD")]}
+            ).encode(),
+            json.dumps(
+                {"id": "batch-1", "events": [dict(valid, timestamp=-1)]}
+            ).encode(),
+            json.dumps(
+                {"id": "batch-1", "events": [dict(valid, timestamp=True)]}
+            ).encode(),
+            json.dumps(
+                {
+                    "id": "batch-1",
+                    "events": [dict(valid, timestamp=2147483648000)],
+                }
+            ).encode(),
+            json.dumps(
+                {"id": "batch-1", "events": [dict(valid, latencyMs=-1)]}
+            ).encode(),
+            json.dumps(
+                {"id": "batch-1", "events": [dict(valid, digest="0" * 63)]}
+            ).encode(),
+            json.dumps(
+                {"id": "batch-1", "events": [dict(valid, signature="ab" * 63 + "a")]}
+            ).encode(),
+            json.dumps(
+                {"id": "batch-1", "events": [dict(valid, keyVersion=0)]}
+            ).encode(),
+            json.dumps(
+                {"id": "batch-1", "events": [dict(valid, keyVersion=True)]}
+            ).encode(),
+            # 批内 eventId 重复。
+            json.dumps(
+                {"id": "batch-1", "events": [valid, self.event("evt-1", 600)]}
+            ).encode(),
+            b'{"id":"batch-1","id":"batch-2","events":[]}',
+            b"not-json",
+        ]
+        for index, body in enumerate(bodies):
+            with self.subTest(index=index):
+                status, payload = self.post_batch(body, key=f"bad-{index}")
+                self.assertEqual(status, 400)
+                self.assertEqual(json.loads(payload), {"error": "invalid_request"})
+        self.assertEqual(self.table_count("sla_telemetry_events"), 0)
+
+    def test_one_hundred_events_succeed_and_one_hundred_one_rejected(self) -> None:
+        self.activate()
+        events = [self.event(f"evt-{index:03d}", index) for index in range(1, 102)]
+        status, body = self.post_batch(self.batch_body(events=events[:100]))
+        self.assertEqual(status, 201)
+        self.assertEqual(len(json.loads(body)["events"]), 100)
+        status, body = self.post_batch(
+            self.batch_body("batch-2", events), key="batch-2"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+
+    def test_replay_returns_first_bytes_without_double_write(self) -> None:
+        self.activate()
+        body = self.batch_body(events=[self.event("evt-1", 100), self.event("evt-2", 200)])
+        status, first = self.post_batch(body)
+        self.assertEqual(status, 201)
+        for _ in range(2):
+            status, replay = self.post_batch(body)
+            self.assertEqual(status, 201)
+            self.assertEqual(replay, first)
+        self.assertEqual(self.table_count("sla_telemetry_events"), 2)
+        self.assertEqual(self.table_count("sla_telemetry_batches"), 1)
+        # 重启后重放首次状态码与响应字节。
+        self.restart()
+        status, replay = self.post_batch(body)
+        self.assertEqual(status, 201)
+        self.assertEqual(replay, first)
+        status, fetched = self.get_batch("/v1/telemetry-batches/batch-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(fetched, first)
+
+    def test_concurrent_same_key_same_request_replays(self) -> None:
+        self.activate()
+        body = self.batch_body(events=[self.event("evt-1", 100)])
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(
+                executor.map(lambda _: self.post_batch(body), range(8))
+            )
+        statuses = [status for status, _ in results]
+        self.assertEqual(statuses, [201] * 8)
+        self.assertEqual(len({payload for _, payload in results}), 1)
+        self.assertEqual(self.table_count("sla_telemetry_events"), 1)
+        self.assertEqual(self.table_count("sla_telemetry_batches"), 1)
+
+    def test_same_key_different_sla_batch_or_body_conflicts(self) -> None:
+        self.activate()
+        body = self.batch_body(events=[self.event("evt-1", 100)])
+        self.assertEqual(self.post_batch(body)[0], 201)
+        # 同键更换批次 id。
+        other = self.batch_body("batch-2", [self.event("evt-1", 100)])
+        status, payload = self.post_batch(other)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "conflict"})
+        # 同键更换正文。
+        other = self.batch_body(events=[self.event("evt-2", 100)])
+        status, payload = self.post_batch(other)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "conflict"})
+        # 同键更换 SLA（即使该 SLA 不存在）。
+        status, payload = self.post_batch(body, sla_id="sla-9")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "conflict"})
+
+    def test_different_key_same_batch_id_is_batch_exists(self) -> None:
+        self.activate()
+        self.assertEqual(self.post_batch(self.batch_body(), key="key-1")[0], 201)
+        other = self.batch_body(events=[self.event("evt-2", 100)])
+        status, payload = self.post_batch(other, key="key-2")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "batch_exists"})
+
+    def test_sla_not_found(self) -> None:
+        status, payload = self.post_batch(self.batch_body(), sla_id="missing")
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(payload), {"error": "not_found"})
+
+    def test_pending_sla_conflicts(self) -> None:
+        status, payload = self.post_batch(self.batch_body())
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "conflict"})
+
+    def test_sealed_sla_conflicts(self) -> None:
+        self.activate()
+        # 直接把结束时刻改到过去，使 SLA 满足封存时间条件。
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            connection.execute(
+                "UPDATE slas SET end_unix = ? WHERE id = 'sla-1'", (self.start + 5,)
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        body = json.dumps({"actorId": self.machine_id}).encode()
+        request = Request(
+            self.url("/v1/slas/sla-1/telemetry-seals"), data=body, method="POST"
+        )
+        request.add_header("Idempotency-Key", "seal-1")
+        add_sla_auth(request, self.server)
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        status, payload = self.post_batch(self.batch_body())
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "conflict"})
+
+    def test_first_failing_event_determines_response_and_nothing_is_written(
+        self,
+    ) -> None:
+        self.activate()
+        events = [
+            self.event("evt-1", 100),
+            self.event("evt-2", 200, digest="0" * 64),  # 摘要错误
+            self.event("evt-3", 300, signature="ab" * 64),  # 签名错误（不到达）
+        ]
+        status, payload = self.post_batch(self.batch_body(events=events))
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "conflict"})
+        self.assertEqual(self.table_count("sla_telemetry_events"), 0)
+        self.assertEqual(self.table_count("sla_telemetry_batches"), 0)
+        self.assertEqual(self.table_count("sla_telemetry_batch_idempotency_records"), 0)
+        # 时间窗越界同样以首项失败响应。
+        events = [
+            self.event("evt-1", 100),
+            self.event("evt-2", self.end * 1000 - self.start * 1000),
+        ]
+        status, payload = self.post_batch(self.batch_body(events=events), key="batch-2")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "conflict"})
+        self.assertEqual(self.table_count("sla_telemetry_events"), 0)
+
+    def test_invalid_signature_and_unknown_key_version(self) -> None:
+        self.activate()
+        events = [self.event("evt-1", 100, signature="ab" * 64)]
+        status, payload = self.post_batch(self.batch_body(events=events))
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "invalid_signature"})
+        events = [self.event("evt-1", 100, key_version=9)]
+        status, payload = self.post_batch(self.batch_body(events=events), key="batch-2")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "invalid_signature"})
+        self.assertEqual(self.table_count("sla_telemetry_events"), 0)
+
+    def test_revoked_key_version_is_invalid_signature(self) -> None:
+        self.activate()
+        # 轮换到版本二并吊销版本一：版本一窗口内的事件按 invalid_signature 拒绝。
+        new_seed = b"\x05" * 32
+        new_public = _ed25519_public_key(new_seed).hex()
+        current_signature, new_signature = key_rotation_signatures(
+            PRODUCER_SEED, new_seed, self.machine_id, 1, new_public
+        )
+        request = Request(
+            self.url(f"/v1/machines/{self.machine_id}/keys"),
+            data=json.dumps(
+                {
+                    "expectedVersion": 1,
+                    "publicKey": new_public,
+                    "currentSignature": current_signature,
+                    "newSignature": new_signature,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "rotate-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        request = Request(
+            self.url(f"/v1/machines/{self.machine_id}/keys/1/revocation"),
+            data=json.dumps(
+                {"signature": key_revocation_signature(new_seed, self.machine_id, 1)}
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "revoke-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+        status, payload = self.post_batch(self.batch_body())
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "invalid_signature"})
+        self.assertEqual(self.table_count("sla_telemetry_events"), 0)
+
+    def test_event_exists_against_single_write_and_other_batch(self) -> None:
+        self.activate()
+        status, _ = self.post_single(self.event("evt-1", 100), "tel-1")
+        self.assertEqual(status, 201)
+        events = [self.event("evt-0", 50), self.event("evt-1", 100)]
+        status, payload = self.post_batch(self.batch_body(events=events))
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "event_exists"})
+        self.assertEqual(self.table_count("sla_telemetry_events"), 1)
+        # 其他批次已写入的 eventId 同样冲突。
+        self.assertEqual(
+            self.post_batch(self.batch_body("batch-2", [self.event("evt-2", 150)]), key="k-2")[0],
+            201,
+        )
+        status, payload = self.post_batch(
+            self.batch_body("batch-3", [self.event("evt-2", 150)]), key="k-3"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "event_exists"})
+
+    def test_failure_consumes_no_sequence_and_same_key_retry_succeeds(self) -> None:
+        self.activate()
+        events = [self.event("evt-1", 100, digest="0" * 64)]
+        status, payload = self.post_batch(self.batch_body(events=events))
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "conflict"})
+        self.assertEqual(self.table_count("sla_telemetry_events"), 0)
+        self.assertEqual(self.table_count("sla_telemetry_batches"), 0)
+        self.assertEqual(self.table_count("sla_telemetry_batch_idempotency_records"), 0)
+        # 失败不留幂等记录：补正后同键重试成功，序号自 1 起。
+        status, body = self.post_batch(self.batch_body(events=[self.event("evt-1", 100)]))
+        self.assertEqual(status, 201)
+        self.assertEqual(
+            json.loads(body)["events"], [{"eventId": "evt-1", "commitSeq": 1}]
+        )
+
+    def test_get_batch_errors(self) -> None:
+        self.activate()
+        status, payload = self.get_batch("/v1/telemetry-batches/batch-x")
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(payload), {"error": "not_found"})
+        status, payload = self.get_batch("/v1/telemetry-batches/BAD")
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(payload), {"error": "not_found"})
+        self.assertEqual(self.post_batch(self.batch_body())[0], 201)
+        status, payload = self.get_batch("/v1/telemetry-batches/batch-1?x=1")
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(payload), {"error": "invalid_request"})
+
+    def test_concurrent_batch_and_single_compete_for_event_id(self) -> None:
+        self.activate()
+        event = self.event("evt-1", 100)
+        batch_body = self.batch_body(events=[event])
+        single_body = json.dumps(event).encode()
+        outcomes = []
+
+        def run_batch() -> tuple[int, str]:
+            status, body = self.post_batch(batch_body, key="key-batch")
+            return status, json.loads(body).get("error", "")
+
+        def run_single() -> tuple[int, str]:
+            request = Request(
+                self.url("/v1/slas/sla-1/telemetry"), data=single_body, method="POST"
+            )
+            request.add_header("Idempotency-Key", "key-single")
+            try:
+                with urlopen(request, timeout=5) as response:
+                    return response.status, ""
+            except HTTPError as error:
+                return error.code, json.loads(error.read()).get("error", "")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = [run_batch(), run_single()]
+        winners = [item for item in outcomes if item[0] == 201]
+        losers = [item for item in outcomes if item[0] != 201]
+        self.assertEqual(len(winners), 1)
+        self.assertEqual(len(losers), 1)
+        self.assertEqual(losers[0], (409, "event_exists"))
+        self.assertEqual(self.event_rows(), [("evt-1", 1)])
+
+    def test_concurrent_batches_sharing_event_id_only_one_commits(self) -> None:
+        self.activate()
+        body_a = self.batch_body("batch-a", [self.event("evt-1", 100)])
+        body_b = self.batch_body("batch-b", [self.event("evt-1", 100)])
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(self.post_batch, body_a, "sla-1", "key-a"),
+                executor.submit(self.post_batch, body_b, "sla-1", "key-b"),
+            ]
+            statuses = sorted(future.result()[0] for future in futures)
+        self.assertEqual(statuses, [201, 409])
+        self.assertEqual(self.table_count("sla_telemetry_events"), 1)
+        self.assertEqual(self.table_count("sla_telemetry_batches"), 1)
+
+
 class EvaluationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()

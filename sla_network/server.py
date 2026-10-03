@@ -41,6 +41,10 @@ TEMPLATE_ID_PATTERN = re.compile(r"[a-z0-9-]{1,64}")
 SLA_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)")
 SLA_CONFIRMATIONS_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/confirmations")
 SLA_TELEMETRY_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/telemetry")
+SLA_TELEMETRY_BATCHES_PATH_PATTERN = re.compile(
+    r"/v1/slas/([^/]+)/telemetry-batches"
+)
+TELEMETRY_BATCH_ITEM_PATH_PATTERN = re.compile(r"/v1/telemetry-batches/([^/]+)")
 SLA_TELEMETRY_SEALS_PATH_PATTERN = re.compile(
     r"/v1/slas/([^/]+)/telemetry-seals"
 )
@@ -102,6 +106,8 @@ CONFIRMATION_PARTIES = {"producer", "consumer"}
 TELEMETRY_FIELDS = {"eventId", "timestamp", "latencyMs", "digest"}
 TELEMETRY_V1_SIGNED_FIELDS = TELEMETRY_FIELDS | {"signature"}
 TELEMETRY_SIGNED_FIELDS = TELEMETRY_FIELDS | {"keyVersion", "signature"}
+TELEMETRY_BATCH_FIELDS = {"id", "events"}
+TELEMETRY_BATCH_MAX_EVENTS = 100
 SIGNATURE_PATTERN = re.compile(r"[0-9a-f]{128}")
 EVALUATION_FIELDS = {"from", "to"}
 TELEMETRY_SEAL_FIELDS = {"actorId"}
@@ -337,6 +343,12 @@ class Handler(BaseHTTPRequestHandler):
         telemetry_seal_match = SLA_TELEMETRY_SEAL_PATH_PATTERN.fullmatch(target.path)
         if telemetry_seal_match is not None:
             self._get_telemetry_seal(telemetry_seal_match.group(1), target.query)
+            return
+        telemetry_batch_match = TELEMETRY_BATCH_ITEM_PATH_PATTERN.fullmatch(
+            target.path
+        )
+        if telemetry_batch_match is not None:
+            self._get_telemetry_batch(telemetry_batch_match.group(1), target.query)
             return
         machine_delegations_match = MACHINE_DELEGATIONS_PATH_PATTERN.fullmatch(
             target.path
@@ -1796,6 +1808,12 @@ class Handler(BaseHTTPRequestHandler):
         telemetry_match = SLA_TELEMETRY_PATH_PATTERN.fullmatch(self.path)
         if telemetry_match is not None:
             self._post_telemetry(telemetry_match.group(1))
+            return
+        telemetry_batches_match = SLA_TELEMETRY_BATCHES_PATH_PATTERN.fullmatch(
+            urlsplit(self.path).path
+        )
+        if telemetry_batches_match is not None:
+            self._create_telemetry_batch(telemetry_batches_match.group(1))
             return
         telemetry_seals_match = SLA_TELEMETRY_SEALS_PATH_PATTERN.fullmatch(
             urlsplit(self.path).path
@@ -3706,6 +3724,261 @@ class Handler(BaseHTTPRequestHandler):
             except BaseException:
                 database.execute("ROLLBACK")
                 raise
+
+    def _create_telemetry_batch(self, sla_id: str) -> None:
+        # 批次写入口要求恰好一个合法 Idempotency-Key：缺失、重复或格式非法
+        # 均为 400/invalid_request，且不查询任何资源。
+        values = self.headers.get_all("Idempotency-Key")
+        if values is None or len(values) != 1:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        idempotency_key = values[0]
+        if IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 批量摄取不接受任何查询参数：参数校验先于体校验与 SLA 查询。
+        if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        fields = self._read_telemetry_batch_object()
+        if fields is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        status, payload = self._apply_telemetry_batch(
+            idempotency_key, sla_id, fields
+        )
+        self._json(status, payload)
+
+    def _read_telemetry_batch_object(self) -> dict[str, Any] | None:
+        parsed = self._read_json_object()
+        if parsed is None or set(parsed) != TELEMETRY_BATCH_FIELDS:
+            return None
+        batch_id = parsed["id"]
+        if not isinstance(batch_id, str) or TEMPLATE_ID_PATTERN.fullmatch(batch_id) is None:
+            return None
+        events = parsed["events"]
+        if not isinstance(events, list):
+            return None
+        if not 1 <= len(events) <= TELEMETRY_BATCH_MAX_EVENTS:
+            return None
+        seen: set[str] = set()
+        normalized_events: list[dict[str, Any]] = []
+        for event in events:
+            # 每项完整沿用单条遥测 v2 的六个公开字段与取值语义。
+            if not isinstance(event, dict) or set(event) != TELEMETRY_SIGNED_FIELDS:
+                return None
+            event_id = event["eventId"]
+            if not isinstance(event_id, str) or TEMPLATE_ID_PATTERN.fullmatch(event_id) is None:
+                return None
+            if not _bounded_int(event["timestamp"], 0, 2147483647999):
+                return None
+            if not _bounded_int(event["latencyMs"], 0, 2147483647):
+                return None
+            digest = event["digest"]
+            if not isinstance(digest, str) or PUBLIC_KEY_PATTERN.fullmatch(digest) is None:
+                return None
+            signature = event["signature"]
+            if not isinstance(signature, str) or SIGNATURE_PATTERN.fullmatch(signature) is None:
+                return None
+            if not _bounded_int(event["keyVersion"], 1, INT64_MAX):
+                return None
+            # 批内 eventId 不得重复：重复属请求结构非法。
+            if event_id in seen:
+                return None
+            seen.add(event_id)
+            normalized_events.append(
+                {
+                    "eventId": event_id,
+                    "timestamp": event["timestamp"],
+                    "latencyMs": event["latencyMs"],
+                    "digest": digest,
+                    "keyVersion": event["keyVersion"],
+                    "signature": signature,
+                }
+            )
+        return {"id": batch_id, "events": normalized_events}
+
+    def _apply_telemetry_batch(
+        self, idempotency_key: str, sla_id: str, fields: dict[str, Any]
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+        batch_id = fields["id"]
+        events = fields["events"]
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                record = database.execute(
+                    "SELECT sla_id, batch_id, request_json, status, response_json"
+                    " FROM sla_telemetry_batch_idempotency_records WHERE key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    if (
+                        record["sla_id"] == sla_id
+                        and record["batch_id"] == batch_id
+                        and record["request_json"] == request_json
+                    ):
+                        # 同键同请求（含并发与重启后）重放首次状态码与响应字节。
+                        return HTTPStatus(record["status"]), json.loads(
+                            record["response_json"]
+                        )
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                existing_batch = database.execute(
+                    "SELECT 1 FROM sla_telemetry_batches WHERE id = ?",
+                    (batch_id,),
+                ).fetchone()
+                if existing_batch is not None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "batch_exists"}
+                sla = database.execute(
+                    "SELECT machine_id, start_unix, end_unix, state FROM slas WHERE id = ?",
+                    (sla_id,),
+                ).fetchone()
+                if sla is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                machine_id = sla["machine_id"]
+                # 按数组顺序对每项沿用单条入口的判定序列，以首个失败项响应；
+                # 任一失败整体回滚，不写事件、批次或幂等结果，也不推进序号。
+                for event in events:
+                    timestamp = event["timestamp"]
+                    if (
+                        sla["state"] != "active"
+                        or not (sla["start_unix"] * 1000 <= timestamp < sla["end_unix"] * 1000)
+                    ):
+                        database.execute("ROLLBACK")
+                        return HTTPStatus.CONFLICT, {"error": "conflict"}
+                    message = (
+                        f"{sla_id}\n{event['eventId']}\n{timestamp}\n"
+                        f"{event['latencyMs']}\n{machine_id}"
+                    )
+                    if hashlib.sha256(message.encode("utf-8")).hexdigest() != event["digest"]:
+                        database.execute("ROLLBACK")
+                        return HTTPStatus.CONFLICT, {"error": "conflict"}
+                    key_version = event["keyVersion"]
+                    key = database.execute(
+                        "SELECT public_key, activated_at_ms, revoked FROM machine_keys"
+                        " WHERE machine_id = ? AND version = ?",
+                        (machine_id, key_version),
+                    ).fetchone()
+                    signature_valid = False
+                    if key is not None and not key["revoked"]:
+                        next_activation = database.execute(
+                            "SELECT activated_at_ms FROM machine_keys"
+                            " WHERE machine_id = ? AND version > ?"
+                            " ORDER BY version ASC LIMIT 1",
+                            (machine_id, key_version),
+                        ).fetchone()
+                        within_window = timestamp >= key["activated_at_ms"] and (
+                            next_activation is None
+                            or timestamp < next_activation["activated_at_ms"]
+                        )
+                        if within_window:
+                            signed_message = (
+                                f"telemetry-v2\n{sla_id}\n{event['eventId']}\n{timestamp}\n"
+                                f"{event['latencyMs']}\n{event['digest']}\n"
+                                f"{key_version}\n{machine_id}"
+                            ).encode("utf-8")
+                            signature_valid = ed25519_verify(
+                                bytes.fromhex(key["public_key"]),
+                                signed_message,
+                                bytes.fromhex(event["signature"]),
+                            )
+                    if not signature_valid:
+                        database.execute("ROLLBACK")
+                        return HTTPStatus.CONFLICT, {"error": "invalid_signature"}
+                    # 摘要、版本窗口与签名均有效后才判事件重复；写事务串行，
+                    # 与单条写入及其他批次争用同一 eventId 时仅先提交者成功。
+                    existing = database.execute(
+                        "SELECT event_id FROM sla_telemetry_events"
+                        " WHERE sla_id = ? AND event_id = ?",
+                        (sla_id, event["eventId"]),
+                    ).fetchone()
+                    if existing is not None:
+                        database.execute("ROLLBACK")
+                        return HTTPStatus.CONFLICT, {"error": "event_exists"}
+                # 全部事件通过后才取序号与时间：任一失败均不消耗序号。
+                next_record = database.execute(
+                    "SELECT COALESCE(MAX(commit_seq), 0) + 1 AS next_seq"
+                    " FROM sla_telemetry_events"
+                ).fetchone()
+                next_seq = next_record["next_seq"]
+                created_at_ms = int(datetime.now(UTC).timestamp() * 1000)
+                event_payloads: list[dict[str, Any]] = []
+                for position, event in enumerate(events):
+                    commit_seq = next_seq + position
+                    database.execute(
+                        "INSERT INTO sla_telemetry_events"
+                        "(sla_id, event_id, timestamp_ms, latency_ms, digest, commit_seq,"
+                        " signature, key_version)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            sla_id,
+                            event["eventId"],
+                            event["timestamp"],
+                            event["latencyMs"],
+                            event["digest"],
+                            commit_seq,
+                            event["signature"],
+                            event["keyVersion"],
+                        ),
+                    )
+                    event_payloads.append(
+                        {"eventId": event["eventId"], "commitSeq": commit_seq}
+                    )
+                payload = {
+                    "id": batch_id,
+                    "slaId": sla_id,
+                    "createdAt": created_at_ms,
+                    "events": event_payloads,
+                }
+                database.execute(
+                    "INSERT INTO sla_telemetry_batches"
+                    "(id, sla_id, created_at_ms, response_json) VALUES (?, ?, ?, ?)",
+                    (
+                        batch_id,
+                        sla_id,
+                        created_at_ms,
+                        json.dumps(payload, separators=(",", ":")),
+                    ),
+                )
+                database.execute(
+                    "INSERT INTO sla_telemetry_batch_idempotency_records"
+                    "(key, sla_id, batch_id, request_json, status, response_json)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        sla_id,
+                        batch_id,
+                        request_json,
+                        int(HTTPStatus.CREATED),
+                        json.dumps(payload, separators=(",", ":")),
+                    ),
+                )
+                database.execute("COMMIT")
+                return HTTPStatus.CREATED, payload
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+
+    def _get_telemetry_batch(self, batch_id: str, query: str) -> None:
+        # 读取入口不接受任何查询参数：参数校验先于批次查询。
+        if parse_qsl(query, keep_blank_values=True):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        if TEMPLATE_ID_PATTERN.fullmatch(batch_id) is None:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        with closing(connect(self.server.database_path)) as database:
+            record = database.execute(
+                "SELECT response_json FROM sla_telemetry_batches WHERE id = ?",
+                (batch_id,),
+            ).fetchone()
+        if record is None:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        self._json(HTTPStatus.OK, json.loads(record["response_json"]))
 
     def _evaluate_sla(self, sla_id: str) -> None:
         idempotency_key = self.headers.get("Idempotency-Key")

@@ -133,6 +133,20 @@ CREATE TABLE IF NOT EXISTS sla_telemetry_idempotency_records (
     status INTEGER NOT NULL,
     response_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS sla_telemetry_batches (
+    id TEXT PRIMARY KEY,
+    sla_id TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    response_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sla_telemetry_batch_idempotency_records (
+    key TEXT PRIMARY KEY,
+    sla_id TEXT NOT NULL,
+    batch_id TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    response_json TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS sla_evaluation_idempotency_records (
     key TEXT PRIMARY KEY,
     sla_id TEXT NOT NULL,
