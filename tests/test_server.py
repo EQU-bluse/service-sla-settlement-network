@@ -27267,8 +27267,8 @@ class FinalAuditVerificationProofVerificationProofTests(
         self.assertEqual(row[2], 1)
 
     def test_old_database_gains_empty_proof_storage(self) -> None:
-        # 模拟升级前旧库：不存在本层冻结证明存储；重启后仅新增空存储，
-        # 不补造任何历史证明，新证明序号自 1 起。
+        # 模拟升级前旧库：不存在本层冻结证明与其链存储；重启后仅新增空存储
+        # 并完成一次性空补链，不补造任何历史证明，新证明序号自 1 起。
         report = self.setup_verification_report("favvp-mig")
         status, _ = self.post_verification_verification_proof(
             1, report, "favvp-mig-old"
@@ -27281,6 +27281,14 @@ class FinalAuditVerificationProofVerificationProofTests(
             "DROP TABLE"
             " final_audit_verification_proof_verification_proof_idempotency_records"
         )
+        self.db_execute(
+            "DROP TABLE final_audit_verification_proof_verification_proof_chain"
+        )
+        self.db_execute(
+            "DELETE FROM schema_metadata"
+            " WHERE key ="
+            " 'final_audit_verification_proof_verification_proof_chain_backfilled'"
+        )
         self.restart()
         status, body = self.get(self.PROOFS_ENDPOINT)
         self.assertEqual(status, 200, body)
@@ -27291,6 +27299,269 @@ class FinalAuditVerificationProofVerificationProofTests(
         self.assertEqual(status, 201, response)
         self.assertEqual(json.loads(response)["proofSeq"], 1)
         self.assertEqual(json.loads(response)["verificationSeq"], 1)
+
+
+class FinalAuditVerificationProofVerificationProofChainTests(
+    FinalAuditVerificationProofVerificationProofTests
+):
+    # 一致性报告冻结证明复核报告冻结证明前向链：本层冻结证明首次成功在原事务
+    # 追加 final-audit-verification-proof-verification-proof-chain-v1 前向链
+    # 记录；旧库按 proofSeq 升序单事务补链。辅助方法复用
+    # FinalAuditVerificationProofVerificationProofTests；屏蔽继承来的既有测试，
+    # 避免重复运行。
+    for _inherited in dir(FinalAuditVerificationProofVerificationProofTests):
+        if _inherited.startswith("test_"):
+            locals()[_inherited] = None
+
+    CHAIN = "/v1/final-audit-verification-proof-verification-proof-chain"
+    CHAIN_DOMAIN = "final-audit-verification-proof-verification-proof-chain-v1"
+
+    def setup_two_proofs(self, key: str) -> tuple[bytes, bytes, bytes]:
+        # 两份本层冻结证明指向同一份复核报告：第二份由另一审计机器签署，
+        # proofSeq 在本功能独立序号空间全库递增。
+        report = self.setup_verification_report(f"{key}-t")
+        status, first = self.post_verification_verification_proof(
+            1, report, f"{key}-p1"
+        )
+        self.assertEqual(status, 201, first)
+        status, second = self.post_verification_verification_proof(
+            1,
+            report,
+            f"{key}-p2",
+            seed=self.AUDITOR2_SEED,
+            actor=self.auditor2_id,
+        )
+        self.assertEqual(status, 201, second)
+        return report, first, second
+
+    def test_chain_empty_history(self) -> None:
+        status, body = self.get(self.CHAIN)
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertEqual(list(payload), ["entries", "nextCursor", "head"])
+        self.assertEqual(payload["entries"], [])
+        self.assertIsNone(payload["nextCursor"])
+        self.assertIsNone(payload["head"])
+        self.assertFalse(body.endswith(b"\n"))
+
+    def test_chain_entries_digests_and_head(self) -> None:
+        _, first, second = self.setup_two_proofs("favvpc-cd")
+        status, body = self.get(self.CHAIN)
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        entries = payload["entries"]
+        self.assertEqual([e["proofSeq"] for e in entries], [1, 2])
+        self.assertEqual(
+            [list(e) for e in entries],
+            [
+                ["proofSeq", "responseDigest", "previousChainDigest", "chainDigest"],
+                ["proofSeq", "responseDigest", "previousChainDigest", "chainDigest"],
+            ],
+        )
+        zeros = "0" * 64
+        rd1 = hashlib.sha256(first).hexdigest()
+        rd2 = hashlib.sha256(second).hexdigest()
+        cd1 = hashlib.sha256(
+            "\n".join((self.CHAIN_DOMAIN, "1", rd1, zeros)).encode("utf-8")
+        ).hexdigest()
+        cd2 = hashlib.sha256(
+            "\n".join((self.CHAIN_DOMAIN, "2", rd2, cd1)).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(entries[0]["responseDigest"], rd1)
+        self.assertEqual(entries[0]["previousChainDigest"], zeros)
+        self.assertEqual(entries[0]["chainDigest"], cd1)
+        self.assertEqual(entries[1]["responseDigest"], rd2)
+        self.assertEqual(entries[1]["previousChainDigest"], cd1)
+        self.assertEqual(entries[1]["chainDigest"], cd2)
+        self.assertEqual(payload["head"], {"proofSeq": 2, "chainDigest": cd2})
+        self.assertIsNone(payload["nextCursor"])
+
+    def test_chain_paging_and_stable_cut(self) -> None:
+        self.setup_two_proofs("favvpc-pg")
+        status, body = self.get(f"{self.CHAIN}?limit=1")
+        self.assertEqual(status, 200, body)
+        first_page = json.loads(body)
+        self.assertEqual([e["proofSeq"] for e in first_page["entries"]], [1])
+        self.assertEqual(first_page["nextCursor"], "2:1")
+        self.assertEqual(first_page["head"]["proofSeq"], 2)
+        # 旧游标携带 cut=2：此后新增证明不进入续页，head 仍停在 cut 末项。
+        report2 = self.setup_second_verification_report("favvpc-pg")
+        status, third = self.post_verification_verification_proof(
+            2, report2, "favvpc-pg-p3"
+        )
+        self.assertEqual(status, 201, third)
+        status, body = self.get(
+            f"{self.CHAIN}?limit=1&cursor={first_page['nextCursor']}"
+        )
+        self.assertEqual(status, 200, body)
+        second_page = json.loads(body)
+        self.assertEqual([e["proofSeq"] for e in second_page["entries"]], [2])
+        self.assertIsNone(second_page["nextCursor"])
+        self.assertEqual(second_page["head"]["proofSeq"], 2)
+        # 全新首页取新 cut=3。
+        status, body = self.get(f"{self.CHAIN}?limit=1")
+        self.assertEqual(json.loads(body)["head"]["proofSeq"], 3)
+
+    def test_chain_invalid_params_and_cursors(self) -> None:
+        self.setup_two_proofs("favvpc-bad")
+        for query in (
+            "limit=0",
+            "limit=101",
+            "limit=x",
+            "foo=1",
+            "cursor=1",
+            "cursor=x:1",
+            "limit=1&limit=2",
+            "cursor=99:1",
+            "cursor=1:5",
+        ):
+            status, _ = self.get(f"{self.CHAIN}?{query}")
+            self.assertEqual(status, 400, query)
+
+    def test_chain_single_item(self) -> None:
+        _, first, _ = self.setup_two_proofs("favvpc-item")
+        status, body = self.get(f"{self.CHAIN}/1")
+        self.assertEqual(status, 200, body)
+        entry = json.loads(body)
+        self.assertEqual(
+            list(entry),
+            ["proofSeq", "responseDigest", "previousChainDigest", "chainDigest"],
+        )
+        self.assertEqual(entry["proofSeq"], 1)
+        self.assertEqual(entry["responseDigest"], hashlib.sha256(first).hexdigest())
+        self.assertEqual(entry["previousChainDigest"], "0" * 64)
+        expected = hashlib.sha256(
+            "\n".join(
+                (self.CHAIN_DOMAIN, "1", entry["responseDigest"], "0" * 64)
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(entry["chainDigest"], expected)
+        self.assertFalse(body.endswith(b"\n"))
+
+    def test_chain_single_item_errors(self) -> None:
+        self.setup_two_proofs("favvpc-item-err")
+        for seq in ("0", "01", "abc", "3"):
+            status, _ = self.get(f"{self.CHAIN}/{seq}")
+            self.assertEqual(status, 404, seq)
+        status, _ = self.get(f"{self.CHAIN}/1?x=1")
+        self.assertEqual(status, 400)
+        status, _ = self.get(f"{self.CHAIN}/1", omit_auth=True)
+        self.assertEqual(status, 400)
+        status, _ = self.get(
+            f"{self.CHAIN}/1",
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+        )
+        self.assertEqual(status, 403)
+
+    def test_chain_requires_auditor_and_auth(self) -> None:
+        status, _ = self.get(
+            self.CHAIN,
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+        )
+        self.assertEqual(status, 403)
+        status, _ = self.get(self.CHAIN, omit_auth=True)
+        self.assertEqual(status, 400)
+
+    def test_chain_nonce_consumed_only_on_success(self) -> None:
+        self.setup_two_proofs("favvpc-nonce")
+        nonce = f"nonce-favvpc-chain-{time.time_ns()}"
+        status, _ = self.get(self.CHAIN, nonce=nonce)
+        self.assertEqual(status, 200)
+        status, body = self.get(self.CHAIN, nonce=nonce)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "replay_detected"})
+        failed_nonce = f"nonce-favvpc-chain-fail-{time.time_ns()}"
+        for _ in range(2):
+            status, _ = self.get(
+                f"{self.CHAIN}?cursor=99:1", nonce=failed_nonce
+            )
+            self.assertEqual(status, 400)
+
+    def test_no_chain_append_on_failed_or_replayed_proof(self) -> None:
+        report = self.setup_verification_report("favvpc-fail")
+        # 验签失败（409）不追加链项、不推进序号。
+        bad = json.dumps(
+            {"verificationSeq": 1, "signature": "ab" * 64}
+        ).encode()
+        status, _ = self.request_raw(
+            self.PROOFS_ENDPOINT, bad, "favvpc-fail-badsig", "POST"
+        )
+        self.assertEqual(status, 409)
+        # 目标缺失（404）不追加链项。
+        status, _ = self.post_verification_verification_proof(
+            99, report, "favvpc-fail-missing"
+        )
+        self.assertEqual(status, 404)
+        status, body = self.get(self.CHAIN)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["entries"], [])
+        # 首次成功追加一条；同键重放不再追加。
+        status, first = self.post_verification_verification_proof(
+            1, report, "favvpc-fail-ok"
+        )
+        self.assertEqual(status, 201, first)
+        status, replay = self.post_verification_verification_proof(
+            1, report, "favvpc-fail-ok"
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(replay, first)
+        status, body = self.get(self.CHAIN)
+        self.assertEqual([e["proofSeq"] for e in json.loads(body)["entries"]], [1])
+
+    def test_chain_backfilled_after_restart(self) -> None:
+        _, first, second = self.setup_two_proofs("favvpc-mig")
+        # 手工删除链并清除迁移标记，模拟升级前只有冻结证明记录的旧库。
+        self.db_execute(
+            "DELETE FROM final_audit_verification_proof_verification_proof_chain"
+        )
+        self.db_execute(
+            "DELETE FROM schema_metadata"
+            " WHERE key ="
+            " 'final_audit_verification_proof_verification_proof_chain_backfilled'"
+        )
+        self.restart()
+        status, body = self.get(self.CHAIN)
+        self.assertEqual(status, 200, body)
+        entries = json.loads(body)["entries"]
+        self.assertEqual([e["proofSeq"] for e in entries], [1, 2])
+        rd1 = hashlib.sha256(first).hexdigest()
+        rd2 = hashlib.sha256(second).hexdigest()
+        cd1 = hashlib.sha256(
+            "\n".join((self.CHAIN_DOMAIN, "1", rd1, "0" * 64)).encode()
+        ).hexdigest()
+        cd2 = hashlib.sha256(
+            "\n".join((self.CHAIN_DOMAIN, "2", rd2, cd1)).encode()
+        ).hexdigest()
+        self.assertEqual(entries[0]["chainDigest"], cd1)
+        self.assertEqual(entries[1]["chainDigest"], cd2)
+        # 补链不改历史响应、时间、序号与幂等字节。
+        status, reread = self.get(self.PROOFS_ENDPOINT)
+        self.assertEqual(status, 200)
+        proofs = json.loads(reread)["proofs"]
+        self.assertEqual(proofs[0], json.loads(first))
+        self.assertEqual(proofs[1], json.loads(second))
+        # 迁移仅一次：再次重启不重复补链。
+        self.restart()
+        status, body = self.get(self.CHAIN)
+        self.assertEqual(len(json.loads(body)["entries"]), 2)
+
+    def test_chain_exposes_tampering_without_repair(self) -> None:
+        self.setup_two_proofs("favvpc-tamper")
+        self.db_execute(
+            "UPDATE final_audit_verification_proof_verification_proof_chain"
+            " SET chain_digest = ? WHERE proof_seq = 1",
+            ("f" * 64,),
+        )
+        status, body = self.get(f"{self.CHAIN}/1")
+        self.assertEqual(status, 200)
+        # 服务不修补历史：链项与 head 如实暴露被替换的摘要。
+        self.assertEqual(json.loads(body)["chainDigest"], "f" * 64)
+        status, body = self.get(self.CHAIN)
+        payload = json.loads(body)
+        self.assertEqual(payload["head"]["proofSeq"], 2)
+        self.assertEqual(payload["entries"][0]["chainDigest"], "f" * 64)
 
 
 class IntegerLimitTests(_EvidenceScenario, unittest.TestCase):
