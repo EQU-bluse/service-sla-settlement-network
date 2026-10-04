@@ -146,6 +146,10 @@ FINAL_AUDIT_PROOF_FIELDS = {"verificationSeq", "signature"}
 FINAL_AUDIT_VERIFICATION_PROOF_FIELDS = {"verificationSeq", "signature"}
 FINAL_AUDIT_VERIFICATION_PROOF_WITNESS_FIELDS = {"proofSeq", "chainDigest"}
 FINAL_AUDIT_VERIFICATION_PROOF_VERIFICATION_FIELDS = {"proofSeq"}
+FINAL_AUDIT_VERIFICATION_PROOF_VERIFICATION_PROOF_WITNESS_FIELDS = {
+    "proofSeq",
+    "chainDigest",
+}
 FINAL_AUDIT_VERIFICATION_PROOF_VERIFICATION_PROOF_FIELDS = {
     "verificationSeq",
     "signature",
@@ -201,6 +205,10 @@ FINAL_AUDIT_VERIFICATION_PROOF_VERIFICATION_PROOFS_QUERY_PARAMS = {
     "cursor",
 }
 FINAL_AUDIT_VERIFICATION_PROOF_VERIFICATION_PROOF_CHAIN_QUERY_PARAMS = {
+    "limit",
+    "cursor",
+}
+FINAL_AUDIT_VERIFICATION_PROOF_VERIFICATION_PROOF_WITNESSES_QUERY_PARAMS = {
     "limit",
     "cursor",
 }
@@ -597,6 +605,14 @@ class Handler(BaseHTTPRequestHandler):
             == "/v1/final-audit-verification-proof-verification-proof-chain"
         ):
             self._get_final_audit_verification_proof_verification_proof_chain(
+                target.query
+            )
+            return
+        if (
+            target.path
+            == "/v1/final-audit-verification-proof-verification-proof-witnesses"
+        ):
+            self._get_final_audit_verification_proof_verification_proof_witnesses(
                 target.query
             )
             return
@@ -1970,6 +1986,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if urlsplit(self.path).path == "/v1/final-audit-verification-proof-verification-proofs":
             self._create_final_audit_verification_proof_verification_proof()
+            return
+        if (
+            urlsplit(self.path).path
+            == "/v1/final-audit-verification-proof-verification-proof-witnesses"
+        ):
+            self._create_final_audit_verification_proof_verification_proof_witness()
             return
         delegation_revocation_match = DELEGATION_PATH_PATTERN.fullmatch(
             urlsplit(self.path).path
@@ -14278,6 +14300,358 @@ class Handler(BaseHTTPRequestHandler):
                 database.execute("ROLLBACK")
                 raise
         self._json(HTTPStatus.OK, payload)
+
+    def _create_final_audit_verification_proof_verification_proof_witness(
+        self,
+    ) -> None:
+        idempotency_key = self._audit_idempotency_key()
+        if idempotency_key is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 见证创建拒绝查询参数：参数校验先于体校验与认证结构。
+        if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 正文恰含 proofSeq（非布尔正整数，任意长度）与 chainDigest
+        # （64 位小写十六进制），键不得重复。
+        raw_body = self._read_raw_body()
+        fields = (
+            None
+            if raw_body is None
+            else self._read_final_audit_verification_proof_verification_proof_witness_object(
+                raw_body
+            )
+        )
+        if fields is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 仅接受单一 SLA-Auth：代理头、缺失、重复或结构非法均为非法请求。
+        if self.headers.get_all(SLA_DELEGATION_HEADER):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        auth = self._parse_sla_auth()
+        if auth is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        body_digest = hashlib.sha256(raw_body).hexdigest()
+        status, payload = (
+            self._apply_final_audit_verification_proof_verification_proof_witness(
+                fields, auth, body_digest, idempotency_key
+            )
+        )
+        self._json(status, payload)
+
+    def _read_final_audit_verification_proof_verification_proof_witness_object(
+        self, body: bytes
+    ) -> dict[str, Any] | None:
+        parsed = self._read_json_object(body, unbounded_ints=True)
+        if (
+            parsed is None
+            or set(parsed)
+            != FINAL_AUDIT_VERIFICATION_PROOF_VERIFICATION_PROOF_WITNESS_FIELDS
+        ):
+            return None
+        proof_seq = parsed["proofSeq"]
+        chain_digest = parsed["chainDigest"]
+        # 证明序号要求为非布尔正整数：零、负整数、布尔值与非整数为正文非法
+        # （400/invalid_request）；超出存储范围但格式合法的正整数按链节点
+        # 不存在处理（404/not_found）。
+        if (
+            not isinstance(proof_seq, int)
+            or isinstance(proof_seq, bool)
+            or proof_seq <= 0
+        ):
+            return None
+        if (
+            not isinstance(chain_digest, str)
+            or DIGEST_PATTERN.fullmatch(chain_digest) is None
+        ):
+            return None
+        return parsed
+
+    def _apply_final_audit_verification_proof_verification_proof_witness(
+        self,
+        fields: dict[str, Any],
+        auth: SlaAuth,
+        body_digest: str,
+        idempotency_key: str,
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        proof_seq = fields["proofSeq"]
+        claimed_chain_digest = fields["chainDigest"]
+        request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+        standard_path = (
+            "/v1/final-audit-verification-proof-verification-proof-witnesses"
+        )
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                # 幂等判定先于授权与认证：同键更换正文或认证五段均冲突。
+                record = database.execute(
+                    "SELECT request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature"
+                    " FROM"
+                    " final_audit_verification_proof_verification_proof_witness_idempotency_records"
+                    " WHERE key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    if (
+                        record["request_json"] == request_json
+                        and self._auth_record_matches(record, auth)
+                    ):
+                        return HTTPStatus(record["status"]), json.loads(
+                            record["response_json"]
+                        )
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                # 认证机器须为启动时配置的审计机器；未获审计授权一律 403，
+                # 且不得借此探测目标链项。
+                if auth.machine_id not in self.server.auditors:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
+                try:
+                    self._verify_request_principal(
+                        database, auth, standard_path, body_digest
+                    )
+                    self._check_request_nonce(database, auth)
+                except AuthRejected as rejected:
+                    database.execute("ROLLBACK")
+                    return rejected.status, {"error": rejected.error}
+                # 目标序号须指向已保存的复核报告冻结证明链节点；超存储范围
+                # 但格式合法（参数无法绑定 SQLite 整数）同样按不存在处理。
+                if proof_seq <= INT64_MAX:
+                    chain_row = database.execute(
+                        "SELECT chain_digest"
+                        " FROM final_audit_verification_proof_verification_proof_chain"
+                        " WHERE proof_seq = ?",
+                        (proof_seq,),
+                    ).fetchone()
+                else:
+                    chain_row = None
+                if chain_row is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                # 摘要须与保存的链摘要逐字一致；错配为冲突，不见证也不消费随机数。
+                if chain_row["chain_digest"] != claimed_chain_digest:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                # 同一审计机器对同一链节点限见证一次；不同审计机器仍可分别签名。
+                existing = database.execute(
+                    "SELECT 1 FROM"
+                    " final_audit_verification_proof_verification_proof_witnesses"
+                    " WHERE proof_seq = ? AND auditor_machine_id = ?",
+                    (proof_seq, auth.machine_id),
+                ).fetchone()
+                if existing is not None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "witness_exists"}
+                # 冻结签名公钥：取该机器本次认证版本登记的公钥；
+                # 认证通过后该行必存在，按 README 请求认证规则由冻结字段重建
+                # 待验字节并复核签名，确保落库见证独立可验。
+                key_row = database.execute(
+                    "SELECT public_key FROM machine_keys"
+                    " WHERE machine_id = ? AND version = ?",
+                    (auth.machine_id, auth.key_version),
+                ).fetchone()
+                frozen_message = self._request_auth_signing_bytes(
+                    auth, standard_path, body_digest
+                )
+                rebuilt_valid = (
+                    key_row is not None
+                    and ed25519_verify(
+                        bytes.fromhex(key_row["public_key"]),
+                        frozen_message,
+                        auth.signature_bytes,
+                    )
+                )
+                if not rebuilt_valid:
+                    database.execute("ROLLBACK")
+                    return (
+                        HTTPStatus.UNAUTHORIZED,
+                        {"error": "invalid_authentication"},
+                    )
+                # 本功能内全库唯一持久递增见证序号：取写锁后取最大序号 + 1
+                # （空表 1），独立于其他见证序号空间；旧库仅新增空存储，
+                # 不补历史记录，序号自 1 开始。
+                witness_seq = database.execute(
+                    "SELECT COALESCE(MAX(witness_seq), 0) + 1 AS next_seq"
+                    " FROM final_audit_verification_proof_verification_proof_witnesses"
+                ).fetchone()["next_seq"]
+                created_at_ms = int(datetime.now(UTC).timestamp() * 1000)
+                payload = {
+                    "witnessSeq": witness_seq,
+                    "proofSeq": proof_seq,
+                    "chainDigest": claimed_chain_digest,
+                    "auditorId": auth.machine_id,
+                    "publicKey": key_row["public_key"],
+                    "keyVersion": auth.key_version,
+                    "requestTimeMs": auth.request_time_ms,
+                    "nonce": auth.nonce,
+                    "bodyDigest": body_digest,
+                    "authSignature": auth.signature,
+                    "createdAt": created_at_ms,
+                }
+                response_json = json.dumps(payload, separators=(",", ":"))
+                database.execute(
+                    "INSERT INTO"
+                    " final_audit_verification_proof_verification_proof_witnesses"
+                    "(witness_seq, proof_seq, chain_digest, auditor_machine_id,"
+                    " public_key, key_version, request_time_ms, nonce,"
+                    " body_digest, auth_signature, created_at_ms, response_json)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        witness_seq,
+                        proof_seq,
+                        claimed_chain_digest,
+                        auth.machine_id,
+                        key_row["public_key"],
+                        auth.key_version,
+                        auth.request_time_ms,
+                        auth.nonce,
+                        body_digest,
+                        auth.signature,
+                        created_at_ms,
+                        response_json,
+                    ),
+                )
+                database.execute(
+                    "INSERT INTO"
+                    " final_audit_verification_proof_verification_proof_witness_idempotency_records"
+                    "(key, request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        request_json,
+                        int(HTTPStatus.CREATED),
+                        response_json,
+                        auth.machine_id,
+                        auth.key_version,
+                        auth.request_time_ms,
+                        auth.nonce,
+                        auth.signature,
+                    ),
+                )
+                # 见证、幂等结果与随机数同一事务原子持久化；
+                # 失败、重放或并发败者不消费随机数、不推进见证序号。
+                self._consume_request_nonce(database, auth)
+                database.execute("COMMIT")
+                return HTTPStatus.CREATED, payload
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+
+    def _final_audit_verification_proof_verification_proof_witness_collection_page(
+        self, database: Any, cut: int, last_seq: int, limit: int
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        rows = database.execute(
+            "SELECT witness_seq, response_json"
+            " FROM final_audit_verification_proof_verification_proof_witnesses"
+            " WHERE witness_seq <= ? AND witness_seq > ?"
+            " ORDER BY witness_seq ASC LIMIT ?",
+            (cut, last_seq, limit + 1),
+        ).fetchall()
+        has_next = len(rows) > limit
+        page = rows[:limit]
+        witnesses = [json.loads(row["response_json"]) for row in page]
+        next_cursor = f"{cut}:{page[-1]['witness_seq']}" if has_next else None
+        return witnesses, next_cursor
+
+    def _get_final_audit_verification_proof_verification_proof_witnesses(
+        self, query: str
+    ) -> None:
+        # 复核报告冻结证明链头见证集合分页、认证、游标与随机数语义
+        # 沿用一致性报告冻结证明链头见证集合读取。
+        parsed = self._parse_evaluation_query(
+            query,
+            FINAL_AUDIT_VERIFICATION_PROOF_VERIFICATION_PROOF_WITNESSES_QUERY_PARAMS,
+        )
+        if parsed is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        limit, cursor = parsed
+        # GET 拒绝正文：出现非零、缺失或非法 Content-Length 携带的请求体
+        # 均为非法请求（同时读取并排空连接，避免残留字节影响后续连接复用）。
+        length_header = self.headers.get("Content-Length")
+        if length_header is not None:
+            raw_get_body = self._read_raw_body()
+            if raw_get_body is not None or length_header != "0":
+                self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+                return
+        if self.headers.get_all(SLA_DELEGATION_HEADER):
+            self._json(
+                HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+            )
+            return
+        auth = self._parse_sla_auth()
+        if auth is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        body_digest = hashlib.sha256(b"").hexdigest()
+        standard_path = (
+            "/v1/final-audit-verification-proof-verification-proof-witnesses"
+        )
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                if auth.machine_id not in self.server.auditors:
+                    database.execute("ROLLBACK")
+                    self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                    return
+                try:
+                    self._verify_request_principal(
+                        database, auth, standard_path, body_digest
+                    )
+                    self._check_request_nonce(database, auth)
+                except AuthRejected as rejected:
+                    database.execute("ROLLBACK")
+                    self._json(rejected.status, {"error": rejected.error})
+                    return
+                # 首页在写事务起点冻结最大见证序号：并发新增不进入旧 cut。
+                current_max = database.execute(
+                    "SELECT COALESCE(MAX(witness_seq), 0) AS current_max"
+                    " FROM final_audit_verification_proof_verification_proof_witnesses"
+                ).fetchone()["current_max"]
+                if cursor is None:
+                    cut, last_seq = current_max, 0
+                else:
+                    cut, last_seq = cursor
+                    # 认证通过后的超前 cut 或缺失锚点同为非法请求。
+                    if cut > current_max:
+                        database.execute("ROLLBACK")
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                        )
+                        return
+                    anchor = database.execute(
+                        "SELECT 1 FROM"
+                        " final_audit_verification_proof_verification_proof_witnesses"
+                        " WHERE witness_seq = ? AND witness_seq <= ?",
+                        (last_seq, cut),
+                    ).fetchone()
+                    if anchor is None:
+                        database.execute("ROLLBACK")
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                        )
+                        return
+                witnesses, next_cursor = (
+                    self._final_audit_verification_proof_verification_proof_witness_collection_page(
+                        database, cut, last_seq, limit
+                    )
+                )
+                # 仅成功读取才在同一事务消费随机数；任何失败均不消费、不推进序号。
+                self._consume_request_nonce(database, auth)
+                database.execute("COMMIT")
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+        self._json(
+            HTTPStatus.OK,
+            {"witnesses": witnesses, "nextCursor": next_cursor},
+        )
 
     def _create_final_audit_proof_verification(self) -> None:
         idempotency_key = self._audit_idempotency_key()
