@@ -53,6 +53,9 @@ SLA_TELEMETRY_SEAL_PATH_PATTERN = re.compile(
     r"/v1/slas/([^/]+)/telemetry-seal"
 )
 SLA_EVALUATIONS_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/evaluations")
+EVALUATION_BATCH_ITEM_PATH_PATTERN = re.compile(
+    r"/v1/evaluation-batches/([^/]+)"
+)
 SLA_SETTLEMENTS_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/settlements")
 ACCOUNT_LEDGER_PATH_PATTERN = re.compile(r"/v1/accounts/([^/]+)/ledger")
 FUNDS_PATH_PATTERN = re.compile(r"/v1/funds/([^/]+)")
@@ -117,6 +120,9 @@ TELEMETRY_BATCH_FIELDS = {"id", "events"}
 TELEMETRY_BATCH_MAX_EVENTS = 100
 SIGNATURE_PATTERN = re.compile(r"[0-9a-f]{128}")
 EVALUATION_FIELDS = {"from", "to"}
+EVALUATION_BATCH_FIELDS = {"id", "items"}
+EVALUATION_BATCH_ITEM_FIELDS = {"slaId", "from", "to"}
+EVALUATION_BATCH_MAX_ITEMS = 100
 TELEMETRY_SEAL_FIELDS = {"actorId"}
 FUND_FIELDS = {"amountMicros", "reference"}
 SETTLEMENT_FIELDS = {"slaId", "evaluationSeq"}
@@ -439,6 +445,14 @@ class Handler(BaseHTTPRequestHandler):
         if settlement_batch_match is not None:
             self._get_settlement_batch(
                 settlement_batch_match.group(1), target.query
+            )
+            return
+        evaluation_batch_match = EVALUATION_BATCH_ITEM_PATH_PATTERN.fullmatch(
+            target.path
+        )
+        if evaluation_batch_match is not None:
+            self._get_evaluation_batch(
+                evaluation_batch_match.group(1), target.query
             )
             return
         if target.path == "/v1/disputes":
@@ -1934,6 +1948,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/v1/settlement-batches":
             self._create_settlement_batch()
+            return
+        if urlsplit(self.path).path == "/v1/evaluation-batches":
+            self._create_evaluation_batch()
             return
         if self.path == "/v1/disputes":
             self._create_dispute()
@@ -4236,6 +4253,271 @@ class Handler(BaseHTTPRequestHandler):
             except BaseException:
                 database.execute("ROLLBACK")
                 raise
+
+    def _create_evaluation_batch(self) -> None:
+        # 批次写入口要求恰好一个合法 Idempotency-Key：缺失、重复或格式非法
+        # 均为 400/invalid_request，且不查询任何资源。
+        values = self.headers.get_all("Idempotency-Key")
+        if values is None or len(values) != 1:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        idempotency_key = values[0]
+        if IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 批量评估不接受任何查询参数：参数校验先于体校验与 SLA 查询。
+        if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        fields = self._read_evaluation_batch_object()
+        if fields is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        status, payload = self._apply_evaluation_batch(idempotency_key, fields)
+        self._json(status, payload)
+
+    def _read_evaluation_batch_object(self) -> dict[str, Any] | None:
+        parsed = self._read_json_object()
+        if parsed is None or set(parsed) != EVALUATION_BATCH_FIELDS:
+            return None
+        batch_id = parsed["id"]
+        if not isinstance(batch_id, str) or TEMPLATE_ID_PATTERN.fullmatch(batch_id) is None:
+            return None
+        items = parsed["items"]
+        if not isinstance(items, list):
+            return None
+        if not 1 <= len(items) <= EVALUATION_BATCH_MAX_ITEMS:
+            return None
+        seen: set[tuple[str, int, int]] = set()
+        normalized_items: list[dict[str, Any]] = []
+        for item in items:
+            # 每项完整沿用单笔评估的字段与取值语义。
+            if not isinstance(item, dict) or set(item) != EVALUATION_BATCH_ITEM_FIELDS:
+                return None
+            sla_id = item["slaId"]
+            if not isinstance(sla_id, str) or TEMPLATE_ID_PATTERN.fullmatch(sla_id) is None:
+                return None
+            start = item["from"]
+            end = item["to"]
+            if not isinstance(start, int) or isinstance(start, bool):
+                return None
+            if not isinstance(end, int) or isinstance(end, bool):
+                return None
+            # 批内 (slaId,from,to) 组合不得重复：重复属请求结构非法。
+            combination = (sla_id, start, end)
+            if combination in seen:
+                return None
+            seen.add(combination)
+            normalized_items.append({"slaId": sla_id, "from": start, "to": end})
+        return {"id": batch_id, "items": normalized_items}
+
+    def _apply_evaluation_batch(
+        self, idempotency_key: str, fields: dict[str, Any]
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+        batch_id = fields["id"]
+        items = fields["items"]
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                record = database.execute(
+                    "SELECT batch_id, request_json, status, response_json"
+                    " FROM evaluation_batch_idempotency_records WHERE key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    if (
+                        record["batch_id"] == batch_id
+                        and record["request_json"] == request_json
+                    ):
+                        # 同键同请求（含并发与重启后）重放首次状态码与响应字节。
+                        return HTTPStatus(record["status"]), json.loads(
+                            record["response_json"]
+                        )
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                existing_batch = database.execute(
+                    "SELECT 1 FROM evaluation_batches WHERE id = ?",
+                    (batch_id,),
+                ).fetchone()
+                if existing_batch is not None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "batch_exists"}
+                # 事务起点只取一次全库最大 commit_seq：全部 active 项共用该 cut，
+                # sealed 项仍用各自 sealCut；写锁保证事务期间无新遥测提交。
+                cut_record = database.execute(
+                    "SELECT MAX(commit_seq) AS cut FROM sla_telemetry_events"
+                ).fetchone()
+                batch_cut = cut_record["cut"]
+                if batch_cut is None:
+                    batch_cut = 0
+                # 按输入顺序对每项沿用单笔评估的 SLA 存在性、状态与区间判定，
+                # 以首个失败项响应；任一失败整体回滚，不写任何记录也不分配序号。
+                planned: list[dict[str, Any]] = []
+                for item in items:
+                    sla_id = item["slaId"]
+                    sla = database.execute(
+                        "SELECT max_latency_ms, start_unix, end_unix, state"
+                        " FROM slas WHERE id = ?",
+                        (sla_id,),
+                    ).fetchone()
+                    if sla is None:
+                        database.execute("ROLLBACK")
+                        return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                    start = item["from"]
+                    end = item["to"]
+                    if sla["state"] not in ("active", "sealed") or not (
+                        sla["start_unix"] * 1000 <= start < end <= sla["end_unix"] * 1000
+                    ):
+                        database.execute("ROLLBACK")
+                        return HTTPStatus.CONFLICT, {"error": "conflict"}
+                    if sla["state"] == "sealed":
+                        # sealed 项的 cut 固定为封存时冻结的 sealCut。
+                        cut = database.execute(
+                            "SELECT seal_cut FROM sla_telemetry_seals WHERE sla_id = ?",
+                            (sla_id,),
+                        ).fetchone()["seal_cut"]
+                    else:
+                        cut = batch_cut
+                    summary = database.execute(
+                        "SELECT COUNT(*) AS count, COALESCE(SUM(latency_ms), 0) AS latency_sum,"
+                        " MAX(latency_ms) AS max_latency,"
+                        " COALESCE(SUM(CASE WHEN latency_ms > ? THEN 1 ELSE 0 END), 0)"
+                        " AS violations"
+                        " FROM sla_telemetry_events"
+                        " WHERE sla_id = ? AND commit_seq <= ?"
+                        " AND timestamp_ms >= ? AND timestamp_ms < ?",
+                        (
+                            sla["max_latency_ms"],
+                            sla_id,
+                            cut,
+                            start,
+                            end,
+                        ),
+                    ).fetchone()
+                    count = summary["count"]
+                    violations = summary["violations"]
+                    if count == 0:
+                        outcome = "insufficient"
+                    elif violations == 0:
+                        outcome = "fulfilled"
+                    else:
+                        outcome = "breached"
+                    planned.append(
+                        {
+                            "sla_id": sla_id,
+                            "from": start,
+                            "to": end,
+                            "cut": cut,
+                            "count": count,
+                            "latency_sum": summary["latency_sum"],
+                            "max_latency": summary["max_latency"],
+                            "violations": violations,
+                            "outcome": outcome,
+                        }
+                    )
+                # 全部项通过后才取序号与时间：任一失败均不消耗序号；
+                # 序号与单笔评估共享同一全库空间，批内按输入顺序连续分配。
+                next_record = database.execute(
+                    "SELECT COALESCE(MAX(evaluation_seq), 0) + 1 AS next_seq"
+                    " FROM sla_evaluation_idempotency_records"
+                ).fetchone()
+                next_seq = next_record["next_seq"]
+                created_at_ms = int(datetime.now(UTC).timestamp() * 1000)
+                evaluation_payloads: list[dict[str, Any]] = []
+                for position, plan in enumerate(planned):
+                    evaluation_seq = next_seq + position
+                    result_payload = {
+                        "evaluationSeq": evaluation_seq,
+                        "from": plan["from"],
+                        "to": plan["to"],
+                        "cut": plan["cut"],
+                        "count": plan["count"],
+                        "latencySum": plan["latency_sum"],
+                        "maxLatency": plan["max_latency"],
+                        "violations": plan["violations"],
+                        "outcome": plan["outcome"],
+                        "createdAt": created_at_ms,
+                    }
+                    # 批内评估写入共享评估存储，立即进入既有分页并可被结算引用；
+                    # 合成幂等键含冒号，不会与客户端键（[A-Za-z0-9-]）冲突。
+                    database.execute(
+                        "INSERT INTO sla_evaluation_idempotency_records"
+                        "(key, sla_id, request_json, status, response_json,"
+                        " evaluation_seq, created_at_ms)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            f"evaluation-batch:{batch_id}:{position}",
+                            plan["sla_id"],
+                            json.dumps(
+                                {"from": plan["from"], "to": plan["to"]},
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                            int(HTTPStatus.CREATED),
+                            json.dumps(result_payload, separators=(",", ":")),
+                            evaluation_seq,
+                            created_at_ms,
+                        ),
+                    )
+                    database.execute(
+                        "INSERT INTO evaluation_batch_items"
+                        "(batch_id, position, evaluation_seq, sla_id)"
+                        " VALUES (?, ?, ?, ?)",
+                        (batch_id, position, evaluation_seq, plan["sla_id"]),
+                    )
+                    evaluation_payloads.append(
+                        {"slaId": plan["sla_id"], **result_payload}
+                    )
+                payload = {
+                    "id": batch_id,
+                    "createdAt": created_at_ms,
+                    "evaluations": evaluation_payloads,
+                }
+                database.execute(
+                    "INSERT INTO evaluation_batches"
+                    "(id, created_at_ms, response_json) VALUES (?, ?, ?)",
+                    (
+                        batch_id,
+                        created_at_ms,
+                        json.dumps(payload, separators=(",", ":")),
+                    ),
+                )
+                database.execute(
+                    "INSERT INTO evaluation_batch_idempotency_records"
+                    "(key, batch_id, request_json, status, response_json)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        batch_id,
+                        request_json,
+                        int(HTTPStatus.CREATED),
+                        json.dumps(payload, separators=(",", ":")),
+                    ),
+                )
+                database.execute("COMMIT")
+                return HTTPStatus.CREATED, payload
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+
+    def _get_evaluation_batch(self, batch_id: str, query: str) -> None:
+        # 读取入口不接受任何查询参数：参数校验先于批次查询。
+        if parse_qsl(query, keep_blank_values=True):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        if TEMPLATE_ID_PATTERN.fullmatch(batch_id) is None:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        with closing(connect(self.server.database_path)) as database:
+            record = database.execute(
+                "SELECT response_json FROM evaluation_batches WHERE id = ?",
+                (batch_id,),
+            ).fetchone()
+        if record is None:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        self._json(HTTPStatus.OK, json.loads(record["response_json"]))
 
     def _create_telemetry_seal(self, sla_id: str) -> None:
         idempotency_key = self.headers.get("Idempotency-Key")

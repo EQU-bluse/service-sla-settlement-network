@@ -156,6 +156,27 @@ CREATE TABLE IF NOT EXISTS sla_evaluation_idempotency_records (
     evaluation_seq INTEGER NOT NULL DEFAULT 0,
     created_at_ms INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS evaluation_batches (
+    id TEXT PRIMARY KEY,
+    created_at_ms INTEGER NOT NULL,
+    response_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS evaluation_batch_items (
+    batch_id TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    evaluation_seq INTEGER NOT NULL,
+    sla_id TEXT NOT NULL,
+    PRIMARY KEY (batch_id, position)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_evaluation_batch_items_seq
+ON evaluation_batch_items(evaluation_seq);
+CREATE TABLE IF NOT EXISTS evaluation_batch_idempotency_records (
+    key TEXT PRIMARY KEY,
+    batch_id TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    response_json TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS sla_telemetry_seals (
     sla_id TEXT PRIMARY KEY,
     seal_cut INTEGER NOT NULL,

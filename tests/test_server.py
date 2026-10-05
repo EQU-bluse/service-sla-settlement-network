@@ -4117,6 +4117,582 @@ class EvaluationTests(unittest.TestCase):
         self.assertIsNone(page["nextCursor"])
 
 
+class EvaluationBatchTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.machine_id = machine_id(PUBLIC_KEY_A)
+        self.consumer_id = machine_id(PUBLIC_KEY_B)
+        for key, public_key in (("register-1", PUBLIC_KEY_A), ("register-2", PUBLIC_KEY_B)):
+            request = Request(
+                self.url("/v1/machines"),
+                data=json.dumps({"publicKey": public_key}).encode(),
+                method="POST",
+            )
+            request.add_header("Idempotency-Key", key)
+            with urlopen(request, timeout=5) as response:
+                self.assertEqual(response.status, 201)
+        request = Request(
+            self.url(f"/v1/machines/{self.machine_id}/capabilities"),
+            data=json.dumps(
+                {
+                    "expectedVersion": 0,
+                    "name": "pump-01",
+                    "protocol": "mqtt",
+                    "region": "cn",
+                    "unit": "call",
+                    "capacity": 10,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "cap-1")
+        add_sla_auth(request, self.server)
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        request = Request(
+            self.url("/v1/sla-templates"),
+            data=json.dumps(
+                {
+                    "id": "tpl-1",
+                    "machineId": self.machine_id,
+                    "capabilityVersion": 1,
+                    "priceMicros": 1000,
+                    "maxLatencyMs": 50,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "tpl-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        current = int(time.time())
+        self.start = current - 10
+        self.end = current + 3600
+        self.create_sla("sla-1", "sla-create-1")
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temporary.cleanup()
+
+    def url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}{path}"
+
+    def create_sla(self, sla_id: str, key: str) -> None:
+        request = Request(
+            self.url("/v1/slas"),
+            data=json.dumps(
+                {
+                    "id": sla_id,
+                    "templateId": "tpl-1",
+                    "consumerId": self.consumer_id,
+                    "start": self.start,
+                    "end": self.end,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", key)
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+
+    def activate(self, sla_id: str = "sla-1") -> None:
+        for index, (party, actor) in enumerate(
+            (
+                ("producer", self.machine_id),
+                ("consumer", self.consumer_id),
+            )
+        ):
+            request = Request(
+                self.url(f"/v1/slas/{sla_id}/confirmations"),
+                data=json.dumps({"party": party, "actorId": actor}).encode(),
+                method="POST",
+            )
+            request.add_header("Idempotency-Key", f"conf-{sla_id}-{index}")
+            add_sla_auth(request, self.server)
+            with urlopen(request, timeout=5) as response:
+                self.assertEqual(response.status, 200)
+
+    def digest(self, sla_id: str, event_id: str, timestamp: int, latency_ms: int) -> str:
+        message = f"{sla_id}\n{event_id}\n{timestamp}\n{latency_ms}\n{self.machine_id}"
+        return hashlib.sha256(message.encode("utf-8")).hexdigest()
+
+    def add_event(
+        self, index: int, timestamp: int, latency_ms: int, sla_id: str = "sla-1"
+    ) -> None:
+        event_id = f"evt-{sla_id}-{index:03d}"
+        digest = self.digest(sla_id, event_id, timestamp, latency_ms)
+        body = json.dumps(
+            {
+                "eventId": event_id,
+                "timestamp": timestamp,
+                "latencyMs": latency_ms,
+                "digest": digest,
+                "keyVersion": 1,
+                "signature": telemetry_signature(
+                    PRODUCER_SEED, sla_id, event_id, timestamp, latency_ms, digest,
+                    self.machine_id,
+                ),
+            }
+        ).encode()
+        request = Request(
+            self.url(f"/v1/slas/{sla_id}/telemetry"), data=body, method="POST"
+        )
+        request.add_header("Idempotency-Key", f"tel-{sla_id}-{index}")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+
+    def expire(self, sla_id: str = "sla-1") -> None:
+        # 直接把结束时刻改到过去（start+5 秒），使 SLA 满足封存时间条件。
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            connection.execute(
+                "UPDATE slas SET end_unix = ? WHERE id = ?",
+                (self.start + 5, sla_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def seal(self, sla_id: str = "sla-1") -> dict:
+        body = json.dumps({"actorId": self.machine_id}).encode()
+        request = Request(
+            self.url(f"/v1/slas/{sla_id}/telemetry-seals"), data=body, method="POST"
+        )
+        request.add_header("Idempotency-Key", f"seal-{sla_id}")
+        add_sla_auth(request, self.server)
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+            return json.loads(response.read())
+
+    def restart(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def batch_body(
+        self,
+        batch_id: str = "batch-1",
+        items: list[dict] | None = None,
+    ) -> bytes:
+        if items is None:
+            items = [
+                {"slaId": "sla-1", "from": self.start * 1000, "to": self.end * 1000}
+            ]
+        return json.dumps({"id": batch_id, "items": items}).encode()
+
+    def post_batch(
+        self,
+        body: bytes | None = None,
+        key: str | None = "batch-key-1",
+        query: str = "",
+    ) -> tuple[int, bytes]:
+        if body is None:
+            body = self.batch_body()
+        suffix = f"?{query}" if query else ""
+        request = Request(
+            self.url(f"/v1/evaluation-batches{suffix}"), data=body, method="POST"
+        )
+        if key is not None:
+            request.add_header("Idempotency-Key", key)
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def post_batch_raw_duplicate_key(self, body: bytes, key: str) -> tuple[int, bytes]:
+        # http.client 不支持同名头重复，改用原始套接字发送两份幂等头。
+        raw = (
+            b"POST /v1/evaluation-batches HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Type: application/json\r\n"
+            + f"Idempotency-Key: {key}\r\n".encode()
+            + f"Idempotency-Key: {key}\r\n".encode()
+            + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+            + body
+        )
+        with socket.create_connection(("127.0.0.1", self.server.server_port), timeout=5) as sock:
+            sock.sendall(raw)
+            chunks = []
+            while True:
+                part = sock.recv(65536)
+                if not part:
+                    break
+                chunks.append(part)
+        response = b"".join(chunks)
+        head, _, payload = response.partition(b"\r\n\r\n")
+        status_line = head.split(b"\r\n", 1)[0]
+        return int(status_line.split()[1]), payload
+
+    def get_batch(self, path: str) -> tuple[int, object]:
+        try:
+            with urlopen(self.url(path), timeout=5) as response:
+                return response.status, json.loads(response.read())
+        except HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    def get_evaluations(
+        self, query: str = "", sla_id: str = "sla-1"
+    ) -> tuple[int, object]:
+        suffix = f"?{query}" if query else ""
+        try:
+            with urlopen(
+                self.url(f"/v1/slas/{sla_id}/evaluations{suffix}"), timeout=5
+            ) as response:
+                return response.status, json.loads(response.read())
+        except HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    def post_evaluation(
+        self, sla_id: str = "sla-1", idempotency_key: str = "eval-1"
+    ) -> tuple[int, bytes]:
+        body = json.dumps(
+            {"from": self.start * 1000, "to": self.end * 1000}
+        ).encode()
+        request = Request(
+            self.url(f"/v1/slas/{sla_id}/evaluations"), data=body, method="POST"
+        )
+        request.add_header("Idempotency-Key", idempotency_key)
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def make_active_pair(self) -> int:
+        self.activate()
+        self.create_sla("sla-2", "sla-create-2")
+        self.activate("sla-2")
+        return self.start * 1000
+
+    def test_batch_creates_consecutive_evaluations_on_shared_cut(self) -> None:
+        base = self.make_active_pair()
+        self.add_event(1, base + 100, 10)
+        self.add_event(2, base + 200, 99, sla_id="sla-2")
+        items = [
+            {"slaId": "sla-1", "from": base, "to": base + 400},
+            {"slaId": "sla-2", "from": base, "to": base + 400},
+        ]
+        before = int(time.time() * 1000)
+        status, body = self.post_batch(self.batch_body(items=items))
+        after = int(time.time() * 1000)
+        self.assertEqual(status, 201)
+        payload = json.loads(body)
+        self.assertEqual(list(payload), ["id", "createdAt", "evaluations"])
+        self.assertEqual(payload["id"], "batch-1")
+        self.assertTrue(before <= payload["createdAt"] <= after)
+        self.assertEqual(len(payload["evaluations"]), 2)
+        for item in payload["evaluations"]:
+            self.assertEqual(
+                list(item),
+                [
+                    "slaId",
+                    "evaluationSeq",
+                    "from",
+                    "to",
+                    "cut",
+                    "count",
+                    "latencySum",
+                    "maxLatency",
+                    "violations",
+                    "outcome",
+                    "createdAt",
+                ],
+            )
+            self.assertEqual(item["createdAt"], payload["createdAt"])
+            self.assertEqual(item["cut"], 2)
+        first, second = payload["evaluations"]
+        self.assertEqual((first["slaId"], first["evaluationSeq"]), ("sla-1", 1))
+        self.assertEqual((second["slaId"], second["evaluationSeq"]), ("sla-2", 2))
+        self.assertEqual(
+            {key: value for key, value in first.items()
+             if key not in ("slaId", "evaluationSeq", "createdAt")},
+            {
+                "from": base,
+                "to": base + 400,
+                "cut": 2,
+                "count": 1,
+                "latencySum": 10,
+                "maxLatency": 10,
+                "violations": 0,
+                "outcome": "fulfilled",
+            },
+        )
+        self.assertEqual(
+            {key: value for key, value in second.items()
+             if key not in ("slaId", "evaluationSeq", "createdAt")},
+            {
+                "from": base,
+                "to": base + 400,
+                "cut": 2,
+                "count": 1,
+                "latencySum": 99,
+                "maxLatency": 99,
+                "violations": 1,
+                "outcome": "breached",
+            },
+        )
+
+    def test_batch_items_enter_sla_pagination_and_settlement(self) -> None:
+        base = self.make_active_pair()
+        items = [
+            {"slaId": "sla-1", "from": base, "to": base + 400},
+            {"slaId": "sla-2", "from": base, "to": base + 400},
+        ]
+        status, body = self.post_batch(self.batch_body(items=items))
+        self.assertEqual(status, 201)
+        evaluations = json.loads(body)["evaluations"]
+        # 批内评估立即进入既有 SLA 评估分页。
+        status, page1 = self.get_evaluations(sla_id="sla-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["evaluationSeq"] for item in page1["evaluations"]],
+            [evaluations[0]["evaluationSeq"]],
+        )
+        self.assertEqual(page1["evaluations"][0]["outcome"], "insufficient")
+        status, page2 = self.get_evaluations(sla_id="sla-2")
+        self.assertEqual(
+            [item["evaluationSeq"] for item in page2["evaluations"]],
+            [evaluations[1]["evaluationSeq"]],
+        )
+        # 单笔评估在批次之后继续分配全库序号。
+        status, single = self.post_evaluation(idempotency_key="eval-after")
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(single)["evaluationSeq"], 3)
+        # 批内评估可被单笔结算引用（insufficient 记零金额 pending）。
+        request = Request(
+            self.url("/v1/settlements"),
+            data=json.dumps(
+                {"slaId": "sla-1", "evaluationSeq": evaluations[0]["evaluationSeq"]}
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "settle-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+            settlement = json.loads(response.read())
+        self.assertEqual(settlement["result"], "pending")
+        self.assertEqual(settlement["evaluationSeq"], evaluations[0]["evaluationSeq"])
+
+    def test_sealed_item_uses_seal_cut_active_item_uses_batch_cut(self) -> None:
+        base = self.make_active_pair()
+        self.add_event(1, base + 100, 10)
+        self.expire("sla-1")
+        seal = self.seal("sla-1")
+        self.assertEqual(seal["sealCut"], 1)
+        # 封存后全库继续推进 commit_seq：active 项取事务起点全库最大值。
+        self.add_event(2, base + 200, 20, sla_id="sla-2")
+        items = [
+            {"slaId": "sla-1", "from": base, "to": base + 400},
+            {"slaId": "sla-2", "from": base, "to": base + 400},
+        ]
+        status, body = self.post_batch(self.batch_body(items=items))
+        self.assertEqual(status, 201)
+        first, second = json.loads(body)["evaluations"]
+        self.assertEqual(first["cut"], 1)
+        self.assertEqual(first["count"], 1)
+        self.assertEqual(second["cut"], 2)
+        self.assertEqual(second["count"], 1)
+
+    def test_get_batch_roundtrip_and_errors(self) -> None:
+        base = self.make_active_pair()
+        items = [{"slaId": "sla-1", "from": base, "to": base + 400}]
+        status, body = self.post_batch(self.batch_body(items=items))
+        self.assertEqual(status, 201)
+        status, fetched = self.get_batch("/v1/evaluation-batches/batch-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(fetched, json.loads(body))
+        status, fetched = self.get_batch("/v1/evaluation-batches/batch-1?x=1")
+        self.assertEqual(status, 400)
+        self.assertEqual(fetched, {"error": "invalid_request"})
+        status, fetched = self.get_batch("/v1/evaluation-batches/BAD")
+        self.assertEqual(status, 404)
+        self.assertEqual(fetched, {"error": "not_found"})
+        status, fetched = self.get_batch("/v1/evaluation-batches/missing")
+        self.assertEqual(status, 404)
+        self.assertEqual(fetched, {"error": "not_found"})
+
+    def test_header_and_query_validation_precedes_resources(self) -> None:
+        body = self.batch_body()
+        status, _ = self.post_batch(body, key=None)
+        self.assertEqual(status, 400)
+        status, _ = self.post_batch(body, key="bad key!")
+        self.assertEqual(status, 400)
+        status, _ = self.post_batch_raw_duplicate_key(body, "batch-key-1")
+        self.assertEqual(status, 400)
+        status, _ = self.post_batch(body, query="x=1")
+        self.assertEqual(status, 400)
+        # 头与查询参数非法不查询任何资源、不留幂等记录：补正后同键可成功。
+        self.activate()
+        status, _ = self.post_batch(body)
+        self.assertEqual(status, 201)
+
+    def test_invalid_bodies(self) -> None:
+        self.activate()
+        valid_item = {"slaId": "sla-1", "from": 0, "to": 1}
+        cases = [
+            b"not-json",
+            json.dumps([]).encode(),
+            json.dumps({"id": "batch-1"}).encode(),
+            json.dumps({"items": [valid_item]}).encode(),
+            json.dumps({"id": "batch-1", "items": [valid_item], "x": 1}).encode(),
+            json.dumps({"id": "BAD", "items": [valid_item]}).encode(),
+            json.dumps({"id": "batch-1", "items": []}).encode(),
+            json.dumps({"id": "batch-1", "items": "x"}).encode(),
+            json.dumps({"id": "batch-1", "items": [valid_item] * 101}).encode(),
+            json.dumps({"id": "batch-1", "items": [{"slaId": "sla-1", "from": 0}]}).encode(),
+            json.dumps(
+                {"id": "batch-1", "items": [{**valid_item, "extra": 1}]}
+            ).encode(),
+            json.dumps(
+                {"id": "batch-1", "items": [{"slaId": "BAD", "from": 0, "to": 1}]}
+            ).encode(),
+            json.dumps(
+                {"id": "batch-1", "items": [{"slaId": "sla-1", "from": True, "to": 1}]}
+            ).encode(),
+            json.dumps(
+                {"id": "batch-1", "items": [{"slaId": "sla-1", "from": 0, "to": "1"}]}
+            ).encode(),
+            # 批内重复同一 (slaId,from,to) 组合。
+            json.dumps({"id": "batch-1", "items": [valid_item, valid_item]}).encode(),
+        ]
+        for body in cases:
+            status, payload = self.post_batch(body, key=f"bad-{cases.index(body)}")
+            self.assertEqual(status, 400, body)
+            self.assertEqual(json.loads(payload), {"error": "invalid_request"})
+        # 全部失败均不分配序号：随后合法批次从 1 开始。
+        status, body = self.post_batch(key="batch-key-good")
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(body)["evaluations"][0]["evaluationSeq"], 1)
+
+    def test_same_key_same_request_replays_first_bytes(self) -> None:
+        self.activate()
+        status, body = self.post_batch()
+        self.assertEqual(status, 201)
+        for _ in range(2):
+            again_status, again_body = self.post_batch()
+            self.assertEqual((again_status, again_body), (status, body))
+        self.restart()
+        again_status, again_body = self.post_batch()
+        self.assertEqual((again_status, again_body), (status, body))
+
+    def test_same_key_different_request_conflicts(self) -> None:
+        self.activate()
+        status, _ = self.post_batch()
+        self.assertEqual(status, 201)
+        # 同键更换批次 id。
+        status, payload = self.post_batch(self.batch_body(batch_id="batch-2"))
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "conflict"})
+        # 同键同批次 id 但正文不同。
+        other = self.batch_body(
+            items=[{"slaId": "sla-1", "from": 0, "to": self.end * 1000}]
+        )
+        status, payload = self.post_batch(other)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "conflict"})
+
+    def test_different_key_same_batch_id_is_batch_exists(self) -> None:
+        self.activate()
+        status, _ = self.post_batch()
+        self.assertEqual(status, 201)
+        status, payload = self.post_batch(key="batch-key-2")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "batch_exists"})
+
+    def test_first_missing_sla_is_404_and_retry_after_fix(self) -> None:
+        self.activate()
+        base = self.start * 1000
+        items = [
+            {"slaId": "sla-1", "from": base, "to": base + 400},
+            {"slaId": "missing", "from": base, "to": base + 400},
+        ]
+        status, payload = self.post_batch(self.batch_body(items=items))
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(payload), {"error": "not_found"})
+        # 失败不保存批次、评估或幂等结果，也不分配序号。
+        status, fetched = self.get_batch("/v1/evaluation-batches/batch-1")
+        self.assertEqual(status, 404)
+        status, page = self.get_evaluations()
+        self.assertEqual(page["evaluations"], [])
+        # 条件补正后原键可重试。
+        self.create_sla("missing", "sla-create-2")
+        self.activate("missing")
+        status, body = self.post_batch(self.batch_body(items=items))
+        self.assertEqual(status, 201)
+        self.assertEqual(
+            [item["evaluationSeq"] for item in json.loads(body)["evaluations"]],
+            [1, 2],
+        )
+
+    def test_first_invalid_item_conflicts_in_input_order(self) -> None:
+        base = self.start * 1000
+        # sla-1 仍为 pending：状态非 active/sealed 的首个失败项为 409。
+        items = [
+            {"slaId": "missing", "from": base, "to": base + 400},
+            {"slaId": "sla-1", "from": base, "to": base + 400},
+        ]
+        status, payload = self.post_batch(self.batch_body(items=items))
+        self.assertEqual(status, 404)
+        items.reverse()
+        status, payload = self.post_batch(self.batch_body(items=items))
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "conflict"})
+        self.activate()
+        # 区间越界（from>=to、超出 SLA 窗口）均为 409。
+        for interval in (
+            {"from": base + 400, "to": base + 400},
+            {"from": base - 1, "to": base + 400},
+            {"from": base, "to": self.end * 1000 + 1},
+        ):
+            status, payload = self.post_batch(
+                self.batch_body(items=[{"slaId": "sla-1", **interval}]),
+                key=f"range-{interval['from']}",
+            )
+            self.assertEqual(status, 409, interval)
+            self.assertEqual(json.loads(payload), {"error": "conflict"})
+        # 失败不消耗序号：合法批次仍从 1 开始。
+        status, body = self.post_batch(key="batch-key-good")
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(body)["evaluations"][0]["evaluationSeq"], 1)
+
+    def test_concurrent_same_key_replays_single_creation(self) -> None:
+        self.activate()
+        body = self.batch_body()
+        results: list[tuple[int, bytes]] = []
+        lock = threading.Lock()
+
+        def create() -> None:
+            status, payload = self.post_batch(body)
+            with lock:
+                results.append((status, payload))
+
+        threads = [threading.Thread(target=create) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(len(results), 8)
+        first = results[0]
+        self.assertEqual(first[0], 201)
+        for result in results:
+            self.assertEqual(result, first)
+        # 并发批次与单笔评估混排不产生重复序号。
+        status, single = self.post_evaluation(idempotency_key="eval-after")
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(single)["evaluationSeq"], 2)
+
+
 class TelemetrySealTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
