@@ -256,6 +256,27 @@ CREATE TABLE IF NOT EXISTS dispute_idempotency_records (
     status INTEGER NOT NULL,
     response_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS dispute_batches (
+    id TEXT PRIMARY KEY,
+    created_at_ms INTEGER NOT NULL,
+    response_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS dispute_batch_items (
+    batch_id TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    dispute_id TEXT NOT NULL,
+    settlement_seq INTEGER NOT NULL,
+    PRIMARY KEY (batch_id, position)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_dispute_batch_items_dispute
+ON dispute_batch_items(dispute_id);
+CREATE TABLE IF NOT EXISTS dispute_batch_idempotency_records (
+    key TEXT PRIMARY KEY,
+    batch_id TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    response_json TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS dispute_resolution_idempotency_records (
     key TEXT PRIMARY KEY,
     dispute_id TEXT NOT NULL,
