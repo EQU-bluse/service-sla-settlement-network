@@ -256,6 +256,18 @@ CREATE TABLE IF NOT EXISTS dispute_idempotency_records (
     status INTEGER NOT NULL,
     response_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS dispute_batches (
+    id TEXT PRIMARY KEY,
+    created_at_ms INTEGER NOT NULL,
+    response_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS dispute_batch_idempotency_records (
+    key TEXT PRIMARY KEY,
+    batch_id TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    response_json TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS dispute_resolution_idempotency_records (
     key TEXT PRIMARY KEY,
     dispute_id TEXT NOT NULL,

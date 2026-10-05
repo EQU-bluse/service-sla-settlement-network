@@ -7694,6 +7694,741 @@ class DisputeTests(unittest.TestCase):
         )
 
 
+class DisputeBatchTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.database_path = str(Path(self.temporary.name) / "service.db")
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = self.database_path
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.machine_id = machine_id(PUBLIC_KEY_A)
+        self.consumer_id = machine_id(PUBLIC_KEY_B)
+        for key, public_key in (("register-1", PUBLIC_KEY_A), ("register-2", PUBLIC_KEY_B)):
+            request = Request(
+                self.url("/v1/machines"),
+                data=json.dumps({"publicKey": public_key}).encode(),
+                method="POST",
+            )
+            request.add_header("Idempotency-Key", key)
+            with urlopen(request, timeout=5) as response:
+                self.assertEqual(response.status, 201)
+        request = Request(
+            self.url(f"/v1/machines/{self.machine_id}/capabilities"),
+            data=json.dumps(
+                {
+                    "expectedVersion": 0,
+                    "name": "pump-01",
+                    "protocol": "mqtt",
+                    "region": "cn",
+                    "unit": "call",
+                    "capacity": 10,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "cap-1")
+        add_sla_auth(request, self.server)
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        request = Request(
+            self.url("/v1/sla-templates"),
+            data=json.dumps(
+                {
+                    "id": "tpl-1",
+                    "machineId": self.machine_id,
+                    "capabilityVersion": 1,
+                    "priceMicros": 1000,
+                    "maxLatencyMs": 50,
+                }
+            ).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "tpl-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+        current = int(time.time())
+        self.start = current - 10
+        self.end = current + 3600
+        self.create_sla("sla-1", "sla-create-1")
+        self.activate("sla-1")
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temporary.cleanup()
+
+    def url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}{path}"
+
+    def request_json(
+        self, method: str, path: str, body: bytes | None, headers: dict[str, str] | None = None
+    ) -> tuple[int, bytes]:
+        request = Request(self.url(path), data=body, method=method)
+        if headers:
+            for name, value in headers.items():
+                request.add_header(name, value)
+        try:
+            with urlopen(request, timeout=10) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def post_json(
+        self, path: str, payload: object, key: str | None
+    ) -> tuple[int, bytes]:
+        data = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+        request = Request(self.url(path), data=data, method="POST")
+        if key is not None:
+            request.add_header("Idempotency-Key", key)
+        add_sla_auth(request, self.server)
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def get_json(self, path: str) -> tuple[int, dict]:
+        try:
+            with urlopen(self.url(path), timeout=5) as response:
+                return response.status, json.load(response)
+        except HTTPError as error:
+            return error.code, json.load(error)
+
+    def create_sla(self, sla_id: str, key: str) -> None:
+        status, _ = self.post_json(
+            "/v1/slas",
+            {
+                "id": sla_id,
+                "templateId": "tpl-1",
+                "consumerId": self.consumer_id,
+                "start": self.start,
+                "end": self.end,
+            },
+            key,
+        )
+        self.assertEqual(status, 201)
+
+    def activate(self, sla_id: str) -> None:
+        for index, (party, actor) in enumerate(
+            (
+                ("producer", self.machine_id),
+                ("consumer", self.consumer_id),
+            )
+        ):
+            status, _ = self.post_json(
+                f"/v1/slas/{sla_id}/confirmations",
+                {"party": party, "actorId": actor},
+                f"conf-{sla_id}-{index}",
+            )
+            self.assertEqual(status, 200)
+
+    def add_event(self, sla_id: str, index: int, latency_ms: int) -> None:
+        event_id = f"evt-{sla_id}-{index}"
+        timestamp = self.start * 1000 + index
+        digest = hashlib.sha256(
+            f"{sla_id}\n{event_id}\n{timestamp}\n{latency_ms}\n{self.machine_id}".encode()
+        ).hexdigest()
+        status, _ = self.post_json(
+            f"/v1/slas/{sla_id}/telemetry",
+            {
+                "eventId": event_id,
+                "timestamp": timestamp,
+                "latencyMs": latency_ms,
+                "digest": digest,
+                "keyVersion": 1,
+                "signature": telemetry_signature(
+                    PRODUCER_SEED, sla_id, event_id, timestamp, latency_ms, digest,
+                    self.machine_id,
+                ),
+            },
+            f"tel-{sla_id}-{index}",
+        )
+        self.assertEqual(status, 201)
+
+    def evaluate(self, sla_id: str, key: str) -> int:
+        status, body = self.post_json(
+            f"/v1/slas/{sla_id}/evaluations",
+            {"from": self.start * 1000, "to": self.end * 1000},
+            key,
+        )
+        self.assertEqual(status, 201)
+        return json.loads(body)["evaluationSeq"]
+
+    def deposit(self, account: str, amount: int, key: str) -> None:
+        status, _ = self.post_json(
+            f"/v1/funds/{account}",
+            {"amountMicros": amount, "reference": f"ref-{key}"},
+            key,
+        )
+        self.assertEqual(status, 201)
+
+    def settle(self, sla_id: str, evaluation_seq: int, key: str) -> dict:
+        status, body = self.post_json(
+            "/v1/settlements",
+            {"slaId": sla_id, "evaluationSeq": evaluation_seq},
+            key,
+        )
+        self.assertEqual(status, 201)
+        return json.loads(body)
+
+    def create_charged_settlement(self, tag: int) -> dict:
+        self.add_event("sla-1", tag, 10)
+        evaluation_seq = self.evaluate("sla-1", f"eval-{tag}")
+        self.deposit(self.consumer_id, 100000, f"fund-{tag}")
+        settlement = self.settle("sla-1", evaluation_seq, f"settle-{tag}")
+        self.assertEqual(settlement["result"], "charged")
+        return settlement
+
+    def create_pending_settlement(self, tag: int) -> dict:
+        sla_id = f"sla-pending-{tag}"
+        self.create_sla(sla_id, f"sla-create-pending-{tag}")
+        self.activate(sla_id)
+        evaluation_seq = self.evaluate(sla_id, f"eval-pending-{tag}")
+        settlement = self.settle(sla_id, evaluation_seq, f"settle-pending-{tag}")
+        self.assertEqual(settlement["result"], "pending")
+        self.assertEqual(settlement["amount"], 0)
+        return settlement
+
+    def batch_body(self, batch_id: str, items: list[dict]) -> bytes:
+        return json.dumps({"id": batch_id, "items": items}).encode()
+
+    def batch_item(
+        self, dispute_id: str, settlement_seq: int, claimant_id: str | None = None
+    ) -> dict:
+        return {
+            "id": dispute_id,
+            "settlementSeq": settlement_seq,
+            "claimantId": claimant_id or self.consumer_id,
+        }
+
+    def post_batch(
+        self,
+        body: bytes,
+        key: str | None = "batch-1",
+        duplicate_key: bool = False,
+        path: str = "/v1/dispute-batches",
+    ) -> tuple[int, bytes]:
+        if duplicate_key:
+            # http.client 不支持同名头重复，改用原始套接字发送两份幂等头。
+            return self.post_batch_raw_duplicate_key(body, key or "batch-1")
+        headers = {"Idempotency-Key": key} if key is not None else None
+        return self.request_json("POST", path, body, headers)
+
+    def post_batch_raw_duplicate_key(self, body: bytes, key: str) -> tuple[int, bytes]:
+        raw = (
+            b"POST /v1/dispute-batches HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Type: application/json\r\n"
+            + f"Idempotency-Key: {key}\r\n".encode()
+            + f"Idempotency-Key: {key}\r\n".encode()
+            + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+            + body
+        )
+        with socket.create_connection(("127.0.0.1", self.server.server_port), timeout=5) as sock:
+            sock.sendall(raw)
+            chunks = []
+            while True:
+                part = sock.recv(65536)
+                if not part:
+                    break
+                chunks.append(part)
+        response = b"".join(chunks)
+        head, _, payload = response.partition(b"\r\n\r\n")
+        status_line = head.split(b"\r\n", 1)[0]
+        return int(status_line.split()[1]), payload
+
+    def dispute_state(self, dispute_id: str) -> tuple[int, dict]:
+        return self.get_json(f"/v1/disputes/{dispute_id}")
+
+    def dispute_events(self, dispute_id: str) -> list[dict]:
+        status, payload = self.get_json(f"/v1/disputes/{dispute_id}/events")
+        self.assertEqual(status, 200)
+        return payload["events"]
+
+    def test_batch_creates_disputes_in_order_with_shared_created_at(self) -> None:
+        first = self.create_charged_settlement(1)
+        second = self.create_charged_settlement(2)
+        items = [
+            self.batch_item("dispute-1", first["settlementSeq"]),
+            self.batch_item("dispute-2", second["settlementSeq"]),
+        ]
+        status, raw = self.post_batch(self.batch_body("batch-1", items))
+        self.assertEqual(status, 201)
+        payload = json.loads(raw)
+        self.assertEqual(list(payload), ["id", "createdAt", "disputes"])
+        self.assertEqual(payload["id"], "batch-1")
+        disputes = payload["disputes"]
+        self.assertEqual(len(disputes), 2)
+        self.assertEqual(
+            [list(item) for item in disputes],
+            [["id", "settlementSeq", "open", "amount"]] * 2,
+        )
+        self.assertEqual(
+            disputes,
+            [
+                {
+                    "id": "dispute-1",
+                    "settlementSeq": first["settlementSeq"],
+                    "open": True,
+                    "amount": first["amount"],
+                },
+                {
+                    "id": "dispute-2",
+                    "settlementSeq": second["settlementSeq"],
+                    "open": True,
+                    "amount": second["amount"],
+                },
+            ],
+        )
+        self.assertFalse(raw.endswith(b"\n"))
+        # 批内争议出现在既有单笔查询与事件入口中。
+        for item, settlement in zip(disputes, (first, second)):
+            status, dispute = self.dispute_state(item["id"])
+            self.assertEqual(status, 200)
+            self.assertEqual(dispute["state"], "open")
+            self.assertEqual(dispute["settlementSeq"], settlement["settlementSeq"])
+            self.assertEqual(dispute["claimantId"], self.consumer_id)
+            events = self.dispute_events(item["id"])
+            self.assertEqual([event["type"] for event in events], ["opened"])
+            self.assertEqual(events[0]["createdAt"], payload["createdAt"])
+        # 事件序号与单笔入口共享同一全库序号空间，批内按输入顺序连续分配。
+        self.assertEqual(
+            self.dispute_events("dispute-2")[0]["eventSeq"],
+            self.dispute_events("dispute-1")[0]["eventSeq"] + 1,
+        )
+        status, fetched = self.request_json("GET", "/v1/dispute-batches/batch-1", None)
+        self.assertEqual(status, 200)
+        self.assertEqual(fetched, raw)
+
+    def test_batch_replay_same_key_returns_first_bytes(self) -> None:
+        settlement = self.create_charged_settlement(1)
+        body = self.batch_body(
+            "batch-1", [self.batch_item("dispute-1", settlement["settlementSeq"])]
+        )
+        status, first = self.post_batch(body)
+        self.assertEqual(status, 201)
+        status, replay = self.post_batch(body)
+        self.assertEqual(status, 201)
+        self.assertEqual(replay, first)
+        self.assertEqual(len(self.dispute_events("dispute-1")), 1)
+
+    def test_batch_same_key_different_request_conflicts(self) -> None:
+        first = self.create_charged_settlement(1)
+        second = self.create_charged_settlement(2)
+        body = self.batch_body(
+            "batch-1", [self.batch_item("dispute-1", first["settlementSeq"])]
+        )
+        self.assertEqual(self.post_batch(body)[0], 201)
+        changed_id = self.batch_body(
+            "batch-2", [self.batch_item("dispute-1", first["settlementSeq"])]
+        )
+        status, payload = self.post_batch(changed_id)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "conflict"})
+        changed_body = self.batch_body(
+            "batch-1", [self.batch_item("dispute-2", second["settlementSeq"])]
+        )
+        status, payload = self.post_batch(changed_body)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "conflict"})
+
+    def test_batch_different_key_same_batch_id_is_batch_exists(self) -> None:
+        first = self.create_charged_settlement(1)
+        second = self.create_charged_settlement(2)
+        body = self.batch_body(
+            "batch-1", [self.batch_item("dispute-1", first["settlementSeq"])]
+        )
+        self.assertEqual(self.post_batch(body)[0], 201)
+        other = self.batch_body(
+            "batch-1", [self.batch_item("dispute-2", second["settlementSeq"])]
+        )
+        status, payload = self.post_batch(other, key="batch-2")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "batch_exists"})
+
+    def test_batch_invalid_requests(self) -> None:
+        settlement = self.create_charged_settlement(1)
+        valid_item = self.batch_item("dispute-1", settlement["settlementSeq"])
+        cases = [
+            b"",
+            b"{not json",
+            json.dumps({}).encode(),
+            json.dumps({"id": "batch-1"}).encode(),
+            json.dumps({"items": [valid_item]}).encode(),
+            json.dumps({"id": "batch-1", "items": [valid_item], "extra": 1}).encode(),
+            json.dumps({"id": "BAD ID", "items": [valid_item]}).encode(),
+            json.dumps({"id": 1, "items": [valid_item]}).encode(),
+            json.dumps({"id": "batch-1", "items": {}}).encode(),
+            json.dumps({"id": "batch-1", "items": []}).encode(),
+            json.dumps(
+                {
+                    "id": "batch-1",
+                    "items": [
+                        self.batch_item(f"dispute-{index}", index + 1)
+                        for index in range(101)
+                    ],
+                }
+            ).encode(),
+            json.dumps({"id": "batch-1", "items": ["x"]}).encode(),
+            json.dumps({"id": "batch-1", "items": [{"id": "dispute-1"}]}).encode(),
+            json.dumps(
+                {"id": "batch-1", "items": [dict(valid_item, extra=1)]}
+            ).encode(),
+            json.dumps(
+                {
+                    "id": "batch-1",
+                    "items": [self.batch_item("BAD ID", settlement["settlementSeq"])],
+                }
+            ).encode(),
+            json.dumps(
+                {"id": "batch-1", "items": [self.batch_item("dispute-1", 0)]}
+            ).encode(),
+            json.dumps(
+                {"id": "batch-1", "items": [self.batch_item("dispute-1", True)]}
+            ).encode(),
+            json.dumps(
+                {"id": "batch-1", "items": [self.batch_item("dispute-1", "1")]}
+            ).encode(),
+            json.dumps(
+                {
+                    "id": "batch-1",
+                    "items": [self.batch_item("dispute-1", settlement["settlementSeq"], "zz")],
+                }
+            ).encode(),
+            # 批内争议 id 重复。
+            json.dumps(
+                {
+                    "id": "batch-1",
+                    "items": [
+                        self.batch_item("dispute-1", settlement["settlementSeq"]),
+                        self.batch_item("dispute-1", 999),
+                    ],
+                }
+            ).encode(),
+            # 批内结算序号重复。
+            json.dumps(
+                {
+                    "id": "batch-1",
+                    "items": [
+                        self.batch_item("dispute-1", settlement["settlementSeq"]),
+                        self.batch_item("dispute-2", settlement["settlementSeq"]),
+                    ],
+                }
+            ).encode(),
+        ]
+        for index, body in enumerate(cases):
+            status, payload = self.post_batch(body, key=f"bad-{index}")
+            self.assertEqual(status, 400, body)
+            self.assertEqual(json.loads(payload), {"error": "invalid_request"})
+        # 缺失、格式非法或重复的 Idempotency-Key 均为 400。
+        status, payload = self.post_batch(self.batch_body("batch-1", [valid_item]), key=None)
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(payload), {"error": "invalid_request"})
+        status, payload = self.post_batch(
+            self.batch_body("batch-1", [valid_item]), key="bad key"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(payload), {"error": "invalid_request"})
+        status, payload = self.post_batch(
+            self.batch_body("batch-1", [valid_item]), duplicate_key=True
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(payload), {"error": "invalid_request"})
+        # 不接受任何查询参数。
+        status, payload = self.post_batch(
+            self.batch_body("batch-1", [valid_item]),
+            path="/v1/dispute-batches?x=1",
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(payload), {"error": "invalid_request"})
+        # 全部失败不留任何记录：同批次 id 与合法正文随后可正常创建。
+        status, _ = self.post_batch(self.batch_body("batch-1", [valid_item]), key="ok-1")
+        self.assertEqual(status, 201)
+
+    def test_batch_item_missing_settlement_is_not_found_and_atomic(self) -> None:
+        settlement = self.create_charged_settlement(1)
+        body = self.batch_body(
+            "batch-1",
+            [
+                self.batch_item("dispute-1", settlement["settlementSeq"]),
+                self.batch_item("dispute-2", 999),
+            ],
+        )
+        status, payload = self.post_batch(body)
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(payload), {"error": "not_found"})
+        # 整批回滚：无争议、无事件、无批次、无幂等记录。
+        status, _ = self.dispute_state("dispute-1")
+        self.assertEqual(status, 404)
+        status, _ = self.request_json("GET", "/v1/dispute-batches/batch-1", None)
+        self.assertEqual(status, 404)
+        # 失败不消耗事件序号：后续单笔争议的 opened 事件仍取序号 1。
+        second = self.create_charged_settlement(2)
+        status, _ = self.post_json(
+            "/v1/disputes",
+            {
+                "id": "dispute-9",
+                "settlementSeq": second["settlementSeq"],
+                "claimantId": self.consumer_id,
+            },
+            "dispute-9",
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(self.dispute_events("dispute-9")[0]["eventSeq"], 1)
+        # 未留幂等记录：同键补正后可重试成功（second 已被上一单笔争议占用，
+        # 改用新结算 third）。
+        third = self.create_charged_settlement(3)
+        body = self.batch_body(
+            "batch-1",
+            [
+                self.batch_item("dispute-1", settlement["settlementSeq"]),
+                self.batch_item("dispute-2", third["settlementSeq"]),
+            ],
+        )
+        status, _ = self.post_batch(body)
+        self.assertEqual(status, 201)
+
+    def test_batch_item_claimant_not_payer_is_forbidden(self) -> None:
+        settlement = self.create_charged_settlement(1)
+        body = self.batch_body(
+            "batch-1",
+            [self.batch_item("dispute-1", settlement["settlementSeq"], self.machine_id)],
+        )
+        status, payload = self.post_batch(body)
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(payload), {"error": "forbidden"})
+        status, _ = self.dispute_state("dispute-1")
+        self.assertEqual(status, 404)
+
+    def test_batch_item_pending_settlement_conflicts(self) -> None:
+        charged = self.create_charged_settlement(1)
+        pending = self.create_pending_settlement(1)
+        body = self.batch_body(
+            "batch-1",
+            [
+                self.batch_item("dispute-1", charged["settlementSeq"]),
+                self.batch_item("dispute-2", pending["settlementSeq"]),
+            ],
+        )
+        status, payload = self.post_batch(body)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "conflict"})
+        status, _ = self.dispute_state("dispute-1")
+        self.assertEqual(status, 404)
+
+    def test_batch_item_occupied_dispute_or_settlement(self) -> None:
+        first = self.create_charged_settlement(1)
+        second = self.create_charged_settlement(2)
+        third = self.create_charged_settlement(3)
+        # 单笔入口先占用 dispute-taken 与第一笔结算。
+        status, _ = self.post_json(
+            "/v1/disputes",
+            {
+                "id": "dispute-taken",
+                "settlementSeq": first["settlementSeq"],
+                "claimantId": self.consumer_id,
+            },
+            "dispute-taken",
+        )
+        self.assertEqual(status, 201)
+        # 争议 id 被占用。
+        status, payload = self.post_batch(
+            self.batch_body(
+                "batch-1",
+                [self.batch_item("dispute-taken", second["settlementSeq"])],
+            )
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "dispute_exists"})
+        # 结算被占用。
+        status, payload = self.post_batch(
+            self.batch_body(
+                "batch-2",
+                [self.batch_item("dispute-2", first["settlementSeq"])],
+            ),
+            key="batch-2",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "dispute_exists"})
+        # 前项合法、后项被占用同样整批失败。
+        status, payload = self.post_batch(
+            self.batch_body(
+                "batch-3",
+                [
+                    self.batch_item("dispute-3", third["settlementSeq"]),
+                    self.batch_item("dispute-4", first["settlementSeq"]),
+                ],
+            ),
+            key="batch-3",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "dispute_exists"})
+        status, _ = self.dispute_state("dispute-3")
+        self.assertEqual(status, 404)
+
+    def test_batch_open_disputes_freeze_payee_funds(self) -> None:
+        charged = self.create_charged_settlement(1)
+        body = self.batch_body(
+            "batch-1", [self.batch_item("dispute-1", charged["settlementSeq"])]
+        )
+        self.assertEqual(self.post_batch(body)[0], 201)
+        # 收款方（生产机器）可用余额被等额冻结：后续赔付结算余额不足。
+        self.add_event("sla-1", 2, 100)
+        breached_eval = self.evaluate("sla-1", "eval-breached")
+        status, payload = self.post_json(
+            "/v1/settlements",
+            {"slaId": "sla-1", "evaluationSeq": breached_eval},
+            "settle-breached",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "insufficient_funds"})
+
+    def test_batch_disputes_usable_in_existing_endpoints(self) -> None:
+        settlement = self.create_charged_settlement(1)
+        body = self.batch_body(
+            "batch-1", [self.batch_item("dispute-1", settlement["settlementSeq"])]
+        )
+        self.assertEqual(self.post_batch(body)[0], 201)
+        status, payload = self.post_json(
+            "/v1/disputes/dispute-1/resolution", {"decision": "release"}, "resolve-1"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            json.loads(payload),
+            {"id": "dispute-1", "released": True, "amount": settlement["amount"]},
+        )
+        status, dispute = self.dispute_state("dispute-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(dispute["state"], "released")
+        status, payload = self.get_json(
+            f"/v1/disputes?accountId={self.consumer_id}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual([item["id"] for item in payload["disputes"]], ["dispute-1"])
+        self.assertEqual(payload["disputes"][0]["state"], "released")
+
+    def test_concurrent_batch_same_key_replays_first_bytes(self) -> None:
+        settlement = self.create_charged_settlement(1)
+        body = self.batch_body(
+            "batch-1", [self.batch_item("dispute-1", settlement["settlementSeq"])]
+        )
+        results: list[bytes] = []
+        lock = threading.Lock()
+
+        def create() -> None:
+            status, payload = self.post_batch(body)
+            self.assertEqual(status, 201)
+            with lock:
+                results.append(payload)
+
+        threads = [threading.Thread(target=create) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual(len(results), 8)
+        self.assertEqual(len(set(results)), 1)
+        self.assertEqual(len(self.dispute_events("dispute-1")), 1)
+
+    def test_concurrent_contention_with_single_dispute_succeeds_once(self) -> None:
+        settlement = self.create_charged_settlement(1)
+        body = self.batch_body(
+            "batch-1", [self.batch_item("dispute-1", settlement["settlementSeq"])]
+        )
+        statuses: list[int] = []
+        lock = threading.Lock()
+
+        def via_batch() -> None:
+            status, _ = self.post_batch(body)
+            with lock:
+                statuses.append(status)
+
+        def via_single(index: int) -> None:
+            status, _ = self.post_json(
+                "/v1/disputes",
+                {
+                    "id": f"dispute-s{index}",
+                    "settlementSeq": settlement["settlementSeq"],
+                    "claimantId": self.consumer_id,
+                },
+                f"dispute-s{index}",
+            )
+            with lock:
+                statuses.append(status)
+
+        threads = [threading.Thread(target=via_batch)]
+        threads.extend(
+            threading.Thread(target=via_single, args=(index,)) for index in range(4)
+        )
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual(sorted(statuses), [201] + [409] * 4)
+
+    def test_concurrent_batches_contending_items_succeed_once(self) -> None:
+        settlement = self.create_charged_settlement(1)
+        statuses: list[int] = []
+        lock = threading.Lock()
+
+        def create(index: int) -> None:
+            body = self.batch_body(
+                f"batch-{index}",
+                [self.batch_item(f"dispute-{index}", settlement["settlementSeq"])],
+            )
+            status, _ = self.post_batch(body, key=f"batch-{index}")
+            with lock:
+                statuses.append(status)
+
+        threads = [threading.Thread(target=create, args=(index,)) for index in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual(sorted(statuses), [201] + [409] * 7)
+
+    def test_get_batch_rejects_query_params_and_unknown_or_invalid_id(self) -> None:
+        settlement = self.create_charged_settlement(1)
+        body = self.batch_body(
+            "batch-1", [self.batch_item("dispute-1", settlement["settlementSeq"])]
+        )
+        self.assertEqual(self.post_batch(body)[0], 201)
+        status, payload = self.request_json(
+            "GET", "/v1/dispute-batches/batch-1?limit=1", None
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(payload), {"error": "invalid_request"})
+        for batch_id in ("missing", quote("BAD ID")):
+            status, payload = self.request_json(
+                "GET", f"/v1/dispute-batches/{batch_id}", None
+            )
+            self.assertEqual(status, 404, batch_id)
+            self.assertEqual(json.loads(payload), {"error": "not_found"})
+
+    def test_batch_replay_survives_restart(self) -> None:
+        settlement = self.create_charged_settlement(1)
+        body = self.batch_body(
+            "batch-1", [self.batch_item("dispute-1", settlement["settlementSeq"])]
+        )
+        status, first = self.post_batch(body)
+        self.assertEqual(status, 201)
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = self.database_path
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        status, replay = self.post_batch(body)
+        self.assertEqual(status, 201)
+        self.assertEqual(replay, first)
+        status, fetched = self.request_json("GET", "/v1/dispute-batches/batch-1", None)
+        self.assertEqual(status, 200)
+        self.assertEqual(fetched, first)
+
+
 class DisputeEventMigrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()

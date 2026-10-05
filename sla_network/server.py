@@ -60,6 +60,7 @@ SETTLEMENT_BATCH_ITEM_PATH_PATTERN = re.compile(
     r"/v1/settlement-batches/([^/]+)"
 )
 DISPUTE_PATH_PATTERN = re.compile(r"/v1/disputes/([^/]+)")
+DISPUTE_BATCH_ITEM_PATH_PATTERN = re.compile(r"/v1/dispute-batches/([^/]+)")
 DISPUTE_EVENTS_PATH_PATTERN = re.compile(r"/v1/disputes/([^/]+)/events")
 DISPUTE_EVIDENCE_PATH_PATTERN = re.compile(r"/v1/disputes/([^/]+)/evidence")
 DISPUTE_EVIDENCE_SNAPSHOTS_PATH_PATTERN = re.compile(
@@ -123,6 +124,9 @@ SETTLEMENT_BATCH_FIELDS = {"id", "items"}
 SETTLEMENT_BATCH_ITEM_FIELDS = {"slaId", "evaluationSeq"}
 SETTLEMENT_BATCH_MAX_ITEMS = 100
 DISPUTE_FIELDS = {"id", "settlementSeq", "claimantId"}
+DISPUTE_BATCH_FIELDS = {"id", "items"}
+DISPUTE_BATCH_ITEM_FIELDS = {"id", "settlementSeq", "claimantId"}
+DISPUTE_BATCH_MAX_ITEMS = 100
 RESOLUTION_FIELDS = {"decision"}
 EVIDENCE_FIELDS = {"evidenceId", "actorId", "observedAt", "digest"}
 EVIDENCE_SNAPSHOT_FIELDS = {"actorId"}
@@ -431,6 +435,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if target.path == "/v1/disputes":
             self._get_disputes(target.query)
+            return
+        dispute_batch_match = DISPUTE_BATCH_ITEM_PATH_PATTERN.fullmatch(target.path)
+        if dispute_batch_match is not None:
+            self._get_dispute_batch(
+                dispute_batch_match.group(1), target.query
+            )
             return
         dispute_events_match = DISPUTE_EVENTS_PATH_PATTERN.fullmatch(target.path)
         if dispute_events_match is not None:
@@ -1911,6 +1921,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/v1/disputes":
             self._create_dispute()
+            return
+        if urlsplit(self.path).path == "/v1/dispute-batches":
+            self._create_dispute_batch()
             return
         evidence_match = DISPUTE_EVIDENCE_PATH_PATTERN.fullmatch(
             urlsplit(self.path).path
@@ -5291,6 +5304,234 @@ class Handler(BaseHTTPRequestHandler):
             except BaseException:
                 database.execute("ROLLBACK")
                 raise
+
+    def _create_dispute_batch(self) -> None:
+        # 批次写入口要求恰好一个合法 Idempotency-Key：缺失、重复或格式非法
+        # 均为 400/invalid_request，且不查询任何资源。
+        values = self.headers.get_all("Idempotency-Key")
+        if values is None or len(values) != 1:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        idempotency_key = values[0]
+        if IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 批量争议不接受任何查询参数：参数校验先于体校验与资源查询。
+        if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        fields = self._read_dispute_batch_object()
+        if fields is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        status, payload = self._apply_dispute_batch(idempotency_key, fields)
+        self._json(status, payload)
+
+    def _read_dispute_batch_object(self) -> dict[str, Any] | None:
+        parsed = self._read_json_object()
+        if parsed is None or set(parsed) != DISPUTE_BATCH_FIELDS:
+            return None
+        batch_id = parsed["id"]
+        if not isinstance(batch_id, str) or TEMPLATE_ID_PATTERN.fullmatch(batch_id) is None:
+            return None
+        items = parsed["items"]
+        if not isinstance(items, list):
+            return None
+        if not 1 <= len(items) <= DISPUTE_BATCH_MAX_ITEMS:
+            return None
+        seen_ids: set[str] = set()
+        seen_settlements: set[int] = set()
+        normalized_items: list[dict[str, Any]] = []
+        for item in items:
+            # 每项完整沿用单笔争议的三个公开字段与取值语义。
+            if not isinstance(item, dict) or set(item) != DISPUTE_BATCH_ITEM_FIELDS:
+                return None
+            dispute_id = item["id"]
+            if not isinstance(dispute_id, str) or TEMPLATE_ID_PATTERN.fullmatch(dispute_id) is None:
+                return None
+            settlement_seq = item["settlementSeq"]
+            if not isinstance(settlement_seq, int) or isinstance(settlement_seq, bool):
+                return None
+            if settlement_seq < 1:
+                return None
+            claimant_id = item["claimantId"]
+            if not isinstance(claimant_id, str) or PUBLIC_KEY_PATTERN.fullmatch(claimant_id) is None:
+                return None
+            # 批内争议 id 与结算序号均不得重复：重复属请求结构非法。
+            if dispute_id in seen_ids or settlement_seq in seen_settlements:
+                return None
+            seen_ids.add(dispute_id)
+            seen_settlements.add(settlement_seq)
+            normalized_items.append(
+                {
+                    "id": dispute_id,
+                    "settlementSeq": settlement_seq,
+                    "claimantId": claimant_id,
+                }
+            )
+        return {"id": batch_id, "items": normalized_items}
+
+    def _apply_dispute_batch(
+        self, idempotency_key: str, fields: dict[str, Any]
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+        batch_id = fields["id"]
+        items = fields["items"]
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                record = database.execute(
+                    "SELECT batch_id, request_json, status, response_json"
+                    " FROM dispute_batch_idempotency_records WHERE key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    if (
+                        record["batch_id"] == batch_id
+                        and record["request_json"] == request_json
+                    ):
+                        return HTTPStatus(record["status"]), json.loads(
+                            record["response_json"]
+                        )
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                existing_batch = database.execute(
+                    "SELECT 1 FROM dispute_batches WHERE id = ?",
+                    (batch_id,),
+                ).fetchone()
+                if existing_batch is not None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "batch_exists"}
+                # 按输入顺序逐项沿用单笔争议判定；批内 id 与结算序号已在
+                # 请求结构校验中去重，这里只与既有争议（单笔或其他批次）比对。
+                planned: list[dict[str, Any]] = []
+                for item in items:
+                    settlement_seq = item["settlementSeq"]
+                    settlement = None
+                    if settlement_seq <= INT64_MAX:
+                        settlement = database.execute(
+                            "SELECT result, amount_micros, payer_id, payee_id"
+                            " FROM settlements WHERE settlement_seq = ?",
+                            (settlement_seq,),
+                        ).fetchone()
+                    if settlement is None:
+                        database.execute("ROLLBACK")
+                        return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                    payer_id = settlement["payer_id"]
+                    if payer_id is not None and item["claimantId"] != payer_id:
+                        database.execute("ROLLBACK")
+                        return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
+                    amount = settlement["amount_micros"]
+                    if settlement["result"] not in DISPUTABLE_RESULTS or amount <= 0:
+                        database.execute("ROLLBACK")
+                        return HTTPStatus.CONFLICT, {"error": "conflict"}
+                    existing = database.execute(
+                        "SELECT 1 FROM disputes WHERE id = ? OR settlement_seq = ?",
+                        (item["id"], settlement_seq),
+                    ).fetchone()
+                    if existing is not None:
+                        database.execute("ROLLBACK")
+                        return HTTPStatus.CONFLICT, {"error": "dispute_exists"}
+                    planned.append(
+                        {
+                            "id": item["id"],
+                            "settlement_seq": settlement_seq,
+                            "claimant_id": item["claimantId"],
+                            "payer_id": settlement["payer_id"],
+                            "payee_id": settlement["payee_id"],
+                            "amount": amount,
+                        }
+                    )
+                # 全部项通过后才取事件序号与时间：任一失败均不消耗序号，
+                # 也不写争议、事件、冻结或幂等结果。
+                next_record = database.execute(
+                    "SELECT COALESCE(MAX(event_seq), 0) + 1 AS next_seq"
+                    " FROM dispute_events"
+                ).fetchone()
+                next_seq = next_record["next_seq"]
+                created_at_ms = int(datetime.now(UTC).timestamp() * 1000)
+                dispute_payloads: list[dict[str, Any]] = []
+                for position, plan in enumerate(planned):
+                    # 冻结仅登记 open 争议，与单笔入口同一口径，不写账本。
+                    database.execute(
+                        "INSERT INTO disputes"
+                        "(id, settlement_seq, claimant_id, payer_id, payee_id,"
+                        " amount_micros, state)"
+                        " VALUES (?, ?, ?, ?, ?, ?, 'open')",
+                        (
+                            plan["id"],
+                            plan["settlement_seq"],
+                            plan["claimant_id"],
+                            plan["payer_id"],
+                            plan["payee_id"],
+                            plan["amount"],
+                        ),
+                    )
+                    # 生命周期事件与单笔入口共享同一全库序号空间，
+                    # 批内按输入顺序连续分配。
+                    database.execute(
+                        "INSERT INTO dispute_events"
+                        "(event_seq, dispute_id, type, created_at_ms)"
+                        " VALUES (?, ?, 'opened', ?)",
+                        (next_seq + position, plan["id"], created_at_ms),
+                    )
+                    dispute_payloads.append(
+                        {
+                            "id": plan["id"],
+                            "settlementSeq": plan["settlement_seq"],
+                            "open": True,
+                            "amount": plan["amount"],
+                        }
+                    )
+                payload = {
+                    "id": batch_id,
+                    "createdAt": created_at_ms,
+                    "disputes": dispute_payloads,
+                }
+                database.execute(
+                    "INSERT INTO dispute_batches"
+                    "(id, created_at_ms, response_json) VALUES (?, ?, ?)",
+                    (
+                        batch_id,
+                        created_at_ms,
+                        json.dumps(payload, separators=(",", ":")),
+                    ),
+                )
+                database.execute(
+                    "INSERT INTO dispute_batch_idempotency_records"
+                    "(key, batch_id, request_json, status, response_json)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        batch_id,
+                        request_json,
+                        int(HTTPStatus.CREATED),
+                        json.dumps(payload, separators=(",", ":")),
+                    ),
+                )
+                database.execute("COMMIT")
+                return HTTPStatus.CREATED, payload
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+
+    def _get_dispute_batch(self, batch_id: str, query: str) -> None:
+        # 读取入口不接受任何查询参数：参数校验先于批次查询。
+        if parse_qsl(query, keep_blank_values=True):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        if TEMPLATE_ID_PATTERN.fullmatch(batch_id) is None:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        with closing(connect(self.server.database_path)) as database:
+            record = database.execute(
+                "SELECT response_json FROM dispute_batches WHERE id = ?",
+                (batch_id,),
+            ).fetchone()
+        if record is None:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        self._json(HTTPStatus.OK, json.loads(record["response_json"]))
 
     def _submit_evidence(self, dispute_id: str) -> None:
         idempotency_key = self.headers.get("Idempotency-Key")
