@@ -6080,7 +6080,7 @@ class SettlementBatchTests(unittest.TestCase):
         with urlopen(request, timeout=5) as response:
             self.assertEqual(response.status, 201)
 
-    def evaluate(self, from_offset_ms: int, to_offset_ms: int) -> int:
+    def evaluate(self, from_offset_ms: int, to_offset_ms: int, sla_id: str = "sla-1") -> int:
         self.eval_counter += 1
         body = json.dumps(
             {
@@ -6088,7 +6088,7 @@ class SettlementBatchTests(unittest.TestCase):
                 "to": self.start * 1000 + to_offset_ms,
             }
         ).encode()
-        request = Request(self.url("/v1/slas/sla-1/evaluations"), data=body, method="POST")
+        request = Request(self.url(f"/v1/slas/{sla_id}/evaluations"), data=body, method="POST")
         request.add_header("Idempotency-Key", f"eval-{self.eval_counter}")
         with urlopen(request, timeout=5) as response:
             self.assertEqual(response.status, 201)
@@ -6143,6 +6143,28 @@ class SettlementBatchTests(unittest.TestCase):
 
     def get_batch(self, path: str) -> tuple[int, bytes]:
         return self.request_json("GET", path, None)
+
+    def list_batches(self, query: str = "") -> tuple[int, bytes]:
+        return self.request_json("GET", f"/v1/settlement-batches{query}", None)
+
+    def make_pending_batch(self, batch_id: str, sla_id: str = "sla-1") -> bytes:
+        eval_seq = self.evaluate(0, 1000, sla_id)
+        status, raw = self.post_batch(
+            self.batch_body(batch_id, [(sla_id, eval_seq)]), key=f"key-{batch_id}"
+        )
+        self.assertEqual(status, 201)
+        return raw
+
+    def post_single_settlement(self, key: str) -> int:
+        eval_seq = self.evaluate(0, 1000)
+        status, raw = self.request_json(
+            "POST",
+            "/v1/settlements",
+            json.dumps({"slaId": "sla-1", "evaluationSeq": eval_seq}).encode(),
+            {"Idempotency-Key": key},
+        )
+        self.assertEqual(status, 201)
+        return json.loads(raw)["settlementSeq"]
 
     def balance(self, account_id: str) -> int:
         connection = sqlite3.connect(self.server.database_path)
@@ -6607,6 +6629,204 @@ class SettlementBatchTests(unittest.TestCase):
             )
         finally:
             connection.close()
+
+    def test_list_batches_empty(self) -> None:
+        status, raw = self.list_batches()
+        self.assertEqual(status, 200)
+        self.assertEqual(raw, b'{"batches":[],"nextCursor":null}')
+
+    def test_list_batches_orders_by_min_seq_and_matches_item_read(self) -> None:
+        first_eval = self.evaluate(0, 1000)
+        second_eval = self.evaluate(0, 1000)
+        status, _ = self.post_batch(
+            self.batch_body(
+                "batch-1", [("sla-1", first_eval), ("sla-1", second_eval)]
+            ),
+            key="key-batch-1",
+        )
+        self.assertEqual(status, 201)
+        self.make_pending_batch("batch-2")
+        # 单笔结算占据序号但不进入批次集合。
+        self.post_single_settlement("single-1")
+        self.make_pending_batch("batch-3")
+        status, raw = self.list_batches()
+        self.assertEqual(status, 200)
+        payload = json.loads(raw)
+        self.assertEqual(list(payload), ["batches", "nextCursor"])
+        self.assertIsNone(payload["nextCursor"])
+        batches = payload["batches"]
+        self.assertEqual(
+            [item["id"] for item in batches], ["batch-1", "batch-2", "batch-3"]
+        )
+        min_seqs = [
+            min(s["settlementSeq"] for s in item["settlements"]) for item in batches
+        ]
+        self.assertEqual(min_seqs, [1, 3, 5])
+        # 每项与按 id 读取的完整对象逐字段一致。
+        for item in batches:
+            status, fetched = self.get_batch(f"/v1/settlement-batches/{item['id']}")
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(fetched), item)
+
+    def test_list_batches_pagination_snapshot_excludes_later_writes(self) -> None:
+        self.make_pending_batch("batch-1")
+        self.make_pending_batch("batch-2")
+        self.make_pending_batch("batch-3")
+        status, raw = self.list_batches("?limit=2")
+        self.assertEqual(status, 200)
+        payload = json.loads(raw)
+        self.assertEqual(
+            [item["id"] for item in payload["batches"]], ["batch-1", "batch-2"]
+        )
+        self.assertEqual(payload["nextCursor"], "3:2")
+        # 快照建立后的新批次与单笔结算不得进入旧快照。
+        self.make_pending_batch("batch-4")
+        self.post_single_settlement("single-late")
+        status, raw = self.list_batches("?limit=2&cursor=3:2")
+        self.assertEqual(status, 200)
+        payload = json.loads(raw)
+        self.assertEqual([item["id"] for item in payload["batches"]], ["batch-3"])
+        self.assertIsNone(payload["nextCursor"])
+        # 新快照能看到全部批次，且不包含单笔结算。
+        status, raw = self.list_batches("?limit=100")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["id"] for item in json.loads(raw)["batches"]],
+            ["batch-1", "batch-2", "batch-3", "batch-4"],
+        )
+
+    def test_list_batches_snapshot_cursor_survives_restart(self) -> None:
+        self.make_pending_batch("batch-1")
+        self.make_pending_batch("batch-2")
+        status, raw = self.list_batches("?limit=1")
+        self.assertEqual(status, 200)
+        payload = json.loads(raw)
+        self.assertEqual([item["id"] for item in payload["batches"]], ["batch-1"])
+        self.assertEqual(payload["nextCursor"], "2:1")
+        self.restart_server()
+        self.make_pending_batch("batch-3")
+        status, raw = self.list_batches("?limit=1&cursor=2:1")
+        self.assertEqual(status, 200)
+        payload = json.loads(raw)
+        self.assertEqual([item["id"] for item in payload["batches"]], ["batch-2"])
+        self.assertIsNone(payload["nextCursor"])
+
+    def test_list_batches_filter_by_sla(self) -> None:
+        self.create_sla("sla-2", "sla-create-2")
+        self.activate("sla-2")
+        self.make_pending_batch("batch-1")
+        self.make_pending_batch("batch-2", sla_id="sla-2")
+        mixed_first = self.evaluate(0, 1000)
+        mixed_second = self.evaluate(0, 1000, "sla-2")
+        status, _ = self.post_batch(
+            self.batch_body(
+                "batch-3", [("sla-1", mixed_first), ("sla-2", mixed_second)]
+            ),
+            key="key-batch-3",
+        )
+        self.assertEqual(status, 201)
+        # 至少含该 SLA 一笔结算的批次按最小序号升序返回。
+        status, raw = self.list_batches("?slaId=sla-2")
+        self.assertEqual(status, 200)
+        payload = json.loads(raw)
+        self.assertEqual(
+            [item["id"] for item in payload["batches"]], ["batch-2", "batch-3"]
+        )
+        self.assertIsNone(payload["nextCursor"])
+        # 匹配批次完整返回全部有序 settlements，不做裁剪。
+        mixed = payload["batches"][1]
+        self.assertEqual(
+            [s["settlementSeq"] for s in mixed["settlements"]], [3, 4]
+        )
+        # 筛选下翻页：锚点为本页末项最小序号，cut 沿用首次读取。
+        status, raw = self.list_batches("?slaId=sla-2&limit=1")
+        self.assertEqual(status, 200)
+        payload = json.loads(raw)
+        self.assertEqual([item["id"] for item in payload["batches"]], ["batch-2"])
+        self.assertEqual(payload["nextCursor"], "4:2")
+        status, raw = self.list_batches("?slaId=sla-2&cursor=4:2")
+        self.assertEqual(status, 200)
+        payload = json.loads(raw)
+        self.assertEqual([item["id"] for item in payload["batches"]], ["batch-3"])
+        self.assertIsNone(payload["nextCursor"])
+        # 锚点批次不含该 SLA：不是当前筛选下的真实锚点。
+        status, payload = self.list_batches("?slaId=sla-2&cursor=4:1")
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(payload), {"error": "invalid_request"})
+        # 存在但无匹配批次的 SLA 返回空页。
+        self.create_sla("sla-3", "sla-create-3")
+        status, raw = self.list_batches("?slaId=sla-3")
+        self.assertEqual(status, 200)
+        self.assertEqual(raw, b'{"batches":[],"nextCursor":null}')
+        # 合法格式但不存在的 SLA 返回 404；非法格式返回 400。
+        status, payload = self.list_batches("?slaId=sla-9")
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(payload), {"error": "not_found"})
+        status, payload = self.list_batches("?slaId=BAD")
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(payload), {"error": "invalid_request"})
+
+    def test_list_batches_invalid_params(self) -> None:
+        self.make_pending_batch("batch-1")
+        bad_queries = [
+            "?foo=1",
+            "?limit=1&limit=2",
+            "?slaId=sla-1&slaId=sla-1",
+            "?cursor=1:1&cursor=1:1",
+            "?limit",
+            "?limit=",
+            "?limit=0",
+            "?limit=101",
+            "?limit=01",
+            "?limit=1.5",
+            "?limit=-1",
+            "?limit=abc",
+            "?cursor",
+            "?cursor=",
+            "?cursor=abc",
+            "?cursor=1",
+            "?cursor=1:2:3",
+            "?cursor=01:1",
+            "?cursor=1:01",
+            "?cursor=1:",
+            "?cursor=:1",
+            "?cursor=1:2",
+            "?cursor=2:1",
+        ]
+        for query in bad_queries:
+            with self.subTest(query=query):
+                status, payload = self.list_batches(query)
+                self.assertEqual(status, 400)
+                self.assertEqual(json.loads(payload), {"error": "invalid_request"})
+
+    def test_list_batches_cursor_anchor_must_be_batch_minimum(self) -> None:
+        first_eval = self.evaluate(0, 1000)
+        second_eval = self.evaluate(0, 1000)
+        status, _ = self.post_batch(
+            self.batch_body(
+                "batch-1", [("sla-1", first_eval), ("sla-1", second_eval)]
+            ),
+            key="key-batch-1",
+        )
+        self.assertEqual(status, 201)
+        # 序号 2 属于批次但不是批次最小序号：不是真实批次锚点。
+        status, payload = self.list_batches("?cursor=2:2")
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(payload), {"error": "invalid_request"})
+        # 合法锚点之外没有更多批次：空页且游标为 null。
+        status, raw = self.list_batches("?cursor=2:1")
+        self.assertEqual(status, 200)
+        self.assertEqual(raw, b'{"batches":[],"nextCursor":null}')
+
+    def test_list_batches_validation_order(self) -> None:
+        # 参数校验先于 SLA 查询。
+        status, payload = self.list_batches("?limit=0&slaId=sla-9")
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(payload), {"error": "invalid_request"})
+        # SLA 查询先于游标状态校验。
+        status, payload = self.list_batches("?slaId=sla-9&cursor=99:1")
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(payload), {"error": "not_found"})
 
 
 class DisputeTests(unittest.TestCase):
