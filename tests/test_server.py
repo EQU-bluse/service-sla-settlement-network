@@ -258,6 +258,9 @@ def seed_for_actor(actor_id: str) -> bytes:
 
 
 _SLA_AUTH_PATH_MACHINE = re.compile(r"^/v1/machines/([0-9a-f]{64})/capabilities$")
+_SLA_AUTH_PATH_WITHDRAWAL = re.compile(
+    r"^/v1/accounts/([0-9a-f]{64})/withdrawals$"
+)
 _SLA_AUTH_CONFIRMATION = re.compile(r"^/v1/slas/([^/]+)/confirmations$")
 _SLA_AUTH_TELEMETRY_SEAL = re.compile(r"^/v1/slas/([^/]+)/telemetry-seals$")
 _SLA_AUTH_EVIDENCE = re.compile(r"^/v1/disputes/([^/]+)/evidence$")
@@ -272,6 +275,9 @@ _SLA_AUTH_ESCALATION = re.compile(r"^/v1/disputes/([^/]+)/escalations$")
 
 def _sla_auth_actor(path: str, body: bytes) -> str | None:
     match = _SLA_AUTH_PATH_MACHINE.fullmatch(path)
+    if match is not None:
+        return match.group(1)
+    match = _SLA_AUTH_PATH_WITHDRAWAL.fullmatch(path)
     if match is not None:
         return match.group(1)
     if (
@@ -6244,6 +6250,593 @@ class FundTests(unittest.TestCase):
         )
         self.assertEqual(status, 201)
         self.assertEqual(json.loads(body), {"depositSeq": 2, "balance": 1001})
+
+
+class WithdrawalTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.machine_id = machine_id(PUBLIC_KEY_A)
+        self.other_id = machine_id(PUBLIC_KEY_B)
+        for key, public_key in (("register-1", PUBLIC_KEY_A), ("register-2", PUBLIC_KEY_B)):
+            request = Request(
+                self.url("/v1/machines"),
+                data=json.dumps({"publicKey": public_key}).encode(),
+                method="POST",
+            )
+            request.add_header("Idempotency-Key", key)
+            with urlopen(request, timeout=5) as response:
+                self.assertEqual(response.status, 201)
+        self.deposit(self.machine_id, 100000, "fund-1")
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temporary.cleanup()
+
+    def url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}{path}"
+
+    def restart(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def post_json(self, path: str, payload: object, key: str | None) -> tuple[int, bytes]:
+        data = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+        request = Request(self.url(path), data=data, method="POST")
+        if key is not None:
+            request.add_header("Idempotency-Key", key)
+        add_sla_auth(request, self.server)
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def deposit(self, account: str, amount: int, key: str) -> None:
+        status, _ = self.post_json(
+            f"/v1/funds/{account}",
+            {"amountMicros": amount, "reference": f"ref-{key}"},
+            key,
+        )
+        self.assertEqual(status, 201)
+
+    def withdrawal_body(self, withdrawal_id: object = "wd-1", amount: object = 40000) -> bytes:
+        return json.dumps({"id": withdrawal_id, "amountMicros": amount}).encode()
+
+    def post_withdrawal(
+        self,
+        body: bytes | None = None,
+        account: str | None = None,
+        idempotency_key: str | None = "wd-key-1",
+        query: str = "",
+        auth: str | None = None,
+        omit_auth: bool = False,
+        extra_headers: dict[str, str] | None = None,
+    ) -> tuple[int, bytes]:
+        if body is None:
+            body = self.withdrawal_body()
+        if account is None:
+            account = self.machine_id
+        suffix = f"?{query}" if query else ""
+        path = f"/v1/accounts/{account}/withdrawals"
+        request = Request(self.url(f"{path}{suffix}"), data=body, method="POST")
+        if idempotency_key is not None:
+            request.add_header("Idempotency-Key", idempotency_key)
+        if auth is not None:
+            request.add_header("SLA-Auth", auth)
+        elif not omit_auth:
+            add_sla_auth(request, self.server)
+        for name, value in (extra_headers or {}).items():
+            request.add_header(name, value)
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def get_ledger(self, account: str) -> tuple[int, dict]:
+        try:
+            with urlopen(
+                self.url(f"/v1/accounts/{account}/ledger"), timeout=5
+            ) as response:
+                return response.status, json.load(response)
+        except HTTPError as error:
+            return error.code, json.load(error)
+
+    def ledger_rows(self) -> list[tuple[str, str, int, int, int]]:
+        connection = sqlite3.connect(self.server.database_path)
+        connection.row_factory = sqlite3.Row
+        try:
+            rows = connection.execute(
+                "SELECT kind, account_id, reference_seq, delta_micros,"
+                " balance_after_micros FROM ledger_entries ORDER BY entry_seq ASC"
+            ).fetchall()
+            return [
+                (
+                    row["kind"],
+                    row["account_id"],
+                    row["reference_seq"],
+                    row["delta_micros"],
+                    row["balance_after_micros"],
+                )
+                for row in rows
+            ]
+        finally:
+            connection.close()
+
+    def open_dispute_on_producer(self) -> None:
+        # 完整业务链：生产者（machine_id）经结算收款 1000 后被消费者争议冻结。
+        status, _ = self.post_json(
+            f"/v1/machines/{self.machine_id}/capabilities",
+            {
+                "expectedVersion": 0,
+                "name": "pump-01",
+                "protocol": "mqtt",
+                "region": "cn",
+                "unit": "call",
+                "capacity": 10,
+            },
+            "cap-1",
+        )
+        self.assertEqual(status, 201)
+        status, _ = self.post_json(
+            "/v1/sla-templates",
+            {
+                "id": "tpl-1",
+                "machineId": self.machine_id,
+                "capabilityVersion": 1,
+                "priceMicros": 1000,
+                "maxLatencyMs": 50,
+            },
+            "tpl-1",
+        )
+        self.assertEqual(status, 201)
+        start = int(time.time()) - 10
+        end = start + 3600
+        status, _ = self.post_json(
+            "/v1/slas",
+            {
+                "id": "sla-1",
+                "templateId": "tpl-1",
+                "consumerId": self.other_id,
+                "start": start,
+                "end": end,
+            },
+            "sla-create-1",
+        )
+        self.assertEqual(status, 201)
+        for index, (party, actor) in enumerate(
+            (("producer", self.machine_id), ("consumer", self.other_id))
+        ):
+            status, _ = self.post_json(
+                "/v1/slas/sla-1/confirmations",
+                {"party": party, "actorId": actor},
+                f"conf-1-{index}",
+            )
+            self.assertEqual(status, 200)
+        timestamp = start * 1000 + 1
+        digest = hashlib.sha256(
+            f"sla-1\nevt-1\n{timestamp}\n10\n{self.machine_id}".encode()
+        ).hexdigest()
+        status, _ = self.post_json(
+            "/v1/slas/sla-1/telemetry",
+            {
+                "eventId": "evt-1",
+                "timestamp": timestamp,
+                "latencyMs": 10,
+                "digest": digest,
+                "keyVersion": 1,
+                "signature": telemetry_signature(
+                    PRODUCER_SEED, "sla-1", "evt-1", timestamp, 10, digest,
+                    self.machine_id,
+                ),
+            },
+            "tel-1",
+        )
+        self.assertEqual(status, 201)
+        status, body = self.post_json(
+            "/v1/slas/sla-1/evaluations",
+            {"from": start * 1000, "to": end * 1000},
+            "eval-1",
+        )
+        self.assertEqual(status, 201)
+        evaluation_seq = json.loads(body)["evaluationSeq"]
+        self.deposit(self.other_id, 100000, "fund-consumer")
+        status, body = self.post_json(
+            "/v1/settlements",
+            {"slaId": "sla-1", "evaluationSeq": evaluation_seq},
+            "settle-1",
+        )
+        self.assertEqual(status, 201)
+        settlement_seq = json.loads(body)["settlementSeq"]
+        status, _ = self.post_json(
+            "/v1/disputes",
+            {
+                "id": "dispute-1",
+                "settlementSeq": settlement_seq,
+                "claimantId": self.other_id,
+            },
+            "dispute-1",
+        )
+        self.assertEqual(status, 201)
+
+    def test_withdrawal_created_response_key_order(self) -> None:
+        status, body = self.post_withdrawal()
+        self.assertEqual(status, 201, body)
+        payload = json.loads(body)
+        self.assertEqual(
+            list(payload),
+            ["id", "withdrawalSeq", "amountMicros", "balance", "availableBalance", "createdAt"],
+        )
+        self.assertEqual(payload["id"], "wd-1")
+        self.assertEqual(payload["withdrawalSeq"], 1)
+        self.assertEqual(payload["amountMicros"], 40000)
+        self.assertEqual(payload["balance"], 60000)
+        self.assertEqual(payload["availableBalance"], 60000)
+        self.assertIsInstance(payload["createdAt"], int)
+        self.assertGreaterEqual(payload["createdAt"], 0)
+        self.assertFalse(body.endswith(b"\n"))
+
+    def test_withdrawal_writes_paired_ledger_entries(self) -> None:
+        self.assertEqual(self.post_withdrawal()[0], 201)
+        self.assertEqual(
+            self.ledger_rows(),
+            [
+                ("deposit", self.machine_id, 1, 100000, 100000),
+                ("deposit", "external:clearing", 1, -100000, -100000),
+                ("withdrawal", self.machine_id, 1, -40000, 60000),
+                ("withdrawal", "external:clearing", 1, 40000, -60000),
+            ],
+        )
+
+    def test_withdrawal_entries_visible_in_ledger(self) -> None:
+        self.assertEqual(self.post_withdrawal()[0], 201)
+        status, payload = self.get_ledger(self.machine_id)
+        self.assertEqual(status, 200)
+        self.assertEqual(len(payload["entries"]), 2)
+        entry = payload["entries"][1]
+        self.assertEqual(
+            list(entry),
+            [
+                "entrySeq",
+                "kind",
+                "referenceSeq",
+                "reference",
+                "slaId",
+                "evaluationSeq",
+                "delta",
+                "balanceAfter",
+                "createdAt",
+            ],
+        )
+        self.assertEqual(entry["kind"], "withdrawal")
+        self.assertEqual(entry["referenceSeq"], 1)
+        self.assertEqual(entry["reference"], "wd-1")
+        self.assertIsNone(entry["slaId"])
+        self.assertIsNone(entry["evaluationSeq"])
+        self.assertEqual(entry["delta"], -40000)
+        self.assertEqual(entry["balanceAfter"], 60000)
+        status, payload = self.get_ledger("external:clearing")
+        self.assertEqual(status, 200)
+        clearing = payload["entries"][1]
+        self.assertEqual(clearing["kind"], "withdrawal")
+        self.assertEqual(clearing["reference"], "wd-1")
+        self.assertEqual(clearing["delta"], 40000)
+
+    def test_withdrawal_sequences_are_global_across_accounts(self) -> None:
+        self.assertEqual(self.post_withdrawal()[0], 201)
+        self.deposit(self.other_id, 5000, "fund-2")
+        status, body = self.post_withdrawal(
+            self.withdrawal_body("wd-2", 2000),
+            account=self.other_id,
+            idempotency_key="wd-key-2",
+        )
+        self.assertEqual(status, 201, body)
+        payload = json.loads(body)
+        self.assertEqual(payload["withdrawalSeq"], 2)
+        self.assertEqual(payload["balance"], 3000)
+
+    def test_replay_returns_first_response_bytes(self) -> None:
+        _, first = self.post_withdrawal()
+        status, body = self.post_withdrawal()
+        self.assertEqual(status, 201)
+        self.assertEqual(body, first)
+        withdrawals = [
+            row for row in self.ledger_rows() if row[0] == "withdrawal"
+        ]
+        self.assertEqual(len(withdrawals), 2)
+
+    def test_replay_survives_restart(self) -> None:
+        _, first = self.post_withdrawal()
+        self.restart()
+        status, body = self.post_withdrawal()
+        self.assertEqual(status, 201)
+        self.assertEqual(body, first)
+
+    def test_same_key_different_request_conflicts(self) -> None:
+        self.assertEqual(self.post_withdrawal()[0], 201)
+        status, body = self.post_withdrawal(self.withdrawal_body("wd-2", 1000))
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+        status, body = self.post_withdrawal(account=self.other_id)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_same_key_different_auth_conflicts(self) -> None:
+        self.assertEqual(self.post_withdrawal()[0], 201)
+        body = self.withdrawal_body()
+        auth = make_sla_auth(
+            self.server,
+            "wd-key-1",
+            PRODUCER_SEED,
+            self.machine_id,
+            "POST",
+            f"/v1/accounts/{self.machine_id}/withdrawals",
+            body,
+            1,
+            nonce="nonce-alt-withdrawal-01",
+        )
+        status, payload = self.post_withdrawal(body, auth=auth)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "conflict"})
+
+    def test_missing_or_invalid_idempotency_key(self) -> None:
+        status, body = self.post_withdrawal(idempotency_key=None)
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        status, body = self.post_withdrawal(idempotency_key="bad key!")
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+
+    def test_query_params_rejected(self) -> None:
+        status, body = self.post_withdrawal(query="limit=1")
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+
+    def test_delegation_header_rejected(self) -> None:
+        status, body = self.post_withdrawal(
+            extra_headers={"SLA-Delegation": "delegation-1;0;1;n-1;" + "ab" * 64}
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+
+    def test_invalid_bodies(self) -> None:
+        bodies = [
+            b"{}",
+            b'{"id":"wd-1"}',
+            b'{"amountMicros":1000}',
+            b'{"id":"wd-1","amountMicros":1000,"extra":1}',
+            b'{"id":"wd-1","id":"wd-1","amountMicros":1000}',
+            b'{"id":"BAD_ID","amountMicros":1000}',
+            b'{"id":"","amountMicros":1000}',
+            b'{"id":1,"amountMicros":1000}',
+            b'{"id":"wd-1","amountMicros":0}',
+            b'{"id":"wd-1","amountMicros":-5}',
+            b'{"id":"wd-1","amountMicros":9000000000000001}',
+            b'{"id":"wd-1","amountMicros":true}',
+            b'{"id":"wd-1","amountMicros":"1000"}',
+            b"not-json",
+        ]
+        for index, body in enumerate(bodies):
+            with self.subTest(index=index):
+                status, payload = self.post_withdrawal(
+                    body, idempotency_key=f"bad-{index}"
+                )
+                self.assertEqual(status, 400)
+                self.assertEqual(json.loads(payload), {"error": "invalid_request"})
+
+    def test_missing_or_malformed_auth(self) -> None:
+        status, body = self.post_withdrawal(omit_auth=True)
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        status, body = self.post_withdrawal(auth="not-an-auth-header")
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+
+    def test_unknown_account_is_404(self) -> None:
+        status, body = self.post_withdrawal(account="ab" * 32)
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+
+    def test_auth_identity_mismatch_is_403(self) -> None:
+        body = self.withdrawal_body()
+        auth = make_sla_auth(
+            self.server,
+            "wd-key-1",
+            PUBLIC_KEY_SEED_B,
+            self.other_id,
+            "POST",
+            f"/v1/accounts/{self.machine_id}/withdrawals",
+            body,
+            1,
+        )
+        status, payload = self.post_withdrawal(body, auth=auth)
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(payload), {"error": "forbidden"})
+
+    def test_stale_request_is_401(self) -> None:
+        body = self.withdrawal_body()
+        auth = make_sla_auth(
+            self.server,
+            "wd-key-1",
+            PRODUCER_SEED,
+            self.machine_id,
+            "POST",
+            f"/v1/accounts/{self.machine_id}/withdrawals",
+            body,
+            1,
+            request_time_ms=int(time.time() * 1000) - 400_000,
+        )
+        status, payload = self.post_withdrawal(body, auth=auth)
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(payload), {"error": "stale_request"})
+
+    def test_invalid_signature_is_401(self) -> None:
+        body = self.withdrawal_body()
+        auth = make_sla_auth(
+            self.server,
+            "wd-key-1",
+            PUBLIC_KEY_SEED_B,
+            self.machine_id,
+            "POST",
+            f"/v1/accounts/{self.machine_id}/withdrawals",
+            body,
+            1,
+        )
+        status, payload = self.post_withdrawal(body, auth=auth)
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(payload), {"error": "invalid_authentication"})
+
+    def test_nonce_reuse_with_different_key_is_409(self) -> None:
+        body = self.withdrawal_body()
+        path = f"/v1/accounts/{self.machine_id}/withdrawals"
+        auth = make_sla_auth(
+            self.server, "wd-key-1", PRODUCER_SEED, self.machine_id,
+            "POST", path, body, 1, nonce="nonce-reuse-check-01",
+        )
+        status, _ = self.post_withdrawal(body, auth=auth)
+        self.assertEqual(status, 201)
+        replay_auth = make_sla_auth(
+            self.server, "wd-key-2", PRODUCER_SEED, self.machine_id,
+            "POST", path, self.withdrawal_body("wd-2", 1000), 1,
+            nonce="nonce-reuse-check-01",
+        )
+        status, payload = self.post_withdrawal(
+            self.withdrawal_body("wd-2", 1000),
+            idempotency_key="wd-key-2",
+            auth=replay_auth,
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "replay_detected"})
+
+    def test_same_id_different_key_is_409(self) -> None:
+        self.assertEqual(self.post_withdrawal()[0], 201)
+        status, body = self.post_withdrawal(
+            self.withdrawal_body("wd-1", 1000), idempotency_key="wd-key-2"
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "withdrawal_exists"})
+
+    def test_insufficient_funds_is_409_and_leaves_no_trace(self) -> None:
+        status, body = self.post_withdrawal(self.withdrawal_body("wd-1", 100001))
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "insufficient_funds"})
+        # 失败不消费随机数：同键同请求重试仍是余额不足而非 replay_detected。
+        status, body = self.post_withdrawal(self.withdrawal_body("wd-1", 100001))
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "insufficient_funds"})
+        self.assertEqual(
+            [row for row in self.ledger_rows() if row[0] == "withdrawal"], []
+        )
+        # 失败不消费随机数、不推进序号：同随机数补正后成功且序号为 1。
+        body = self.withdrawal_body("wd-1", 1000)
+        path = f"/v1/accounts/{self.machine_id}/withdrawals"
+        auth = make_sla_auth(
+            self.server, "wd-key-2", PRODUCER_SEED, self.machine_id,
+            "POST", path, body, 1, nonce="nonce-retry-after-fail",
+        )
+        status, payload = self.post_withdrawal(
+            body, idempotency_key="wd-key-2", auth=auth
+        )
+        self.assertEqual(status, 201, payload)
+        self.assertEqual(json.loads(payload)["withdrawalSeq"], 1)
+
+    def test_open_dispute_freeze_blocks_withdrawal(self) -> None:
+        self.open_dispute_on_producer()
+        # 生产者账面 101000（入金 100000 + 结算 1000），冻结 1000，可用 100000。
+        status, body = self.post_withdrawal(self.withdrawal_body("wd-1", 100001))
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "insufficient_funds"})
+        status, body = self.post_withdrawal(
+            self.withdrawal_body("wd-1", 100000), idempotency_key="wd-key-2"
+        )
+        self.assertEqual(status, 201, body)
+        payload = json.loads(body)
+        self.assertEqual(payload["balance"], 1000)
+        self.assertEqual(payload["availableBalance"], 0)
+
+    def test_concurrent_same_key_single_withdrawal(self) -> None:
+        results: list[tuple[int, bytes]] = []
+        lock = threading.Lock()
+
+        def withdraw() -> None:
+            outcome = self.post_withdrawal()
+            with lock:
+                results.append((outcome[0], outcome[1]))
+
+        threads = [threading.Thread(target=withdraw) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual([status for status, _ in results], [201] * 8)
+        self.assertEqual(len({body for _, body in results}), 1)
+        withdrawals = [
+            row for row in self.ledger_rows() if row[0] == "withdrawal"
+        ]
+        self.assertEqual(len(withdrawals), 2)
+
+    def test_concurrent_same_id_single_winner(self) -> None:
+        results: list[int] = []
+        lock = threading.Lock()
+
+        def withdraw(index: int) -> None:
+            outcome = self.post_withdrawal(
+                self.withdrawal_body("wd-1", 1000),
+                idempotency_key=f"wd-race-{index}",
+            )
+            with lock:
+                results.append(outcome[0])
+
+        threads = [threading.Thread(target=withdraw, args=(i,)) for i in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sorted(results), [201] + [409] * 7)
+        withdrawals = [
+            row for row in self.ledger_rows() if row[0] == "withdrawal"
+        ]
+        self.assertEqual(len(withdrawals), 2)
+
+    def test_audit_checkpoint_consistent_after_withdrawal(self) -> None:
+        auditor_id = machine_id(ARBITRATOR_PUBLIC)
+        self.server.auditors = frozenset({auditor_id})
+        status, _ = self.post_json(
+            "/v1/machines", {"publicKey": ARBITRATOR_PUBLIC}, "register-auditor"
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(self.post_withdrawal()[0], 201)
+        body = b"{}"
+        request = Request(
+            self.url("/v1/audit-checkpoints"), data=body, method="POST"
+        )
+        request.add_header("Idempotency-Key", "audit-1")
+        request.add_header(
+            "SLA-Auth",
+            make_sla_auth(
+                self.server, "audit-1", ARBITRATOR_SEED, auditor_id,
+                "POST", "/v1/audit-checkpoints", body, 1,
+            ),
+        )
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+            payload = json.loads(response.read())
+        self.assertTrue(payload["consistent"], payload["differences"])
+        self.assertEqual(payload["differences"], [])
+        clearing = payload["clearing"]
+        self.assertEqual(clearing["storedBalance"], -60000)
+        self.assertEqual(clearing["expectedBalance"], -60000)
 
 
 class SettlementTests(unittest.TestCase):

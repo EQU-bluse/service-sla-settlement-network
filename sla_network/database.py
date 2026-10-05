@@ -224,6 +224,25 @@ CREATE TABLE IF NOT EXISTS fund_idempotency_records (
     status INTEGER NOT NULL,
     response_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS withdrawals (
+    withdrawal_seq INTEGER PRIMARY KEY,
+    id TEXT NOT NULL UNIQUE,
+    machine_id TEXT NOT NULL,
+    amount_micros INTEGER NOT NULL,
+    created_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS withdrawal_idempotency_records (
+    key TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    response_json TEXT NOT NULL,
+    auth_machine_id TEXT,
+    auth_key_version INTEGER,
+    auth_request_time_ms INTEGER,
+    auth_nonce TEXT,
+    auth_signature TEXT
+);
 CREATE TABLE IF NOT EXISTS settlements (
     settlement_seq INTEGER PRIMARY KEY,
     sla_id TEXT NOT NULL,

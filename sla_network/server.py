@@ -56,6 +56,7 @@ SLA_EVALUATIONS_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/evaluations")
 EVALUATION_BATCH_ITEM_PATH_PATTERN = re.compile(r"/v1/evaluation-batches/([^/]+)")
 SLA_SETTLEMENTS_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/settlements")
 ACCOUNT_LEDGER_PATH_PATTERN = re.compile(r"/v1/accounts/([^/]+)/ledger")
+ACCOUNT_WITHDRAWALS_PATH_PATTERN = re.compile(r"/v1/accounts/([^/]+)/withdrawals")
 FUNDS_PATH_PATTERN = re.compile(r"/v1/funds/([^/]+)")
 SETTLEMENT_BATCH_ITEM_PATH_PATTERN = re.compile(
     r"/v1/settlement-batches/([^/]+)"
@@ -123,6 +124,7 @@ EVALUATION_BATCH_ITEM_FIELDS = {"slaId", "from", "to"}
 EVALUATION_BATCH_MAX_ITEMS = 100
 TELEMETRY_SEAL_FIELDS = {"actorId"}
 FUND_FIELDS = {"amountMicros", "reference"}
+WITHDRAWAL_FIELDS = {"id", "amountMicros"}
 SETTLEMENT_FIELDS = {"slaId", "evaluationSeq"}
 SETTLEMENT_BATCH_FIELDS = {"id", "items"}
 SETTLEMENT_BATCH_ITEM_FIELDS = {"slaId", "evaluationSeq"}
@@ -1142,11 +1144,15 @@ class Handler(BaseHTTPRequestHandler):
                     " e.balance_after_micros AS balance_after_micros,"
                     " e.created_at_ms AS created_at_ms,"
                     " d.reference AS deposit_reference,"
+                    " w.id AS withdrawal_reference,"
                     " s.sla_id AS sla_id,"
                     " s.evaluation_seq AS settlement_evaluation_seq"
                     " FROM ledger_entries AS e"
                     " LEFT JOIN fund_deposits AS d"
                     " ON e.kind = 'deposit' AND e.reference_seq = d.deposit_seq"
+                    " LEFT JOIN withdrawals AS w"
+                    " ON e.kind = 'withdrawal'"
+                    " AND e.reference_seq = w.withdrawal_seq"
                     " LEFT JOIN dispute_escalations AS x"
                     " ON e.kind = 'dispute_escalation'"
                     " AND e.reference_seq = x.escalation_seq"
@@ -1181,6 +1187,18 @@ class Handler(BaseHTTPRequestHandler):
                     "kind": "deposit",
                     "referenceSeq": row["reference_seq"],
                     "reference": row["deposit_reference"],
+                    "slaId": None,
+                    "evaluationSeq": None,
+                    "delta": row["delta_micros"],
+                    "balanceAfter": row["balance_after_micros"],
+                    "createdAt": row["created_at_ms"],
+                }
+            elif row["kind"] == "withdrawal":
+                entry = {
+                    "entrySeq": row["entry_seq"],
+                    "kind": "withdrawal",
+                    "referenceSeq": row["reference_seq"],
+                    "reference": row["withdrawal_reference"],
                     "slaId": None,
                     "evaluationSeq": None,
                     "delta": row["delta_micros"],
@@ -1943,6 +1961,12 @@ class Handler(BaseHTTPRequestHandler):
         funds_match = FUNDS_PATH_PATTERN.fullmatch(self.path)
         if funds_match is not None:
             self._deposit_funds(funds_match.group(1))
+            return
+        withdrawals_match = ACCOUNT_WITHDRAWALS_PATH_PATTERN.fullmatch(
+            urlsplit(self.path).path
+        )
+        if withdrawals_match is not None:
+            self._create_withdrawal(withdrawals_match.group(1))
             return
         if self.path == "/v1/settlements":
             self._create_settlement()
@@ -4829,6 +4853,197 @@ class Handler(BaseHTTPRequestHandler):
                         json.dumps(payload, separators=(",", ":")),
                     ),
                 )
+                database.execute("COMMIT")
+                return HTTPStatus.CREATED, payload
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+
+    def _create_withdrawal(self, account_id: str) -> None:
+        idempotency_key = self.headers.get("Idempotency-Key")
+        if (
+            idempotency_key is None
+            or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None
+        ):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 出金不接受任何查询参数：参数校验先于体校验与账户查询。
+        if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        raw_body = self._read_raw_body()
+        fields = (
+            None if raw_body is None else self._read_withdrawal_object(raw_body)
+        )
+        if fields is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 仅支持单一 SLA-Auth：代理头、头缺失、重复或结构非法均为非法请求，
+        # 且先于账户查询。
+        if self.headers.get_all(SLA_DELEGATION_HEADER):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        auth = self._parse_sla_auth()
+        if auth is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        body_digest = hashlib.sha256(raw_body).hexdigest()
+        status, payload = self._apply_withdrawal(
+            idempotency_key, account_id, fields, auth, body_digest
+        )
+        self._json(status, payload)
+
+    def _read_withdrawal_object(self, body: bytes) -> dict[str, Any] | None:
+        parsed = self._read_json_object(body)
+        if parsed is None or set(parsed) != WITHDRAWAL_FIELDS:
+            return None
+        withdrawal_id = parsed["id"]
+        if (
+            not isinstance(withdrawal_id, str)
+            or TEMPLATE_ID_PATTERN.fullmatch(withdrawal_id) is None
+        ):
+            return None
+        if not _bounded_int(parsed["amountMicros"], 1, AMOUNT_CAP_MICROS):
+            return None
+        return parsed
+
+    def _apply_withdrawal(
+        self,
+        idempotency_key: str,
+        account_id: str,
+        fields: dict[str, Any],
+        auth: SlaAuth,
+        body_digest: str,
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+        standard_path = urlsplit(self.path).path
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                # 幂等判定先于资源查询：同键更换路径、正文或认证五段均冲突。
+                record = database.execute(
+                    "SELECT account_id, request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature"
+                    " FROM withdrawal_idempotency_records WHERE key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    if (
+                        record["account_id"] == account_id
+                        and record["request_json"] == request_json
+                        and self._auth_record_matches(record, auth)
+                    ):
+                        return HTTPStatus(record["status"]), json.loads(
+                            record["response_json"]
+                        )
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                machine = database.execute(
+                    "SELECT id FROM machines WHERE id = ?", (account_id,)
+                ).fetchone()
+                if machine is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                # 认证机器须与路径账户一致；时间、密钥、签名与随机数检查
+                # 沿用请求认证的既有结果。
+                try:
+                    self._verify_request_auth(
+                        database, auth, account_id, standard_path, body_digest
+                    )
+                    self._check_request_nonce(database, auth)
+                except AuthRejected as rejected:
+                    database.execute("ROLLBACK")
+                    return rejected.status, {"error": rejected.error}
+                # 业务 id 全库唯一：异键同 id（含并发与重启后）仅一项成功。
+                existing = database.execute(
+                    "SELECT 1 FROM withdrawals WHERE id = ?",
+                    (fields["id"],),
+                ).fetchone()
+                if existing is not None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "withdrawal_exists"}
+                amount = fields["amountMicros"]
+                balance_row = database.execute(
+                    "SELECT balance_micros FROM ledger_accounts"
+                    " WHERE account_id = ?",
+                    (account_id,),
+                ).fetchone()
+                balance = (
+                    balance_row["balance_micros"] if balance_row is not None else 0
+                )
+                # 可用余额为总余额扣除全部 open 争议冻结后与零的较大值；
+                # 出金不得动用争议冻结资金。
+                frozen = database.execute(
+                    "SELECT COALESCE(SUM(amount_micros), 0) AS frozen"
+                    " FROM disputes WHERE payee_id = ? AND state = 'open'",
+                    (account_id,),
+                ).fetchone()["frozen"]
+                if amount > max(0, balance - frozen):
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "insufficient_funds"}
+                # 全库共享一条持久化出金序号：取写锁后取全库最大序号 + 1（空表 1）。
+                withdrawal_seq = database.execute(
+                    "SELECT COALESCE(MAX(withdrawal_seq), 0) + 1 AS next_seq"
+                    " FROM withdrawals"
+                ).fetchone()["next_seq"]
+                created_at_ms = int(datetime.now(UTC).timestamp() * 1000)
+                # 双重记账：机器账户借记、外部清算账户贷记等额，同事务提交。
+                new_balance = self._adjust_account(database, account_id, -amount)
+                clearing_balance = self._adjust_account(
+                    database, CLEARING_ACCOUNT_ID, amount
+                )
+                self._record_entry(
+                    database, "withdrawal", withdrawal_seq, account_id,
+                    -amount, new_balance, created_at_ms,
+                )
+                self._record_entry(
+                    database, "withdrawal", withdrawal_seq, CLEARING_ACCOUNT_ID,
+                    amount, clearing_balance, created_at_ms,
+                )
+                database.execute(
+                    "INSERT INTO withdrawals"
+                    "(withdrawal_seq, id, machine_id, amount_micros, created_at_ms)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (
+                        withdrawal_seq,
+                        fields["id"],
+                        account_id,
+                        amount,
+                        created_at_ms,
+                    ),
+                )
+                payload = {
+                    "id": fields["id"],
+                    "withdrawalSeq": withdrawal_seq,
+                    "amountMicros": amount,
+                    "balance": new_balance,
+                    "availableBalance": max(0, new_balance - frozen),
+                    "createdAt": created_at_ms,
+                }
+                response_json = json.dumps(payload, separators=(",", ":"))
+                database.execute(
+                    "INSERT INTO withdrawal_idempotency_records"
+                    "(key, account_id, request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        account_id,
+                        request_json,
+                        int(HTTPStatus.CREATED),
+                        response_json,
+                        auth.machine_id,
+                        auth.key_version,
+                        auth.request_time_ms,
+                        auth.nonce,
+                        auth.signature,
+                    ),
+                )
+                # 出金记录、双方分录、幂等结果与随机数同一事务原子持久化；
+                # 任何失败路径都不到达此处，不消费随机数、不推进序号。
+                self._consume_request_nonce(database, auth)
                 database.execute("COMMIT")
                 return HTTPStatus.CREATED, payload
             except BaseException:
@@ -8002,6 +8217,12 @@ class Handler(BaseHTTPRequestHandler):
                 "SELECT deposit_seq, machine_id, amount_micros FROM fund_deposits"
             ).fetchall()
         }
+        withdrawals = {
+            row["withdrawal_seq"]: row
+            for row in database.execute(
+                "SELECT withdrawal_seq, machine_id, amount_micros FROM withdrawals"
+            ).fetchall()
+        }
         settlements = {
             row["settlement_seq"]: row
             for row in database.execute(
@@ -8141,6 +8362,18 @@ class Handler(BaseHTTPRequestHandler):
                 "sides": [
                     (deposit["machine_id"], amount),
                     (CLEARING_ACCOUNT_ID, -amount),
+                ],
+                "attribution": None,
+                "attribution_seq": None,
+                "reference_broken": False,
+            }
+        for withdrawal_seq in sorted(withdrawals):
+            withdrawal = withdrawals[withdrawal_seq]
+            amount = withdrawal["amount_micros"]
+            expected_entries[("withdrawal", withdrawal_seq)] = {
+                "sides": [
+                    (withdrawal["machine_id"], -amount),
+                    (CLEARING_ACCOUNT_ID, amount),
                 ],
                 "attribution": None,
                 "attribution_seq": None,
@@ -8484,13 +8717,16 @@ class Handler(BaseHTTPRequestHandler):
                 }
             )
 
-        # 外部清算账户持有的是系统入金的反向镜像与升级托管：
-        # 余额 = 未仲裁升级托管 − 累计入金；结算与退款只在机器账户间转移。
+        # 外部清算账户持有的是系统入金的反向镜像、出金款项与升级托管：
+        # 余额 = 未仲裁升级托管 − 累计入金 + 累计出金；结算与退款只在机器账户间转移。
         deposit_total = sum(
             deposit["amount_micros"] for deposit in deposits.values()
         )
+        withdrawal_total = sum(
+            withdrawal["amount_micros"] for withdrawal in withdrawals.values()
+        )
         clearing_balance = stored_balances.get(CLEARING_ACCOUNT_ID, 0)
-        expected_clearing = recorded_escrow - deposit_total
+        expected_clearing = recorded_escrow - deposit_total + withdrawal_total
         if clearing_balance != expected_clearing:
             differences.append(
                 self._audit_difference(
