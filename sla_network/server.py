@@ -173,6 +173,7 @@ CLEARING_ACCOUNT_ID = "external:clearing"
 TELEMETRY_QUERY_PARAMS = {"from", "to", "limit", "cursor"}
 EVALUATION_QUERY_PARAMS = {"limit", "cursor"}
 SETTLEMENT_QUERY_PARAMS = {"limit", "cursor"}
+SETTLEMENT_BATCHES_QUERY_PARAMS = {"slaId", "limit", "cursor"}
 LEDGER_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTE_EVENTS_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTE_EVIDENCE_QUERY_PARAMS = {"limit", "cursor"}
@@ -424,6 +425,9 @@ class Handler(BaseHTTPRequestHandler):
             self._get_settlement_batch(
                 settlement_batch_match.group(1), target.query
             )
+            return
+        if target.path == "/v1/settlement-batches":
+            self._get_settlement_batches(target.query)
             return
         if target.path == "/v1/disputes":
             self._get_disputes(target.query)
@@ -4990,6 +4994,138 @@ class Handler(BaseHTTPRequestHandler):
             except BaseException:
                 database.execute("ROLLBACK")
                 raise
+
+    def _parse_settlement_batches_query(
+        self, query: str
+    ) -> tuple[str | None, int, tuple[int, int] | None] | None:
+        parameters: dict[str, list[str]] = {}
+        for key, value in parse_qsl(query, keep_blank_values=True):
+            parameters.setdefault(key, []).append(value)
+        if not set(parameters) <= SETTLEMENT_BATCHES_QUERY_PARAMS:
+            return None
+        if any(len(values) != 1 for values in parameters.values()):
+            return None
+        sla_id: str | None = None
+        if "slaId" in parameters:
+            sla_id = parameters["slaId"][0]
+            if TEMPLATE_ID_PATTERN.fullmatch(sla_id) is None:
+                return None
+
+        def decimal(text: str) -> int | None:
+            if DECIMAL_PATTERN.fullmatch(text) is None:
+                return None
+            return _decimal_int(text)
+
+        if "limit" in parameters:
+            limit = decimal(parameters["limit"][0])
+            if limit is None or not 1 <= limit <= TELEMETRY_MAX_LIMIT:
+                return None
+        else:
+            limit = TELEMETRY_DEFAULT_LIMIT
+        cursor: tuple[int, int] | None = None
+        if "cursor" in parameters:
+            parts = parameters["cursor"][0].split(":")
+            if len(parts) != 2:
+                return None
+            cut = decimal(parts[0])
+            last_seq = decimal(parts[1])
+            if cut is None or last_seq is None:
+                return None
+            cursor = (cut, last_seq)
+        return sla_id, limit, cursor
+
+    @staticmethod
+    def _settlement_batch_scope(
+        sla_id: str | None,
+    ) -> tuple[str, list[Any]]:
+        # 批次排序键为其结算的最小全库序号；slaId 筛选至少含该 SLA 一笔结算的批次。
+        sql = (
+            " FROM (SELECT batch_id, MIN(settlement_seq) AS min_seq"
+            " FROM settlement_batch_items GROUP BY batch_id) AS t"
+            " JOIN settlement_batches AS b ON b.id = t.batch_id"
+        )
+        arguments: list[Any] = []
+        if sla_id is not None:
+            sql += (
+                " WHERE EXISTS (SELECT 1 FROM settlement_batch_items AS f"
+                " WHERE f.batch_id = t.batch_id AND f.sla_id = ?)"
+            )
+            arguments.append(sla_id)
+        return sql, arguments
+
+    def _get_settlement_batches(self, query: str) -> None:
+        # 参数校验先于 SLA 查询，SLA 查询先于游标状态校验。
+        parsed = self._parse_settlement_batches_query(query)
+        if parsed is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        sla_id, limit, cursor = parsed
+        scope_sql, scope_arguments = self._settlement_batch_scope(sla_id)
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN")
+            try:
+                if sla_id is not None:
+                    record = database.execute(
+                        "SELECT 1 FROM slas WHERE id = ?", (sla_id,)
+                    ).fetchone()
+                    if record is None:
+                        database.execute("ROLLBACK")
+                        self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                        return
+                # cut 为读事务起点的全库最大结算序号（空库为 0），跨批次与单笔全局。
+                max_record = database.execute(
+                    "SELECT MAX(settlement_seq) AS current_max FROM settlements"
+                ).fetchone()
+                current_max = max_record["current_max"]
+                if current_max is None:
+                    current_max = 0
+                if cursor is None:
+                    cut = current_max
+                    last_seq = 0
+                else:
+                    cut, last_seq = cursor
+                    if last_seq > cut or cut > current_max:
+                        database.execute("ROLLBACK")
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                        )
+                        return
+                    anchor = database.execute(
+                        "SELECT 1" + scope_sql
+                        + (" AND" if sla_id is not None else " WHERE")
+                        + " t.min_seq = ? AND t.min_seq <= ?",
+                        scope_arguments + [last_seq, cut],
+                    ).fetchone()
+                    if anchor is None:
+                        database.execute("ROLLBACK")
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "invalid_request"}
+                        )
+                        return
+                rows = database.execute(
+                    "SELECT t.min_seq AS min_seq, b.response_json AS response_json"
+                    + scope_sql
+                    + (" AND" if sla_id is not None else " WHERE")
+                    + " t.min_seq > ? AND t.min_seq <= ?"
+                    + " ORDER BY t.min_seq ASC LIMIT ?",
+                    scope_arguments + [last_seq, cut, limit + 1],
+                ).fetchall()
+                database.execute("ROLLBACK")
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+        has_next = len(rows) > limit
+        page = rows[:limit]
+        # 每项直接取创建时保存的完整对象，与按 id 读取逐字段一致。
+        batches = [json.loads(row["response_json"]) for row in page]
+        if has_next:
+            next_cursor = f"{cut}:{page[-1]['min_seq']}"
+        else:
+            next_cursor = None
+        self._json(
+            HTTPStatus.OK,
+            {"batches": batches, "nextCursor": next_cursor},
+        )
 
     def _get_settlement_batch(self, batch_id: str, query: str) -> None:
         # 读取入口不接受任何查询参数：参数校验先于批次查询。
