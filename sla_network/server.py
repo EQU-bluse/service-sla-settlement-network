@@ -60,6 +60,9 @@ EVALUATION_BATCH_ITEM_PATH_PATTERN = re.compile(r"/v1/evaluation-batches/([^/]+)
 SLA_SETTLEMENTS_PATH_PATTERN = re.compile(r"/v1/slas/([^/]+)/settlements")
 ACCOUNT_LEDGER_PATH_PATTERN = re.compile(r"/v1/accounts/([^/]+)/ledger")
 ACCOUNT_WITHDRAWALS_PATH_PATTERN = re.compile(r"/v1/accounts/([^/]+)/withdrawals")
+ACCOUNT_WITHDRAWAL_BATCHES_PATH_PATTERN = re.compile(
+    r"/v1/accounts/([^/]+)/withdrawal-batches"
+)
 FUNDS_PATH_PATTERN = re.compile(r"/v1/funds/([^/]+)")
 SETTLEMENT_BATCH_ITEM_PATH_PATTERN = re.compile(
     r"/v1/settlement-batches/([^/]+)"
@@ -140,6 +143,9 @@ EVALUATION_BATCH_MAX_ITEMS = 100
 TELEMETRY_SEAL_FIELDS = {"actorId"}
 FUND_FIELDS = {"amountMicros", "reference"}
 WITHDRAWAL_FIELDS = {"id", "amountMicros"}
+WITHDRAWAL_BATCH_FIELDS = {"id", "items"}
+WITHDRAWAL_BATCH_ITEM_FIELDS = {"id", "amountMicros"}
+WITHDRAWAL_BATCH_MAX_ITEMS = 100
 SETTLEMENT_FIELDS = {"slaId", "evaluationSeq"}
 SETTLEMENT_BATCH_FIELDS = {"id", "items"}
 SETTLEMENT_BATCH_ITEM_FIELDS = {"slaId", "evaluationSeq"}
@@ -2239,6 +2245,12 @@ class Handler(BaseHTTPRequestHandler):
         )
         if withdrawals_match is not None:
             self._create_withdrawal(withdrawals_match.group(1))
+            return
+        withdrawal_batches_match = ACCOUNT_WITHDRAWAL_BATCHES_PATH_PATTERN.fullmatch(
+            urlsplit(self.path).path
+        )
+        if withdrawal_batches_match is not None:
+            self._create_withdrawal_batch(withdrawal_batches_match.group(1))
             return
         if self.path == "/v1/settlements":
             self._create_settlement()
@@ -5325,6 +5337,242 @@ class Handler(BaseHTTPRequestHandler):
                     ),
                 )
                 # 出金记录、双方分录、余额、幂等结果与随机数同一事务原子持久化；
+                # 任何失败路径都不到达此处，不消费随机数、不推进序号。
+                self._consume_request_nonce(database, auth)
+                database.execute("COMMIT")
+                return HTTPStatus.CREATED, payload
+            except BaseException:
+                database.execute("ROLLBACK")
+                raise
+
+    def _create_withdrawal_batch(self, account_id: str) -> None:
+        idempotency_key = self.headers.get("Idempotency-Key")
+        if (
+            idempotency_key is None
+            or IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key) is None
+        ):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 批量出金不接受任何查询参数：参数校验先于体校验与账户查询。
+        if parse_qsl(urlsplit(self.path).query, keep_blank_values=True):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        raw_body = self._read_raw_body()
+        fields = (
+            None if raw_body is None else self._read_withdrawal_batch_object(raw_body)
+        )
+        if fields is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 仅支持单一 SLA-Auth：代理头、头缺失、重复或结构非法均为非法请求，
+        # 且先于账户查询。
+        if self.headers.get_all(SLA_DELEGATION_HEADER):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        auth = self._parse_sla_auth()
+        if auth is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        body_digest = hashlib.sha256(raw_body).hexdigest()
+        status, payload = self._apply_withdrawal_batch(
+            idempotency_key, account_id, fields, auth, body_digest
+        )
+        self._json(status, payload)
+
+    def _read_withdrawal_batch_object(self, body: bytes) -> dict[str, Any] | None:
+        parsed = self._read_json_object(body)
+        if parsed is None or set(parsed) != WITHDRAWAL_BATCH_FIELDS:
+            return None
+        batch_id = parsed["id"]
+        if not isinstance(batch_id, str) or TEMPLATE_ID_PATTERN.fullmatch(batch_id) is None:
+            return None
+        items = parsed["items"]
+        if not isinstance(items, list):
+            return None
+        if not 1 <= len(items) <= WITHDRAWAL_BATCH_MAX_ITEMS:
+            return None
+        seen: set[str] = set()
+        normalized_items: list[dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict) or set(item) != WITHDRAWAL_BATCH_ITEM_FIELDS:
+                return None
+            item_id = item["id"]
+            if (
+                not isinstance(item_id, str)
+                or TEMPLATE_ID_PATTERN.fullmatch(item_id) is None
+            ):
+                return None
+            if not _bounded_int(item["amountMicros"], 1, AMOUNT_CAP_MICROS):
+                return None
+            # 项目标识批内唯一：重复属于请求结构非法，先于任何资源查询拒绝。
+            if item_id in seen:
+                return None
+            seen.add(item_id)
+            normalized_items.append(
+                {"id": item_id, "amountMicros": item["amountMicros"]}
+            )
+        return {"id": batch_id, "items": normalized_items}
+
+    def _apply_withdrawal_batch(
+        self,
+        idempotency_key: str,
+        account_id: str,
+        fields: dict[str, Any],
+        auth: SlaAuth,
+        body_digest: str,
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        request_json = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+        batch_id = fields["id"]
+        items = fields["items"]
+        standard_path = urlsplit(self.path).path
+        with closing(connect(self.server.database_path)) as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                # 幂等判定先于资源查询：同键更换路径、正文或认证五段均冲突。
+                record = database.execute(
+                    "SELECT machine_id, request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature"
+                    " FROM withdrawal_batch_idempotency_records WHERE key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if record is not None:
+                    database.execute("ROLLBACK")
+                    if (
+                        record["machine_id"] == account_id
+                        and record["request_json"] == request_json
+                        and self._auth_record_matches(record, auth)
+                    ):
+                        return HTTPStatus(record["status"]), json.loads(
+                            record["response_json"]
+                        )
+                    return HTTPStatus.CONFLICT, {"error": "conflict"}
+                machine = database.execute(
+                    "SELECT id FROM machines WHERE id = ?", (account_id,)
+                ).fetchone()
+                if machine is None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.NOT_FOUND, {"error": "not_found"}
+                try:
+                    # 认证机器须与路径账户一致；时间、密钥与签名沿用请求认证。
+                    self._verify_request_auth(
+                        database, auth, account_id, standard_path, body_digest
+                    )
+                    self._check_request_nonce(database, auth)
+                except AuthRejected as rejected:
+                    database.execute("ROLLBACK")
+                    return rejected.status, {"error": rejected.error}
+                existing_batch = database.execute(
+                    "SELECT 1 FROM withdrawal_batches WHERE id = ?", (batch_id,)
+                ).fetchone()
+                if existing_batch is not None:
+                    database.execute("ROLLBACK")
+                    return HTTPStatus.CONFLICT, {"error": "batch_exists"}
+                # 项目标识与全部既有出金（单笔与批量）共享同一唯一命名空间。
+                for item in items:
+                    existing = database.execute(
+                        "SELECT 1 FROM withdrawals WHERE id = ?", (item["id"],)
+                    ).fetchone()
+                    if existing is not None:
+                        database.execute("ROLLBACK")
+                        return HTTPStatus.CONFLICT, {"error": "withdrawal_exists"}
+                # 可用余额为总余额扣除全部 open 争议冻结后与零的较大值，冻结口径
+                # 沿单笔出金；按数组顺序逐项扣减工作余额，前项结果参与后项校验。
+                balance_record = database.execute(
+                    "SELECT balance_micros FROM ledger_accounts WHERE account_id = ?",
+                    (account_id,),
+                ).fetchone()
+                working_balance = (
+                    0 if balance_record is None else balance_record["balance_micros"]
+                )
+                frozen_record = database.execute(
+                    "SELECT COALESCE(SUM(amount_micros), 0) AS frozen"
+                    " FROM disputes WHERE payee_id = ? AND state = 'open'",
+                    (account_id,),
+                ).fetchone()
+                frozen = frozen_record["frozen"]
+                for item in items:
+                    if max(0, working_balance - frozen) < item["amountMicros"]:
+                        database.execute("ROLLBACK")
+                        return HTTPStatus.CONFLICT, {"error": "insufficient_funds"}
+                    working_balance -= item["amountMicros"]
+                # 全部项通过后才取序号与时间：任一失败均不消耗序号、不推进状态。
+                # 序号与单笔出金共享一条全库唯一、持久递增序列，批内按数组顺序连续。
+                next_record = database.execute(
+                    "SELECT COALESCE(MAX(withdrawal_seq), 0) + 1 AS next_seq"
+                    " FROM withdrawals"
+                ).fetchone()
+                next_seq = next_record["next_seq"]
+                created_at_ms = int(datetime.now(UTC).timestamp() * 1000)
+                withdrawal_payloads: list[dict[str, Any]] = []
+                for position, item in enumerate(items):
+                    withdrawal_seq = next_seq + position
+                    amount = item["amountMicros"]
+                    # 双重记账：借记机器账户、贷记外部清算账户等额反向分录。
+                    balance = self._adjust_account(database, account_id, -amount)
+                    clearing_balance = self._adjust_account(
+                        database, CLEARING_ACCOUNT_ID, amount
+                    )
+                    self._record_entry(
+                        database, "withdrawal", withdrawal_seq, account_id,
+                        -amount, balance, created_at_ms,
+                    )
+                    self._record_entry(
+                        database, "withdrawal", withdrawal_seq, CLEARING_ACCOUNT_ID,
+                        amount, clearing_balance, created_at_ms,
+                    )
+                    database.execute(
+                        "INSERT INTO withdrawals"
+                        "(withdrawal_seq, id, machine_id, amount_micros, created_at_ms)"
+                        " VALUES (?, ?, ?, ?, ?)",
+                        (withdrawal_seq, item["id"], account_id, amount, created_at_ms),
+                    )
+                    database.execute(
+                        "INSERT INTO withdrawal_batch_items"
+                        "(batch_id, position, withdrawal_seq, item_id)"
+                        " VALUES (?, ?, ?, ?)",
+                        (batch_id, position, withdrawal_seq, item["id"]),
+                    )
+                    withdrawal_payloads.append(
+                        {
+                            "id": item["id"],
+                            "withdrawalSeq": withdrawal_seq,
+                            "amountMicros": amount,
+                            "balance": balance,
+                            "availableBalance": max(0, balance - frozen),
+                            "createdAt": created_at_ms,
+                        }
+                    )
+                payload = {
+                    "id": batch_id,
+                    "createdAt": created_at_ms,
+                    "withdrawals": withdrawal_payloads,
+                }
+                database.execute(
+                    "INSERT INTO withdrawal_batches(id, machine_id, created_at_ms)"
+                    " VALUES (?, ?, ?)",
+                    (batch_id, account_id, created_at_ms),
+                )
+                database.execute(
+                    "INSERT INTO withdrawal_batch_idempotency_records"
+                    "(key, machine_id, request_json, status, response_json,"
+                    " auth_machine_id, auth_key_version, auth_request_time_ms,"
+                    " auth_nonce, auth_signature)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        account_id,
+                        request_json,
+                        int(HTTPStatus.CREATED),
+                        json.dumps(payload, separators=(",", ":")),
+                        auth.machine_id,
+                        auth.key_version,
+                        auth.request_time_ms,
+                        auth.nonce,
+                        auth.signature,
+                    ),
+                )
+                # 批次、各出金、双方分录、余额、随机数与幂等结果同一事务原子提交；
                 # 任何失败路径都不到达此处，不消费随机数、不推进序号。
                 self._consume_request_nonce(database, auth)
                 database.execute("COMMIT")
