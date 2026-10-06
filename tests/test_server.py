@@ -259,6 +259,9 @@ def seed_for_actor(actor_id: str) -> bytes:
 
 _SLA_AUTH_PATH_MACHINE = re.compile(r"^/v1/machines/([0-9a-f]{64})/capabilities$")
 _SLA_AUTH_WITHDRAWAL = re.compile(r"^/v1/accounts/([0-9a-f]{64})/withdrawals$")
+_SLA_AUTH_WITHDRAWAL_BATCH = re.compile(
+    r"^/v1/accounts/([0-9a-f]{64})/withdrawal-batches$"
+)
 _SLA_AUTH_CONFIRMATION = re.compile(r"^/v1/slas/([^/]+)/confirmations$")
 _SLA_AUTH_TELEMETRY_SEAL = re.compile(r"^/v1/slas/([^/]+)/telemetry-seals$")
 _SLA_AUTH_EVIDENCE = re.compile(r"^/v1/disputes/([^/]+)/evidence$")
@@ -276,6 +279,9 @@ def _sla_auth_actor(path: str, body: bytes) -> str | None:
     if match is not None:
         return match.group(1)
     match = _SLA_AUTH_WITHDRAWAL.fullmatch(path)
+    if match is not None:
+        return match.group(1)
+    match = _SLA_AUTH_WITHDRAWAL_BATCH.fullmatch(path)
     if match is not None:
         return match.group(1)
     if (
@@ -6888,6 +6894,574 @@ class WithdrawalTests(unittest.TestCase):
         self.assertFalse(payload["consistent"])
         types = {difference["type"] for difference in payload["differences"]}
         self.assertIn("entry_missing", types)
+
+
+class WithdrawalBatchTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.machine_id = machine_id(PUBLIC_KEY_A)
+        self.other_id = machine_id(PUBLIC_KEY_B)
+        for key, public_key in (("register-1", PUBLIC_KEY_A), ("register-2", PUBLIC_KEY_B)):
+            request = Request(
+                self.url("/v1/machines"),
+                data=json.dumps({"publicKey": public_key}).encode(),
+                method="POST",
+            )
+            request.add_header("Idempotency-Key", key)
+            with urlopen(request, timeout=5) as response:
+                self.assertEqual(response.status, 201)
+        # 机器账户入金 1000，供批量出金场景使用。
+        request = Request(
+            self.url(f"/v1/funds/{self.machine_id}"),
+            data=json.dumps({"amountMicros": 1000, "reference": "ref-1"}).encode(),
+            method="POST",
+        )
+        request.add_header("Idempotency-Key", "fund-1")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temporary.cleanup()
+
+    def url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}{path}"
+
+    def restart(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def batch_body(
+        self,
+        batch_id: object = "wdb-1",
+        items: object = (("wi-1", 400), ("wi-2", 300)),
+    ) -> bytes:
+        return json.dumps(
+            {
+                "id": batch_id,
+                "items": [
+                    {"id": item_id, "amountMicros": amount}
+                    for item_id, amount in items
+                ],
+            }
+        ).encode()
+
+    def post_batch(
+        self,
+        body: bytes | None = None,
+        account: str | None = None,
+        idempotency_key: str | None = "wdb-key-1",
+        query: str = "",
+        auth: str | None = None,
+        omit_auth: bool = False,
+        extra_headers: dict[str, str] | None = None,
+    ) -> tuple[int, bytes]:
+        if body is None:
+            body = self.batch_body()
+        if account is None:
+            account = self.machine_id
+        suffix = f"?{query}" if query else ""
+        path = f"/v1/accounts/{account}/withdrawal-batches"
+        request = Request(self.url(f"{path}{suffix}"), data=body, method="POST")
+        if idempotency_key is not None:
+            request.add_header("Idempotency-Key", idempotency_key)
+        if not omit_auth:
+            if auth is None:
+                add_sla_auth(request, self.server)
+            else:
+                request.add_header("SLA-Auth", auth)
+        for name, value in (extra_headers or {}).items():
+            request.add_header(name, value)
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def post_single_withdrawal(
+        self, withdrawal_id: str, amount: int, idempotency_key: str
+    ) -> tuple[int, bytes]:
+        body = json.dumps({"id": withdrawal_id, "amountMicros": amount}).encode()
+        path = f"/v1/accounts/{self.machine_id}/withdrawals"
+        request = Request(self.url(path), data=body, method="POST")
+        request.add_header("Idempotency-Key", idempotency_key)
+        add_sla_auth(request, self.server)
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def ledger(self, account: str) -> list[dict[str, object]]:
+        request = Request(self.url(f"/v1/accounts/{account}/ledger"), method="GET")
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+            return json.loads(response.read())["entries"]
+
+    def freeze(self, amount: int) -> None:
+        # 直接登记一笔 open 争议：收款方为出金机器，冻结其等额资金。
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            connection.execute(
+                "INSERT INTO disputes"
+                "(id, settlement_seq, claimant_id, payer_id, payee_id,"
+                " amount_micros, state)"
+                " VALUES ('dp-1', 999, ?, ?, ?, ?, 'open')",
+                (self.other_id, self.other_id, self.machine_id, amount),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def test_batch_created_response(self) -> None:
+        status, body = self.post_batch()
+        self.assertEqual(status, 201)
+        payload = json.loads(body)
+        self.assertEqual(list(payload), ["id", "createdAt", "withdrawals"])
+        self.assertEqual(payload["id"], "wdb-1")
+        self.assertIsInstance(payload["createdAt"], int)
+        withdrawals = payload["withdrawals"]
+        self.assertEqual(len(withdrawals), 2)
+        for item in withdrawals:
+            self.assertEqual(
+                list(item),
+                ["id", "withdrawalSeq", "amountMicros", "balance",
+                 "availableBalance", "createdAt"],
+            )
+            self.assertEqual(item["createdAt"], payload["createdAt"])
+        self.assertEqual(
+            [(item["id"], item["withdrawalSeq"], item["amountMicros"]) for item in withdrawals],
+            [("wi-1", 1, 400), ("wi-2", 2, 300)],
+        )
+        self.assertEqual(
+            [item["balance"] for item in withdrawals], [600, 300]
+        )
+        self.assertEqual(
+            [item["availableBalance"] for item in withdrawals], [600, 300]
+        )
+
+    def test_batch_writes_paired_entries_and_records(self) -> None:
+        self.assertEqual(self.post_batch()[0], 201)
+        connection = sqlite3.connect(self.server.database_path)
+        connection.row_factory = sqlite3.Row
+        try:
+            entries = connection.execute(
+                "SELECT kind, reference_seq, account_id, delta_micros,"
+                " balance_after_micros FROM ledger_entries"
+                " WHERE kind = 'withdrawal' ORDER BY entry_seq ASC"
+            ).fetchall()
+            self.assertEqual(
+                [
+                    (
+                        row["kind"],
+                        row["reference_seq"],
+                        row["account_id"],
+                        row["delta_micros"],
+                        row["balance_after_micros"],
+                    )
+                    for row in entries
+                ],
+                [
+                    ("withdrawal", 1, self.machine_id, -400, 600),
+                    ("withdrawal", 1, "external:clearing", 400, -600),
+                    ("withdrawal", 2, self.machine_id, -300, 300),
+                    ("withdrawal", 2, "external:clearing", 300, -300),
+                ],
+            )
+            rows = connection.execute(
+                "SELECT withdrawal_seq, id, machine_id, amount_micros"
+                " FROM withdrawals ORDER BY withdrawal_seq ASC"
+            ).fetchall()
+            self.assertEqual(
+                [
+                    (row["withdrawal_seq"], row["id"], row["amount_micros"])
+                    for row in rows
+                ],
+                [(1, "wi-1", 400), (2, "wi-2", 300)],
+            )
+            batch = connection.execute(
+                "SELECT id FROM withdrawal_batches"
+            ).fetchone()
+            self.assertEqual(batch["id"], "wdb-1")
+        finally:
+            connection.close()
+        # 账本分页沿用既有语义：reference 为项目 id，referenceSeq 为出金序号。
+        machine_entries = [
+            entry for entry in self.ledger(self.machine_id)
+            if entry["kind"] == "withdrawal"
+        ]
+        self.assertEqual(
+            [
+                (entry["referenceSeq"], entry["reference"], entry["delta"])
+                for entry in machine_entries
+            ],
+            [(1, "wi-1", -400), (2, "wi-2", -300)],
+        )
+
+    def test_sequential_balance_check_within_batch(self) -> None:
+        # 单项均可负担，但累计超出可用余额：第二项失败，整批无写入。
+        status, body = self.post_batch(
+            self.batch_body("wdb-1", (("wi-1", 700), ("wi-2", 400)))
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "insufficient_funds"})
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM withdrawals").fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM withdrawal_batches"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM withdrawal_batch_idempotency_records"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM auth_nonce_records"
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            connection.close()
+        # 补正后原键可重试，序号从 1 开始连续分配。
+        status, body = self.post_batch(
+            self.batch_body("wdb-1", (("wi-1", 700), ("wi-2", 300)))
+        )
+        self.assertEqual(status, 201)
+        payload = json.loads(body)
+        self.assertEqual(
+            [item["withdrawalSeq"] for item in payload["withdrawals"]], [1, 2]
+        )
+
+    def test_frozen_funds_not_withdrawable_in_batch(self) -> None:
+        self.freeze(300)
+        status, body = self.post_batch(
+            self.batch_body("wdb-1", (("wi-1", 400), ("wi-2", 301)))
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "insufficient_funds"})
+        status, body = self.post_batch(
+            self.batch_body("wdb-1", (("wi-1", 400), ("wi-2", 300))),
+            idempotency_key="wdb-key-2",
+        )
+        self.assertEqual(status, 201)
+        payload = json.loads(body)
+        self.assertEqual(payload["withdrawals"][-1]["balance"], 300)
+        self.assertEqual(payload["withdrawals"][-1]["availableBalance"], 0)
+
+    def test_batch_id_conflict_different_key(self) -> None:
+        self.assertEqual(self.post_batch()[0], 201)
+        status, body = self.post_batch(
+            self.batch_body("wdb-1", (("wi-9", 100),)),
+            idempotency_key="wdb-key-2",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "batch_exists"})
+
+    def test_item_id_conflicts_with_single_withdrawal(self) -> None:
+        status, _ = self.post_single_withdrawal("wi-1", 100, "wd-key-1")
+        self.assertEqual(status, 201)
+        status, body = self.post_batch()
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "withdrawal_exists"})
+
+    def test_single_withdrawal_conflicts_with_batch_item_id(self) -> None:
+        self.assertEqual(self.post_batch()[0], 201)
+        status, body = self.post_single_withdrawal("wi-2", 100, "wd-key-2")
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "withdrawal_exists"})
+
+    def test_sequences_shared_with_single_withdrawal(self) -> None:
+        status, body = self.post_batch()
+        self.assertEqual(status, 201)
+        self.assertEqual(
+            [item["withdrawalSeq"] for item in json.loads(body)["withdrawals"]],
+            [1, 2],
+        )
+        status, body = self.post_single_withdrawal("wd-9", 100, "wd-key-9")
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(body)["withdrawalSeq"], 3)
+        status, body = self.post_batch(
+            self.batch_body("wdb-2", (("wi-3", 100),)), idempotency_key="wdb-key-2"
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(
+            json.loads(body)["withdrawals"][0]["withdrawalSeq"], 4
+        )
+
+    def test_missing_or_invalid_headers(self) -> None:
+        status, body = self.post_batch(idempotency_key=None)
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        status, body = self.post_batch(idempotency_key="bad key!")
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        status, body = self.post_batch(query="x=1")
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        status, body = self.post_batch(omit_auth=True)
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        status, body = self.post_batch(auth="not-an-auth-header")
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+        status, body = self.post_batch(
+            extra_headers={"SLA-Delegation": "d;0;1;n;" + "0" * 128}
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": "invalid_request"})
+
+    def test_invalid_bodies(self) -> None:
+        too_many = json.dumps(
+            {
+                "id": "wdb-1",
+                "items": [
+                    {"id": f"wi-{index}", "amountMicros": 1}
+                    for index in range(101)
+                ],
+            }
+        ).encode()
+        bodies = [
+            b"{}",
+            b'{"id":"wdb-1"}',
+            b'{"items":[{"id":"wi-1","amountMicros":1}]}',
+            b'{"id":"wdb-1","items":[{"id":"wi-1","amountMicros":1}],"extra":1}',
+            b'{"id":"WDB-1","items":[{"id":"wi-1","amountMicros":1}]}',
+            b'{"id":1,"items":[{"id":"wi-1","amountMicros":1}]}',
+            b'{"id":"wdb-1","items":{}}',
+            b'{"id":"wdb-1","items":[]}',
+            too_many,
+            b'{"id":"wdb-1","items":[{"id":"wi-1"}]}',
+            b'{"id":"wdb-1","items":[{"amountMicros":1}]}',
+            b'{"id":"wdb-1","items":[{"id":"wi-1","amountMicros":1,"x":2}]}',
+            b'{"id":"wdb-1","items":[{"id":"WI-1","amountMicros":1}]}',
+            b'{"id":"wdb-1","items":[{"id":"wi-1","amountMicros":0}]}',
+            b'{"id":"wdb-1","items":[{"id":"wi-1","amountMicros":-1}]}',
+            b'{"id":"wdb-1","items":[{"id":"wi-1","amountMicros":9000000000000001}]}',
+            b'{"id":"wdb-1","items":[{"id":"wi-1","amountMicros":true}]}',
+            b'{"id":"wdb-1","items":[{"id":"wi-1","amountMicros":"1"}]}',
+            b'{"id":"wdb-1","items":[{"id":"wi-1","amountMicros":1},'
+            b'{"id":"wi-1","amountMicros":2}]}',
+            b'{"id":"wdb-1","items":[{"id":"wi-1","amountMicros":1}],"id":"wdb-1"}',
+            b"not-json",
+        ]
+        for index, body in enumerate(bodies):
+            with self.subTest(index=index):
+                status, payload = self.post_batch(
+                    body, idempotency_key=f"bad-{index}"
+                )
+                self.assertEqual(status, 400)
+                self.assertEqual(json.loads(payload), {"error": "invalid_request"})
+
+    def test_unknown_account_is_404(self) -> None:
+        status, body = self.post_batch(account="ab" * 32)
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+
+    def test_auth_machine_mismatch_is_403(self) -> None:
+        body = self.batch_body()
+        auth = make_sla_auth(
+            self.server,
+            "wdb-key-1",
+            PUBLIC_KEY_SEED_B,
+            self.other_id,
+            "POST",
+            f"/v1/accounts/{self.machine_id}/withdrawal-batches",
+            body,
+            1,
+        )
+        status, payload = self.post_batch(body, auth=auth)
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(payload), {"error": "forbidden"})
+
+    def test_stale_request_is_401(self) -> None:
+        body = self.batch_body()
+        auth = make_sla_auth(
+            self.server,
+            "wdb-key-1",
+            PRODUCER_SEED,
+            self.machine_id,
+            "POST",
+            f"/v1/accounts/{self.machine_id}/withdrawal-batches",
+            body,
+            1,
+            request_time_ms=int(time.time() * 1000) - 400_000,
+        )
+        status, payload = self.post_batch(body, auth=auth)
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(payload), {"error": "stale_request"})
+
+    def test_invalid_signature_is_401(self) -> None:
+        body = self.batch_body()
+        auth = make_sla_auth(
+            self.server,
+            "wdb-key-1",
+            PUBLIC_KEY_SEED_B,
+            self.machine_id,
+            "POST",
+            f"/v1/accounts/{self.machine_id}/withdrawal-batches",
+            body,
+            1,
+        )
+        status, payload = self.post_batch(body, auth=auth)
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(payload), {"error": "invalid_authentication"})
+
+    def test_nonce_replay_detected(self) -> None:
+        self.assertEqual(self.post_batch()[0], 201)
+        first_auth = _SLA_AUTH_REGISTRY.header(
+            self.server.database_path,
+            "wdb-key-1",
+            PRODUCER_SEED,
+            self.machine_id,
+            "POST",
+            f"/v1/accounts/{self.machine_id}/withdrawal-batches",
+            self.batch_body(),
+            1,
+        )
+        reused_nonce = first_auth.split(";")[3]
+        body = self.batch_body("wdb-2", (("wi-9", 100),))
+        auth = make_sla_auth(
+            self.server,
+            "wdb-key-2",
+            PRODUCER_SEED,
+            self.machine_id,
+            "POST",
+            f"/v1/accounts/{self.machine_id}/withdrawal-batches",
+            body,
+            1,
+            nonce=reused_nonce,
+        )
+        status, payload = self.post_batch(
+            body, idempotency_key="wdb-key-2", auth=auth
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload), {"error": "replay_detected"})
+
+    def test_same_key_different_request_conflicts(self) -> None:
+        self.assertEqual(self.post_batch()[0], 201)
+        # 同键异体。
+        status, body = self.post_batch(
+            self.batch_body("wdb-1", (("wi-1", 500), ("wi-2", 300)))
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+        # 同键异路径账户。
+        status, body = self.post_batch(account=self.other_id)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+        # 同键更换认证五段（新随机数）。
+        body_bytes = self.batch_body()
+        auth = make_sla_auth(
+            self.server,
+            None,
+            PRODUCER_SEED,
+            self.machine_id,
+            "POST",
+            f"/v1/accounts/{self.machine_id}/withdrawal-batches",
+            body_bytes,
+            1,
+        )
+        status, body = self.post_batch(body_bytes, auth=auth)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_replay_returns_first_response_bytes(self) -> None:
+        _, first = self.post_batch()
+        status, body = self.post_batch()
+        self.assertEqual(status, 201)
+        self.assertEqual(body, first)
+
+    def test_replay_survives_restart(self) -> None:
+        _, first = self.post_batch()
+        self.restart()
+        status, body = self.post_batch()
+        self.assertEqual(status, 201)
+        self.assertEqual(body, first)
+
+    def test_concurrent_same_key_single_batch(self) -> None:
+        results: list[tuple[int, bytes]] = []
+        lock = threading.Lock()
+
+        def post() -> None:
+            outcome = self.post_batch()
+            with lock:
+                results.append(outcome)
+
+        threads = [threading.Thread(target=post) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual([status for status, _ in results], [201] * 8)
+        self.assertEqual(len({body for _, body in results}), 1)
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM withdrawals").fetchone()[0],
+                2,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM withdrawal_batches"
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            connection.close()
+
+    def test_concurrent_batches_never_overdraw(self) -> None:
+        results: list[tuple[int, bytes]] = []
+        lock = threading.Lock()
+
+        def post(index: int) -> None:
+            outcome = self.post_batch(
+                self.batch_body(f"wdb-{index}", ((f"wi-{index}", 200),)),
+                idempotency_key=f"wdb-key-{index}",
+            )
+            with lock:
+                results.append(outcome)
+
+        threads = [
+            threading.Thread(target=post, args=(index,)) for index in range(8)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        successes = [result for result in results if result[0] == 201]
+        failures = [result for result in results if result[0] != 201]
+        self.assertEqual(len(successes), 5)
+        self.assertEqual(len(failures), 3)
+        for status, body in failures:
+            self.assertEqual(status, 409)
+            self.assertEqual(json.loads(body), {"error": "insufficient_funds"})
+        sequences = sorted(
+            json.loads(body)["withdrawals"][0]["withdrawalSeq"]
+            for _, body in successes
+        )
+        self.assertEqual(sequences, [1, 2, 3, 4, 5])
+        entries = self.ledger(self.machine_id)
+        self.assertEqual(entries[-1]["balanceAfter"], 0)
 
 
 class SettlementTests(unittest.TestCase):
