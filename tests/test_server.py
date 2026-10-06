@@ -20430,6 +20430,468 @@ class KeyLifecycleTests(unittest.TestCase):
         self.assertEqual(seq, 1)
 
 
+class MachineKeyHistoryTests(unittest.TestCase):
+    """GET /v1/machines/{id}/keys 与 /keys/{version}：已登记机器读取密钥历史。"""
+
+    TARGET_SEED = b"\x01" * 32
+    READER_SEED = b"\x02" * 32
+    GHOST_SEED = b"\x03" * 32
+    SECOND_SEED = b"\x04" * 32
+    THIRD_SEED = b"\x05" * 32
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.target_public = _ed25519_public_key(self.TARGET_SEED).hex()
+        self.reader_public = _ed25519_public_key(self.READER_SEED).hex()
+        self.second_public = _ed25519_public_key(self.SECOND_SEED).hex()
+        self.third_public = _ed25519_public_key(self.THIRD_SEED).hex()
+        self.target = machine_id(self.target_public)
+        self.reader = machine_id(self.reader_public)
+        self.ghost = machine_id(_ed25519_public_key(self.GHOST_SEED).hex())
+        for key, public_key in (
+            ("register-target", self.target_public),
+            ("register-reader", self.reader_public),
+        ):
+            request = Request(
+                self.url("/v1/machines"),
+                data=json.dumps({"publicKey": public_key}).encode(),
+                method="POST",
+            )
+            request.add_header("Idempotency-Key", key)
+            with urlopen(request, timeout=5) as response:
+                self.assertEqual(response.status, 201)
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temporary.cleanup()
+
+    def url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}{path}"
+
+    def restart(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = ApiServer(("127.0.0.1", 0), Handler)
+        self.server.database_path = str(Path(self.temporary.name) / "service.db")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    @property
+    def collection_path(self) -> str:
+        return f"/v1/machines/{self.target}/keys"
+
+    def post_json(self, path: str, payload: object, key: str) -> tuple[int, bytes]:
+        request = Request(
+            self.url(path), data=json.dumps(payload).encode(), method="POST"
+        )
+        request.add_header("Idempotency-Key", key)
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def rotate(
+        self,
+        expected_version: int,
+        current_seed: bytes,
+        new_seed: bytes,
+        key: str,
+    ) -> tuple[int, bytes]:
+        new_public = _ed25519_public_key(new_seed).hex()
+        current_signature, new_signature = key_rotation_signatures(
+            current_seed, new_seed, self.target, expected_version, new_public
+        )
+        body = {
+            "expectedVersion": expected_version,
+            "publicKey": new_public,
+            "currentSignature": current_signature,
+            "newSignature": new_signature,
+        }
+        return self.post_json(f"/v1/machines/{self.target}/keys", body, key)
+
+    def rotate_to_three_versions(self) -> None:
+        self.assertEqual(self.rotate(1, self.TARGET_SEED, self.SECOND_SEED, "rot-2")[0], 201)
+        self.assertEqual(self.rotate(2, self.SECOND_SEED, self.THIRD_SEED, "rot-3")[0], 201)
+
+    def revoke(self, version: int, latest_seed: bytes, key: str) -> tuple[int, bytes]:
+        body = {"signature": key_revocation_signature(latest_seed, self.target, version)}
+        return self.post_json(
+            f"/v1/machines/{self.target}/keys/{version}/revocation", body, key
+        )
+
+    def get(
+        self,
+        path: str,
+        *,
+        seed: bytes | None = None,
+        actor: str | None = None,
+        auth: str | None = None,
+        nonce: str | None = None,
+        request_time_ms: int | None = None,
+        key_version: int = 1,
+        omit_auth: bool = False,
+    ) -> tuple[int, bytes]:
+        # 历史读取为 GET 且无正文；签名标准路径不含查询串，摘要按空字节计算。
+        request = Request(self.url(path), data=b"", method="GET")
+        if not omit_auth:
+            if auth is None:
+                # 每次调用默认分配独立随机数；显式传入 nonce 的用例验证重放语义。
+                if nonce is None:
+                    nonce = f"nonce-keys-{time.time_ns()}"
+                auth = make_sla_auth(
+                    self.server,
+                    None,
+                    seed if seed is not None else self.READER_SEED,
+                    actor if actor is not None else self.reader,
+                    "GET",
+                    urlsplit(path).path,
+                    b"",
+                    key_version,
+                    request_time_ms=request_time_ms,
+                    nonce=nonce,
+                )
+            request.add_header("SLA-Auth", auth)
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+        except HTTPError as error:
+            return error.code, error.read()
+
+    def get_json(self, path: str, **kwargs: object) -> tuple[int, object]:
+        status, payload = self.get(path, **kwargs)
+        return status, json.loads(payload)
+
+    def test_first_page_single_version_key_order(self) -> None:
+        status, payload = self.get(self.collection_path)
+        self.assertEqual(status, 200)
+        body = json.loads(payload)
+        self.assertEqual(list(body), ["keys", "nextCursor", "head"])
+        self.assertIsNone(body["nextCursor"])
+        self.assertEqual(len(body["keys"]), 1)
+        item = body["keys"][0]
+        self.assertEqual(list(item), ["version", "publicKey", "activatedAt", "revoked"])
+        self.assertEqual(
+            item,
+            {
+                "version": 1,
+                "publicKey": self.target_public,
+                "activatedAt": 0,
+                "revoked": False,
+            },
+        )
+        self.assertEqual(body["head"], item)
+
+    def test_history_after_rotations_and_revocation(self) -> None:
+        self.rotate_to_three_versions()
+        self.assertEqual(self.revoke(1, self.THIRD_SEED, "rev-1")[0], 200)
+        status, body = self.get_json(self.collection_path)
+        self.assertEqual(status, 200)
+        keys = body["keys"]
+        self.assertEqual([item["version"] for item in keys], [1, 2, 3])
+        self.assertEqual(
+            [item["publicKey"] for item in keys],
+            [self.target_public, self.second_public, self.third_public],
+        )
+        self.assertEqual([item["revoked"] for item in keys], [True, False, False])
+        self.assertEqual(keys[0]["activatedAt"], 0)
+        self.assertTrue(all(item["activatedAt"] >= 0 for item in keys))
+        self.assertIsNone(body["nextCursor"])
+        self.assertEqual(body["head"], keys[2])
+
+    def test_pagination_limit_and_cursor(self) -> None:
+        self.rotate_to_three_versions()
+        status, first = self.get_json(f"{self.collection_path}?limit=2")
+        self.assertEqual(status, 200)
+        self.assertEqual([item["version"] for item in first["keys"]], [1, 2])
+        self.assertEqual(first["nextCursor"], "3:2")
+        self.assertEqual(first["head"]["version"], 3)
+        status, second = self.get_json(
+            f"{self.collection_path}?limit=2&cursor={first['nextCursor']}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual([item["version"] for item in second["keys"]], [3])
+        self.assertIsNone(second["nextCursor"])
+        self.assertEqual(second["head"]["version"], 3)
+
+    def test_snapshot_isolation_excludes_later_rotations(self) -> None:
+        self.assertEqual(self.rotate(1, self.TARGET_SEED, self.SECOND_SEED, "rot-2")[0], 201)
+        status, first = self.get_json(f"{self.collection_path}?limit=1")
+        self.assertEqual(status, 200)
+        self.assertEqual([item["version"] for item in first["keys"]], [1])
+        self.assertEqual(first["nextCursor"], "2:1")
+        # 首页后的新轮换不得混入旧游标续页。
+        self.assertEqual(self.rotate(2, self.SECOND_SEED, self.THIRD_SEED, "rot-3")[0], 201)
+        status, second = self.get_json(
+            f"{self.collection_path}?limit=1&cursor={first['nextCursor']}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual([item["version"] for item in second["keys"]], [2])
+        self.assertIsNone(second["nextCursor"])
+        self.assertEqual(second["head"]["version"], 2)
+        # 全新首页取新 cut：三个版本齐全，head 为最新版本。
+        status, fresh = self.get_json(self.collection_path)
+        self.assertEqual(status, 200)
+        self.assertEqual([item["version"] for item in fresh["keys"]], [1, 2, 3])
+        self.assertEqual(fresh["head"]["version"], 3)
+
+    def test_cursor_survives_restart(self) -> None:
+        self.rotate_to_three_versions()
+        status, first = self.get_json(f"{self.collection_path}?limit=1")
+        self.assertEqual(status, 200)
+        cursor = first["nextCursor"]
+        self.restart()
+        status, second = self.get_json(
+            f"{self.collection_path}?limit=1&cursor={cursor}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual([item["version"] for item in second["keys"]], [2])
+        self.assertEqual(second["nextCursor"], "3:2")
+
+    def test_cursor_cut_ahead_is_400(self) -> None:
+        status, payload = self.get_json(f"{self.collection_path}?cursor=999:1")
+        self.assertEqual((status, payload), (400, {"error": "invalid_request"}))
+
+    def test_cursor_anchor_must_exist_within_cut(self) -> None:
+        self.assertEqual(self.rotate(1, self.TARGET_SEED, self.SECOND_SEED, "rot-2")[0], 201)
+        # lastVersion 超过 cut、锚点版本不存在（含 0 与空洞）均非法。
+        for cursor in ("2:5", "2:0", "1:2", "2:9"):
+            status, payload = self.get_json(f"{self.collection_path}?cursor={cursor}")
+            self.assertEqual(
+                (status, payload), (400, {"error": "invalid_request"}), cursor
+            )
+        # 锚点等于 cut 合法：返回空页与 cut 对应 head。
+        status, body = self.get_json(f"{self.collection_path}?cursor=2:2")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["keys"], [])
+        self.assertIsNone(body["nextCursor"])
+        self.assertEqual(body["head"]["version"], 2)
+
+    def test_unknown_or_invalid_machine_is_404(self) -> None:
+        status, payload = self.get_json(f"/v1/machines/{self.ghost}/keys")
+        self.assertEqual((status, payload), (404, {"error": "not_found"}))
+        status, payload = self.get_json("/v1/machines/not-a-machine/keys")
+        self.assertEqual((status, payload), (404, {"error": "not_found"}))
+
+    def test_any_registered_machine_can_read(self) -> None:
+        # 目标机器读取对方历史；默认用例即读取方机器读目标机器历史。
+        status, body = self.get_json(
+            f"/v1/machines/{self.reader}/keys",
+            seed=self.TARGET_SEED,
+            actor=self.target,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["version"] for item in body["keys"]], [1]
+        )
+        self.assertEqual(body["keys"][0]["publicKey"], self.reader_public)
+
+    def test_unregistered_auth_machine_is_401(self) -> None:
+        status, payload = self.get_json(
+            self.collection_path, seed=self.GHOST_SEED, actor=self.ghost
+        )
+        self.assertEqual(
+            (status, payload), (401, {"error": "invalid_authentication"})
+        )
+
+    def test_missing_malformed_or_duplicate_auth_header_is_400(self) -> None:
+        status, payload = self.get_json(self.collection_path, omit_auth=True)
+        self.assertEqual((status, payload), (400, {"error": "invalid_request"}))
+        # 认证结构判定先于资源查询：机器不存在时仍为 400。
+        status, payload = self.get_json(
+            f"/v1/machines/{self.ghost}/keys", omit_auth=True
+        )
+        self.assertEqual((status, payload), (400, {"error": "invalid_request"}))
+        now = int(time.time() * 1000)
+        for raw in (
+            "x",
+            "a;b;c;d",
+            f"{self.reader};01;{now};nonce-0123456789ab;{'a' * 128}",
+            f"{self.reader};0;{now};nonce-0123456789ab;{'a' * 128}",
+            f"{self.reader};1;{now};short;{'a' * 128}",
+            f"{self.reader};1;{now};nonce-0123456789ab;{'A' * 128}",
+            f"{'A' * 64};1;{now};nonce-0123456789ab;{'a' * 128}",
+        ):
+            status, payload = self.get_json(self.collection_path, auth=raw)
+            self.assertEqual(
+                (status, payload), (400, {"error": "invalid_request"}), raw
+            )
+            status, payload = self.get_json(
+                f"{self.collection_path}/1", auth=raw
+            )
+            self.assertEqual(
+                (status, payload), (400, {"error": "invalid_request"}), raw
+            )
+        # 重复认证头同样 400（urllib 会同名去重，直接用 http.client 发两个头）。
+        import http.client
+        target = urlsplit(self.url(self.collection_path))
+        connection = http.client.HTTPConnection(target.hostname, target.port, timeout=5)
+        connection.putrequest("GET", target.path)
+        connection.putheader("SLA-Auth", "a")
+        connection.putheader("SLA-Auth", "b")
+        connection.endheaders()
+        response = connection.getresponse()
+        self.assertEqual(response.status, 400)
+        self.assertEqual(json.loads(response.read()), {"error": "invalid_request"})
+        connection.close()
+
+    def test_query_params_validated_before_resource_and_auth(self) -> None:
+        for query in (
+            "?limit=0",
+            "?limit=101",
+            "?limit=01",
+            "?limit=x",
+            "?limit=1&limit=2",
+            "?bogus=1",
+            "?cursor=1",
+            "?cursor=x:y",
+            "?cursor=1:2:3",
+            "?cursor=1:1&cursor=1:1",
+        ):
+            # 无认证头且机器不存在：参数判定最先，仍为 400。
+            status, payload = self.get_json(
+                f"/v1/machines/{self.ghost}/keys{query}", omit_auth=True
+            )
+            self.assertEqual(
+                (status, payload), (400, {"error": "invalid_request"}), query
+            )
+
+    def test_stale_and_bad_signature_are_401(self) -> None:
+        status, payload = self.get_json(
+            self.collection_path,
+            request_time_ms=int(time.time() * 1000) - 400_000,
+        )
+        self.assertEqual((status, payload), (401, {"error": "stale_request"}))
+        good = make_sla_auth(
+            self.server, None, self.READER_SEED, self.reader,
+            "GET", self.collection_path, b"", 1, nonce="nonce-keys-badsig-01",
+        )
+        tampered = good[:-1] + ("0" if good[-1] != "0" else "1")
+        status, payload = self.get_json(self.collection_path, auth=tampered)
+        self.assertEqual(
+            (status, payload), (401, {"error": "invalid_authentication"})
+        )
+        # 未知密钥版本同样 invalid_authentication。
+        status, payload = self.get_json(self.collection_path, key_version=9)
+        self.assertEqual(
+            (status, payload), (401, {"error": "invalid_authentication"})
+        )
+
+    def test_nonce_consumed_only_on_success(self) -> None:
+        # 成功读取消费随机数：同机同随机数再次读取被判重放。
+        nonce = "nonce-keys-success-01"
+        status, _ = self.get(self.collection_path, nonce=nonce)
+        self.assertEqual(status, 200)
+        status, payload = self.get_json(self.collection_path, nonce=nonce)
+        self.assertEqual((status, payload), (409, {"error": "replay_detected"}))
+        # 资源不存在（404）不消费：同一随机数随后可成功。
+        missing_nonce = "nonce-keys-missing-01"
+        status, payload = self.get_json(
+            f"/v1/machines/{self.ghost}/keys", nonce=missing_nonce
+        )
+        self.assertEqual((status, payload), (404, {"error": "not_found"}))
+        status, _ = self.get(self.collection_path, nonce=missing_nonce)
+        self.assertEqual(status, 200)
+        # 游标非法（400）不消费。
+        cursor_nonce = "nonce-keys-cursor-01"
+        status, payload = self.get_json(
+            f"{self.collection_path}?cursor=999:1", nonce=cursor_nonce
+        )
+        self.assertEqual((status, payload), (400, {"error": "invalid_request"}))
+        status, _ = self.get(self.collection_path, nonce=cursor_nonce)
+        self.assertEqual(status, 200)
+        # 过期请求（401）不消费。
+        stale_nonce = "nonce-keys-stale-001"
+        status, payload = self.get_json(
+            self.collection_path,
+            nonce=stale_nonce,
+            request_time_ms=int(time.time() * 1000) - 400_000,
+        )
+        self.assertEqual((status, payload), (401, {"error": "stale_request"}))
+        status, _ = self.get(self.collection_path, nonce=stale_nonce)
+        self.assertEqual(status, 200)
+
+    def test_item_returns_requested_version(self) -> None:
+        self.rotate_to_three_versions()
+        self.assertEqual(self.revoke(1, self.THIRD_SEED, "rev-1")[0], 200)
+        status, payload = self.get(f"{self.collection_path}/1")
+        self.assertEqual(status, 200)
+        item = json.loads(payload)
+        self.assertEqual(list(item), ["version", "publicKey", "activatedAt", "revoked"])
+        self.assertEqual(
+            item,
+            {
+                "version": 1,
+                "publicKey": self.target_public,
+                "activatedAt": 0,
+                "revoked": True,
+            },
+        )
+        status, latest = self.get_json(f"{self.collection_path}/3")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            (latest["version"], latest["publicKey"], latest["revoked"]),
+            (3, self.third_public, False),
+        )
+
+    def test_item_unknown_version_or_machine_is_404(self) -> None:
+        status, payload = self.get_json(f"{self.collection_path}/2")
+        self.assertEqual((status, payload), (404, {"error": "not_found"}))
+        status, payload = self.get_json(f"/v1/machines/{self.ghost}/keys/1")
+        self.assertEqual((status, payload), (404, {"error": "not_found"}))
+
+    def test_item_version_format_is_404(self) -> None:
+        for version_text in ("0", "01", "x", "-1", "1.0"):
+            status, payload = self.get_json(f"{self.collection_path}/{version_text}")
+            self.assertEqual(
+                (status, payload), (404, {"error": "not_found"}), version_text
+            )
+
+    def test_item_query_param_is_400_before_resource(self) -> None:
+        status, payload = self.get_json(f"{self.collection_path}/1?x=1")
+        self.assertEqual((status, payload), (400, {"error": "invalid_request"}))
+        status, payload = self.get_json(
+            f"/v1/machines/{self.ghost}/keys/1?limit=1"
+        )
+        self.assertEqual((status, payload), (400, {"error": "invalid_request"}))
+
+    def test_item_auth_and_nonce_semantics(self) -> None:
+        # 未登记认证机器为 401；缺失认证头为 400。
+        status, payload = self.get_json(
+            f"{self.collection_path}/1", seed=self.GHOST_SEED, actor=self.ghost
+        )
+        self.assertEqual(
+            (status, payload), (401, {"error": "invalid_authentication"})
+        )
+        status, payload = self.get_json(f"{self.collection_path}/1", omit_auth=True)
+        self.assertEqual((status, payload), (400, {"error": "invalid_request"}))
+        # 成功消费随机数；失败（404）不消费。
+        nonce = "nonce-keys-item-0001"
+        status, _ = self.get(f"{self.collection_path}/1", nonce=nonce)
+        self.assertEqual(status, 200)
+        status, payload = self.get_json(f"{self.collection_path}/1", nonce=nonce)
+        self.assertEqual((status, payload), (409, {"error": "replay_detected"}))
+        missing_nonce = "nonce-keys-item-404"
+        status, payload = self.get_json(
+            f"{self.collection_path}/9", nonce=missing_nonce
+        )
+        self.assertEqual((status, payload), (404, {"error": "not_found"}))
+        status, _ = self.get(f"{self.collection_path}/1", nonce=missing_nonce)
+        self.assertEqual(status, 200)
+
+    def test_item_cursor_like_version_not_confused_with_collection(self) -> None:
+        # 集合游标与单项路径互不混淆：/keys/1:2 不是合法版本号。
+        status, payload = self.get_json(f"{self.collection_path}/1:2")
+        self.assertEqual((status, payload), (404, {"error": "not_found"}))
+
+
 class MachineKeysMigrationTests(unittest.TestCase):
     """密钥历史升级前的旧库：machines 已存在但无 machine_keys 历史。"""
 

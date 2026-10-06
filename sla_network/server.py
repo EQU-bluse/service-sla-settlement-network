@@ -35,6 +35,7 @@ MACHINE_DELEGATION_CONSUMPTIONS_PATH_PATTERN = re.compile(
     r"/v1/machines/([^/]+)/delegation-consumptions"
 )
 MACHINE_KEYS_PATH_PATTERN = re.compile(r"/v1/machines/([^/]+)/keys")
+MACHINE_KEY_ITEM_PATH_PATTERN = re.compile(r"/v1/machines/([^/]+)/keys/([^/]+)")
 MACHINE_KEY_REVOCATION_PATH_PATTERN = re.compile(
     r"/v1/machines/([^/]+)/keys/([^/]+)/revocation"
 )
@@ -204,6 +205,7 @@ DISPUTE_ESCALATIONS_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTE_ARBITRATIONS_QUERY_PARAMS = {"limit", "cursor"}
 DISPUTES_QUERY_PARAMS = {"accountId", "state", "limit", "cursor"}
 MACHINE_DELEGATIONS_QUERY_PARAMS = {"limit", "cursor"}
+MACHINE_KEYS_QUERY_PARAMS = {"limit", "cursor"}
 DELEGATION_EVENTS_QUERY_PARAMS = {"limit", "cursor"}
 DELEGATION_CONSUMPTIONS_QUERY_PARAMS = {"limit", "cursor"}
 AUDIT_CHECKPOINTS_QUERY_PARAMS = {"limit", "cursor"}
@@ -434,6 +436,18 @@ class Handler(BaseHTTPRequestHandler):
             self._get_delegation_events(
                 delegation_events_match.group(1), target.query
             )
+            return
+        machine_key_item_match = MACHINE_KEY_ITEM_PATH_PATTERN.fullmatch(target.path)
+        if machine_key_item_match is not None:
+            self._get_machine_key(
+                machine_key_item_match.group(1),
+                machine_key_item_match.group(2),
+                target.query,
+            )
+            return
+        machine_keys_match = MACHINE_KEYS_PATH_PATTERN.fullmatch(target.path)
+        if machine_keys_match is not None:
+            self._get_machine_keys(machine_keys_match.group(1), target.query)
             return
         evaluations_match = SLA_EVALUATIONS_PATH_PATTERN.fullmatch(target.path)
         if evaluations_match is not None:
@@ -1925,6 +1939,148 @@ class Handler(BaseHTTPRequestHandler):
                 f"{cut}:{page[-1]['event_seq']}" if has_next else None
             )
             return {"consumptions": consumptions, "nextCursor": next_cursor}
+
+        status, error, payload = self._authenticated_audit_transaction(
+            standard_path, auth, resolve_resource, build_snapshot
+        )
+        if payload is None:
+            self._json(status, {"error": error})
+            return
+        self._json(status, payload)
+
+    def _get_machine_keys(self, machine_id: str, query: str) -> None:
+        # 查询参数、limit、cursor=cut:lastVersion 的格式与范围沿用评估历史查询。
+        parsed = self._parse_evaluation_query(query, MACHINE_KEYS_QUERY_PARAMS)
+        if parsed is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        limit, cursor = parsed
+        # 认证结构先于资源检查；GET 无正文。任一已登记机器均可读取他机历史，
+        # 期望签名者即认证机器自身（不做路径机器一致性判定）。
+        auth = self._parse_sla_auth()
+        if auth is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        standard_path = urlsplit(self.path).path
+
+        def resolve_resource(database: Any) -> tuple[Any, str]:
+            # 路径机器标识非法或不存在均为 404。
+            return (
+                database.execute(
+                    "SELECT id FROM machines WHERE id = ?", (machine_id,)
+                ).fetchone(),
+                auth.machine_id,
+            )
+
+        def build_snapshot(database: Any, resource: Any) -> dict[str, Any] | None:
+            # 首页以读事务起点的目标机器最大密钥版本冻结快照；读事务与并发
+            # 轮换、吊销的写事务串行，单页只见某一时刻的完整记录。
+            max_record = database.execute(
+                "SELECT MAX(version) AS current_max FROM machine_keys"
+                " WHERE machine_id = ?",
+                (machine_id,),
+            ).fetchone()
+            current_max = max_record["current_max"] or 0
+            if cursor is None:
+                cut = current_max
+                last_version = 0
+            else:
+                cut, last_version = cursor
+                if cut > current_max:
+                    return None
+                # 锚点须是该机器在 cut 内存在的版本；否则为非法游标。
+                anchor = database.execute(
+                    "SELECT 1 FROM machine_keys"
+                    " WHERE machine_id = ? AND version = ? AND version <= ?",
+                    (machine_id, last_version, cut),
+                ).fetchone()
+                if anchor is None:
+                    return None
+            # 版本按机器自一稠密递增：cut 不超过当前最大版本即必有对应记录。
+            head_record = database.execute(
+                "SELECT version, public_key, activated_at_ms, revoked"
+                " FROM machine_keys WHERE machine_id = ? AND version = ?",
+                (machine_id, cut),
+            ).fetchone()
+            if head_record is None:
+                return None
+            rows = database.execute(
+                "SELECT version, public_key, activated_at_ms, revoked"
+                " FROM machine_keys"
+                " WHERE machine_id = ? AND version <= ? AND version > ?"
+                " ORDER BY version ASC"
+                " LIMIT ?",
+                (machine_id, cut, last_version, limit + 1),
+            ).fetchall()
+            has_next = len(rows) > limit
+            page = rows[:limit]
+
+            def key_object(row: Any) -> dict[str, Any]:
+                return {
+                    "version": row["version"],
+                    "publicKey": row["public_key"],
+                    "activatedAt": row["activated_at_ms"],
+                    "revoked": bool(row["revoked"]),
+                }
+
+            keys = [key_object(row) for row in page]
+            next_cursor = f"{cut}:{page[-1]['version']}" if has_next else None
+            return {
+                "keys": keys,
+                "nextCursor": next_cursor,
+                "head": key_object(head_record),
+            }
+
+        status, error, payload = self._authenticated_audit_transaction(
+            standard_path, auth, resolve_resource, build_snapshot
+        )
+        if payload is None:
+            self._json(status, {"error": error})
+            return
+        self._json(status, payload)
+
+    def _get_machine_key(
+        self, machine_id: str, version_text: str, query: str
+    ) -> None:
+        # 单项读取不接受任何查询参数：参数与认证结构校验均先于资源查询。
+        if parse_qsl(query, keep_blank_values=True):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        auth = self._parse_sla_auth()
+        if auth is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+            return
+        # 路径版本须为无前导零十进制正整数；非法按不存在处理（404）。
+        version: int | None = None
+        if DECIMAL_PATTERN.fullmatch(version_text) is not None:
+            value = _decimal_int(version_text)
+            if value is not None and 1 <= value <= INT64_MAX:
+                version = value
+        standard_path = urlsplit(self.path).path
+
+        def resolve_resource(database: Any) -> tuple[Any, str]:
+            # 机器或版本记录不存在均为 404；任一已登记机器均可读取。
+            machine = database.execute(
+                "SELECT id FROM machines WHERE id = ?", (machine_id,)
+            ).fetchone()
+            if machine is None or version is None:
+                return None, auth.machine_id
+            return (
+                database.execute(
+                    "SELECT version, public_key, activated_at_ms, revoked"
+                    " FROM machine_keys WHERE machine_id = ? AND version = ?",
+                    (machine_id, version),
+                ).fetchone(),
+                auth.machine_id,
+            )
+
+        def build_snapshot(database: Any, resource: Any) -> dict[str, Any] | None:
+            return {
+                "version": resource["version"],
+                "publicKey": resource["public_key"],
+                "activatedAt": resource["activated_at_ms"],
+                "revoked": bool(resource["revoked"]),
+            }
 
         status, error, payload = self._authenticated_audit_transaction(
             standard_path, auth, resolve_resource, build_snapshot
