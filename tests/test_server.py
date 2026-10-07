@@ -35442,6 +35442,553 @@ class FinalAuditVerificationProofVerificationProofVerificationProofVerificationP
         )
 
 
+class FinalAuditVerificationProofVerificationProofVerificationProofVerificationProofVerificationTests(
+    FinalAuditVerificationProofVerificationProofVerificationProofVerificationProofWitnessTests
+):
+    # 一致性报告冻结证明复核报告冻结证明复核报告冻结证明复核报告冻结证明复核
+    # 一致性报告：对截至某复核证明复核报告冻结证明的
+    # final-audit-verification-proof-verification-proof-verification-proof-verification-proof-chain-v1
+    # 前向链与链头见证生成不可变报告。调用形态沿用上一层复核一致性报告，仅更换
+    # 数据源为
+    # final_audit_verification_proof_verification_proof_verification_proof_verification_proofs/
+    # final_audit_verification_proof_verification_proof_verification_proof_verification_proof_chain/
+    # final_audit_verification_proof_verification_proof_verification_proof_verification_proof_witnesses。
+    # 辅助方法复用本层链头见证测试；屏蔽继承来的既有测试。
+    for _inherited in dir(
+        FinalAuditVerificationProofVerificationProofVerificationProofVerificationProofWitnessTests
+    ):
+        if _inherited.startswith("test_"):
+            locals()[_inherited] = None
+
+    L4_CHAIN_PROOF_VERIFICATIONS = (
+        "/v1/final-audit-verification-proof-verification-proof"
+        "-verification-proof-verification-proof-verifications"
+    )
+    L4_VERIFICATION_TABLE = (
+        "final_audit_verification_proof_verification_proof"
+        "_verification_proof_verification_proof_verifications"
+    )
+    L4_VERIFICATION_IDEMPOTENCY_TABLE = (
+        "final_audit_verification_proof_verification_proof"
+        "_verification_proof_verification_proof_verification_idempotency_records"
+    )
+    L4_PROOF_TABLE = (
+        "final_audit_verification_proof_verification_proof"
+        "_verification_proof_verification_proofs"
+    )
+
+    def post_l4_chain_proof_verification_report(
+        self, proof_seq: object, key: str, **kwargs: object
+    ) -> tuple[int, bytes]:
+        return self.request_raw(
+            self.L4_CHAIN_PROOF_VERIFICATIONS,
+            json.dumps({"proofSeq": proof_seq}).encode(),
+            key,
+            "POST",
+            **kwargs,
+        )
+
+    def setup_three_l4_chain_proofs(self, key: str) -> None:
+        # 本层冻结证明 1、2 签署同一份复核报告；证明 3 签署第二份报告。
+        self.setup_two_l4_chain_proofs(f"{key}-a")
+        report2 = self.setup_second_chain_proof_verification_report(f"{key}-b")
+        status, _ = self.post_chain_proof_verification_proof(
+            2, report2, f"{key}-p3"
+        )
+        self.assertEqual(status, 201)
+
+    def test_favpvpvpvpv_clean_partial_and_full_coverage(self) -> None:
+        self.setup_three_l4_chain_proofs("favpvpvpvpv-clean")
+        # 空见证库：witnessSeqBound 为 0，全部链位置未覆盖。
+        status, response = self.post_l4_chain_proof_verification_report(
+            1, "favpvpvpvpv-clean-r1"
+        )
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(payload["verificationSeq"], 1)
+        self.assertEqual(payload["witnessSeqBound"], 0)
+        self.assertTrue(payload["chainConsistent"])
+        self.assertFalse(payload["fullyCovered"])
+        self.assertEqual(payload["uncoveredNodes"], [1])
+        # 仅见证节点 2、3：上界 3 处节点 1 未覆盖。
+        cd2 = self.proof_chain_digest_for(2)
+        cd3 = self.proof_chain_digest_for(3)
+        self.assertEqual(self.post_favpvpvpvpw(2, cd2, "favpvpvpvpv-clean-w2")[0], 201)
+        self.assertEqual(self.post_favpvpvpvpw(3, cd3, "favpvpvpvpv-clean-w3")[0], 201)
+        status, response = self.post_l4_chain_proof_verification_report(
+            3, "favpvpvpvpv-clean-r3"
+        )
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(
+            list(payload),
+            [
+                "verificationSeq",
+                "proofSeqBound",
+                "witnessSeqBound",
+                "digest",
+                "createdBy",
+                "createdAt",
+                "chainConsistent",
+                "fullyCovered",
+                "invalidChainNodes",
+                "invalidWitnesses",
+                "uncoveredNodes",
+            ],
+        )
+        # 独立序号空间：即使其他复核报告已存在，本功能报告序号仍自 1 起。
+        self.assertEqual(payload["verificationSeq"], 2)
+        self.assertEqual(payload["proofSeqBound"], 3)
+        self.assertEqual(payload["witnessSeqBound"], 2)
+        self.assertEqual(payload["createdBy"], self.auditor_id)
+        self.assertTrue(payload["chainConsistent"])
+        self.assertFalse(payload["fullyCovered"])
+        self.assertEqual(payload["invalidChainNodes"], [])
+        self.assertEqual(payload["invalidWitnesses"], [])
+        self.assertEqual(payload["uncoveredNodes"], [1])
+        self.assertEqual(payload["digest"], self.expected_report_digest(payload))
+        self.assertFalse(response.endswith(b"\n"))
+        # 补齐节点 1 的见证后完整覆盖。
+        cd1 = self.proof_chain_digest_for(1)
+        self.assertEqual(self.post_favpvpvpvpw(1, cd1, "favpvpvpvpv-clean-w1")[0], 201)
+        status, response = self.post_l4_chain_proof_verification_report(
+            3, "favpvpvpvpv-clean-full"
+        )
+        payload = json.loads(response)
+        self.assertEqual(status, 201)
+        self.assertTrue(payload["chainConsistent"])
+        self.assertTrue(payload["fullyCovered"])
+        self.assertEqual(payload["uncoveredNodes"], [])
+        self.assertEqual(payload["witnessSeqBound"], 3)
+        self.assertEqual(payload["digest"], self.expected_report_digest(payload))
+
+    def test_favpvpvpvpv_witness_outside_segment_is_ignored(self) -> None:
+        self.setup_three_l4_chain_proofs("favpvpvpvpv-out")
+        # 见证指向节点 2：报告上界 1 时该见证在段外，忽略且不计为坏见证，
+        # witnessSeqBound 仍冻结为本功能全库最大见证序号 1。
+        cd2 = self.proof_chain_digest_for(2)
+        self.assertEqual(self.post_favpvpvpvpw(2, cd2, "favpvpvpvpv-out-w2")[0], 201)
+        status, response = self.post_l4_chain_proof_verification_report(
+            1, "favpvpvpvpv-out-r1"
+        )
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(payload["witnessSeqBound"], 1)
+        self.assertEqual(payload["invalidWitnesses"], [])
+        self.assertEqual(payload["uncoveredNodes"], [1])
+        # 同一见证在上界 2 的报告中有效并覆盖节点 2。
+        status, response = self.post_l4_chain_proof_verification_report(
+            2, "favpvpvpvpv-out-r2"
+        )
+        payload = json.loads(response)
+        self.assertEqual(status, 201)
+        self.assertEqual(payload["invalidWitnesses"], [])
+        self.assertEqual(payload["uncoveredNodes"], [1])
+
+    def test_favpvpvpvpv_missing_proof_only_marks_that_node_without_cascade(
+        self,
+    ) -> None:
+        self.setup_three_l4_chain_proofs("favpvpvpvpv-gap")
+        cd2 = self.proof_chain_digest_for(2)
+        cd3 = self.proof_chain_digest_for(3)
+        self.assertEqual(self.post_favpvpvpvpw(2, cd2, "favpvpvpvpv-gap-w2")[0], 201)
+        self.assertEqual(self.post_favpvpvpvpw(3, cd3, "favpvpvpvpv-gap-w3")[0], 201)
+        # 删除序号 1 的冻结证明（链项保留）：只有 1 坏，节点 2 以保存链项
+        # 重新锚定独立核对，节点 3 恢复全量核对，均不级联判坏。
+        self.db_execute(f"DELETE FROM {self.L4_PROOF_TABLE} WHERE proof_seq = 1")
+        status, response = self.post_l4_chain_proof_verification_report(
+            3, "favpvpvpvpv-gap-r"
+        )
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertFalse(payload["chainConsistent"])
+        self.assertEqual(payload["invalidChainNodes"], [1])
+        self.assertEqual(payload["invalidWitnesses"], [])
+        self.assertEqual(payload["uncoveredNodes"], [1])
+        self.assertFalse(payload["fullyCovered"])
+        self.assertEqual(payload["digest"], self.expected_report_digest(payload))
+
+    def test_favpvpvpvpv_consecutive_missing_proofs_each_recorded_once(self) -> None:
+        self.setup_three_l4_chain_proofs("favpvpvpvpv-gaps")
+        cd3 = self.proof_chain_digest_for(3)
+        self.assertEqual(self.post_favpvpvpvpw(3, cd3, "favpvpvpvpv-gaps-w3")[0], 201)
+        self.db_execute(
+            f"DELETE FROM {self.L4_PROOF_TABLE} WHERE proof_seq IN (1, 2)"
+        )
+        status, response = self.post_l4_chain_proof_verification_report(
+            3, "favpvpvpvpv-gaps-r"
+        )
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(payload["invalidChainNodes"], [1, 2])
+        self.assertEqual(payload["invalidWitnesses"], [])
+        self.assertEqual(payload["uncoveredNodes"], [1, 2])
+        self.assertFalse(payload["chainConsistent"])
+        self.assertFalse(payload["fullyCovered"])
+
+    def test_favpvpvpvpv_missing_chain_item_does_not_break_following_node(
+        self,
+    ) -> None:
+        self.setup_three_l4_chain_proofs("favpvpvpvpv-cgap")
+        cd1 = self.proof_chain_digest_for(1)
+        cd3 = self.proof_chain_digest_for(3)
+        self.assertEqual(self.post_favpvpvpvpw(1, cd1, "favpvpvpvpv-cgap-w1")[0], 201)
+        self.assertEqual(self.post_favpvpvpvpw(3, cd3, "favpvpvpvpv-cgap-w3")[0], 201)
+        # 仅删除节点 2 的链项（证明仍在）：节点 2 坏，规范链沿证明真相继续，
+        # 节点 3 的前项摘要与链摘要照常全量核对通过。
+        self.db_execute(f"DELETE FROM {self.L4_CHAIN_TABLE} WHERE proof_seq = 2")
+        status, response = self.post_l4_chain_proof_verification_report(
+            3, "favpvpvpvpv-cgap-r"
+        )
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(payload["invalidChainNodes"], [2])
+        self.assertEqual(payload["invalidWitnesses"], [])
+        self.assertEqual(payload["uncoveredNodes"], [2])
+        self.assertFalse(payload["chainConsistent"])
+        self.assertFalse(payload["fullyCovered"])
+
+    def test_favpvpvpvpv_reanchored_node_self_inconsistency_is_still_bad(self) -> None:
+        self.setup_three_l4_chain_proofs("favpvpvpvpv-anchor")
+        cd3 = self.proof_chain_digest_for(3)
+        self.assertEqual(self.post_favpvpvpvpw(3, cd3, "favpvpvpvpv-anchor-w3")[0], 201)
+        self.db_execute(f"DELETE FROM {self.L4_PROOF_TABLE} WHERE proof_seq = 1")
+        # 缺口后首个完整节点 2 保存链摘要与其自身证明响应不自洽：独立核对
+        # 失败，节点 2 仍坏，规范链不能在该处恢复；节点 3 另行独立锚定有效。
+        self.db_execute(
+            f"UPDATE {self.L4_CHAIN_TABLE} SET chain_digest = ? WHERE proof_seq = 2",
+            ("f" * 64,),
+        )
+        status, response = self.post_l4_chain_proof_verification_report(
+            3, "favpvpvpvpv-anchor-r"
+        )
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(payload["invalidChainNodes"], [1, 2])
+        self.assertEqual(payload["invalidWitnesses"], [])
+        self.assertEqual(payload["uncoveredNodes"], [1, 2])
+        self.assertFalse(payload["fullyCovered"])
+
+    def test_favpvpvpvpv_real_tamper_after_gap_marks_witness_and_nodes(self) -> None:
+        self.setup_three_l4_chain_proofs("favpvpvpvpv-tamper")
+        cd2 = self.proof_chain_digest_for(2)
+        cd3 = self.proof_chain_digest_for(3)
+        self.assertEqual(self.post_favpvpvpvpw(2, cd2, "favpvpvpvpv-tamper-w2")[0], 201)
+        self.assertEqual(self.post_favpvpvpvpw(3, cd3, "favpvpvpvpv-tamper-w3")[0], 201)
+        self.db_execute(f"DELETE FROM {self.L4_PROOF_TABLE} WHERE proof_seq = 1")
+        # 节点 2 重新锚定有效、上下文恢复；此后替换节点 3 的链摘要仍须落网，
+        # 节点 3 上的见证（见证序号 2）冻结链摘要不再等于被改节点，记为坏见证。
+        self.db_execute(
+            f"UPDATE {self.L4_CHAIN_TABLE} SET chain_digest = ? WHERE proof_seq = 3",
+            ("e" * 64,),
+        )
+        status, response = self.post_l4_chain_proof_verification_report(
+            3, "favpvpvpvpv-tamper-r"
+        )
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(payload["invalidChainNodes"], [1, 3])
+        self.assertEqual(payload["invalidWitnesses"], [2])
+        self.assertEqual(payload["uncoveredNodes"], [1, 3])
+        self.assertFalse(payload["chainConsistent"])
+        self.assertFalse(payload["fullyCovered"])
+
+    def test_favpvpvpvpv_tampered_witness_auth_fields_invalidates_witness(
+        self,
+    ) -> None:
+        self.setup_three_l4_chain_proofs("favpvpvpvpv-wbad")
+        cd1 = self.proof_chain_digest_for(1)
+        self.assertEqual(self.post_favpvpvpvpw(1, cd1, "favpvpvpvpv-wbad-w1")[0], 201)
+        # 直接篡改见证冻结的 bodyDigest：以冻结公钥重建待验字节后签名复核失败，
+        # 该见证序号列入 invalidWitnesses，节点 1 不计入覆盖。
+        self.db_execute(
+            f"UPDATE {self.WITNESS_TABLE} SET body_digest = ?"
+            " WHERE witness_seq = 1",
+            ("0" * 64,),
+        )
+        status, response = self.post_l4_chain_proof_verification_report(
+            1, "favpvpvpvpv-wbad-r"
+        )
+        self.assertEqual(status, 201, response)
+        payload = json.loads(response)
+        self.assertEqual(payload["invalidChainNodes"], [])
+        self.assertEqual(payload["invalidWitnesses"], [1])
+        self.assertEqual(payload["uncoveredNodes"], [1])
+        self.assertFalse(payload["fullyCovered"])
+
+    def test_favpvpvpvpv_target_missing_and_oversized_is_404(self) -> None:
+        self.setup_three_l4_chain_proofs("favpvpvpvpv-miss")
+        status, body = self.post_l4_chain_proof_verification_report(
+            99, "favpvpvpvpv-miss-r"
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+        status, body = self.post_l4_chain_proof_verification_report(
+            9223372036854775808, "favpvpvpvpv-miss-huge"
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not_found"})
+
+    def test_favpvpvpvpv_body_structure_zero_negative_bool_and_nonint(self) -> None:
+        self.setup_two_l4_chain_proofs("favpvpvpvpv-bad")
+        # 报告写入口：proofSeq 必须为非布尔正整数。
+        for bad_body in (
+            b'{"proofSeq":0}',
+            b'{"proofSeq":-1}',
+            b'{"proofSeq":true}',
+            b'{"proofSeq":"1"}',
+            b'{"proofSeq":1.5}',
+            b"{}",
+            b'{"proofSeq":1,"extra":2}',
+        ):
+            status, body = self.request_raw(
+                self.L4_CHAIN_PROOF_VERIFICATIONS,
+                bad_body,
+                f"favpvpvpvpv-bad-{hashlib.sha256(bad_body).hexdigest()[:8]}",
+                "POST",
+            )
+            self.assertEqual(status, 400, bad_body)
+            self.assertEqual(json.loads(body), {"error": "invalid_request"})
+
+    def test_favpvpvpvpv_query_params_delegation_and_permission(self) -> None:
+        self.setup_two_l4_chain_proofs("favpvpvpvpv-auth")
+        good = json.dumps({"proofSeq": 1}).encode()
+        # 查询参数非法（先于认证结构）。
+        status, _ = self.request_raw(
+            f"{self.L4_CHAIN_PROOF_VERIFICATIONS}?x=1",
+            good,
+            "favpvpvpvpv-auth-query",
+            "POST",
+        )
+        self.assertEqual(status, 400)
+        # 代理头非法。
+        request = Request(self.url(self.L4_CHAIN_PROOF_VERIFICATIONS), data=good, method="POST")
+        request.add_header("Idempotency-Key", "favpvpvpvpv-auth-deleg")
+        request.add_header("SLA-Delegation", "d;0;1;n;" + "ab" * 64)
+        try:
+            with urlopen(request, timeout=5) as response:
+                status = response.status
+        except HTTPError as error:
+            status = error.code
+        self.assertEqual(status, 400)
+        # 缺失认证头。
+        status, _ = self.request_raw(
+            self.L4_CHAIN_PROOF_VERIFICATIONS,
+            good,
+            "favpvpvpvpv-auth-noauth",
+            "POST",
+            omit_auth=True,
+        )
+        self.assertEqual(status, 400)
+        # 未配置审计身份 403，且不得借此探测目标证明（目标缺失同样 403）。
+        status, _ = self.post_l4_chain_proof_verification_report(
+            99,
+            "favpvpvpvpv-auth-forbidden",
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+        )
+        self.assertEqual(status, 403)
+
+    def test_favpvpvpvpv_same_key_changed_body_or_auth_conflict(self) -> None:
+        self.setup_two_l4_chain_proofs("favpvpvpvpv-conf")
+        status, _ = self.post_l4_chain_proof_verification_report(
+            1, "favpvpvpvpv-conf-1"
+        )
+        self.assertEqual(status, 201)
+        # 同键异体：冲突，且先于资源查询。
+        status, body = self.request_raw(
+            self.L4_CHAIN_PROOF_VERIFICATIONS,
+            json.dumps({"proofSeq": 2}).encode(),
+            "favpvpvpvpv-conf-1",
+            "POST",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+        # 同键同体异认证五段：冲突。
+        status, body = self.request_raw(
+            self.L4_CHAIN_PROOF_VERIFICATIONS,
+            json.dumps({"proofSeq": 1}).encode(),
+            "favpvpvpvpv-conf-1",
+            "POST",
+            nonce=f"nonce-favpvpvpvpv-conf-{time.time_ns()}",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "conflict"})
+
+    def test_favpvpvpvpv_replay_restart_and_no_seq_advance(self) -> None:
+        self.setup_two_l4_chain_proofs("favpvpvpvpv-rep")
+        status, first = self.post_l4_chain_proof_verification_report(
+            1, "favpvpvpvpv-rep-1"
+        )
+        self.assertEqual(status, 201)
+        status, second = self.post_l4_chain_proof_verification_report(
+            1, "favpvpvpvpv-rep-1"
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(second, first)
+        self.restart()
+        status, third = self.post_l4_chain_proof_verification_report(
+            1, "favpvpvpvpv-rep-1"
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(third, first)
+        # 重放不推进报告序号：异键上界 2 的报告仍为序号 2。
+        status, other = self.post_l4_chain_proof_verification_report(
+            2, "favpvpvpvpv-rep-2"
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(other)["verificationSeq"], 2)
+
+    def test_favpvpvpvpv_failure_consumes_neither_nonce_nor_seq(self) -> None:
+        self.setup_two_l4_chain_proofs("favpvpvpvpv-fail")
+        # 目标不存在（404）不消费随机数、不推进报告序号。
+        nonce = f"nonce-favpvpvpvpv-fail-{time.time_ns()}"
+        status, _ = self.post_l4_chain_proof_verification_report(
+            99, "favpvpvpvpv-fail-miss", nonce=nonce
+        )
+        self.assertEqual(status, 404)
+        status, created = self.post_l4_chain_proof_verification_report(
+            1, "favpvpvpvpv-fail-ok", nonce=nonce
+        )
+        self.assertEqual(status, 201, created)
+        self.assertEqual(json.loads(created)["verificationSeq"], 1)
+        # 成功后随机数已消费：异键复用为 replay_detected。
+        status, body = self.post_l4_chain_proof_verification_report(
+            2, "favpvpvpvpv-fail-replay", nonce=nonce
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "replay_detected"})
+
+    def test_favpvpvpvpv_inconsistent_report_is_201_immutable_and_listed(self) -> None:
+        self.setup_three_l4_chain_proofs("favpvpvpvpv-imm")
+        self.db_execute(f"DELETE FROM {self.L4_PROOF_TABLE} WHERE proof_seq = 1")
+        status, first = self.post_l4_chain_proof_verification_report(
+            3, "favpvpvpvpv-imm-r1"
+        )
+        self.assertEqual(status, 201, first)
+        first_payload = json.loads(first)
+        self.assertEqual(first_payload["invalidChainNodes"], [1])
+        # 此后新增见证与链增长不改写既有报告。
+        cd3 = self.proof_chain_digest_for(3)
+        self.assertEqual(self.post_favpvpvpvpw(3, cd3, "favpvpvpvpv-imm-w3")[0], 201)
+        status, replay = self.post_l4_chain_proof_verification_report(
+            3, "favpvpvpvpv-imm-r1"
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(replay, first)
+        # 集合完整返回创建时报告。
+        status, body = self.get(self.L4_CHAIN_PROOF_VERIFICATIONS)
+        self.assertEqual(status, 200, body)
+        page = json.loads(body)
+        self.assertEqual(list(page), ["verifications", "nextCursor"])
+        self.assertEqual(page["verifications"], [first_payload])
+        self.assertIsNone(page["nextCursor"])
+
+    def test_favpvpvpvpv_collection_paging_and_stable_cut(self) -> None:
+        self.setup_three_l4_chain_proofs("favpvpvpvpv-pg")
+        # 空集合。
+        status, body = self.get(self.L4_CHAIN_PROOF_VERIFICATIONS)
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertEqual(payload["verifications"], [])
+        self.assertIsNone(payload["nextCursor"])
+        # 两份报告：上界 1 与上界 3。
+        status, first = self.post_l4_chain_proof_verification_report(
+            1, "favpvpvpvpv-pg-r1"
+        )
+        self.assertEqual(status, 201)
+        status, second = self.post_l4_chain_proof_verification_report(
+            3, "favpvpvpvpv-pg-r3"
+        )
+        self.assertEqual(status, 201)
+        status, body = self.get(f"{self.L4_CHAIN_PROOF_VERIFICATIONS}?limit=1")
+        self.assertEqual(status, 200, body)
+        page = json.loads(body)
+        self.assertEqual(page["verifications"], [json.loads(first)])
+        cursor = page["nextCursor"]
+        self.assertEqual(cursor, "2:1")
+        status, body = self.get(f"{self.L4_CHAIN_PROOF_VERIFICATIONS}?cursor={cursor}")
+        self.assertEqual(status, 200, body)
+        page = json.loads(body)
+        self.assertEqual(page["verifications"], [json.loads(second)])
+        self.assertIsNone(page["nextCursor"])
+        # 旧游标跨重启稳定。
+        self.restart()
+        status, body = self.get(f"{self.L4_CHAIN_PROOF_VERIFICATIONS}?cursor={cursor}")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["verifications"], [json.loads(second)])
+
+    def test_favpvpvpvpv_collection_invalid_params_and_permissions(self) -> None:
+        self.setup_two_l4_chain_proofs("favpvpvpvpv-listbad")
+        status, _ = self.post_l4_chain_proof_verification_report(
+            1, "favpvpvpvpv-listbad-r"
+        )
+        self.assertEqual(status, 201)
+        for query in (
+            "limit=0",
+            "limit=101",
+            "limit=x",
+            "foo=1",
+            "cursor=1",
+            "cursor=x:1",
+            "cursor=99:1",
+            "cursor=1:99",
+            "limit=1&limit=2",
+        ):
+            status, _ = self.get(f"{self.L4_CHAIN_PROOF_VERIFICATIONS}?{query}")
+            self.assertEqual(status, 400, query)
+        # 未配置审计身份 403；缺失认证头 400；代理头 400。
+        status, _ = self.get(
+            self.L4_CHAIN_PROOF_VERIFICATIONS,
+            seed=PUBLIC_KEY_SEED_B,
+            actor=self.consumer_id,
+        )
+        self.assertEqual(status, 403)
+        status, _ = self.get(self.L4_CHAIN_PROOF_VERIFICATIONS, omit_auth=True)
+        self.assertEqual(status, 400)
+        request = Request(self.url(self.L4_CHAIN_PROOF_VERIFICATIONS), method="GET")
+        request.add_header("SLA-Delegation", "d;0;1;n;" + "ab" * 64)
+        try:
+            with urlopen(request, timeout=5) as response:
+                status = response.status
+        except HTTPError as error:
+            status = error.code
+        self.assertEqual(status, 400)
+
+    def test_favpvpvpvpv_get_nonce_consumed_only_on_success(self) -> None:
+        self.setup_two_l4_chain_proofs("favpvpvpvpv-gnonce")
+        nonce = f"nonce-favpvpvpvpv-gn-{time.time_ns()}"
+        status, _ = self.get(self.L4_CHAIN_PROOF_VERIFICATIONS, nonce=nonce)
+        self.assertEqual(status, 200)
+        status, body = self.get(self.L4_CHAIN_PROOF_VERIFICATIONS, nonce=nonce)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body), {"error": "replay_detected"})
+        failed_nonce = f"nonce-favpvpvpvpv-gn-fail-{time.time_ns()}"
+        for _ in range(2):
+            status, _ = self.get(
+                f"{self.L4_CHAIN_PROOF_VERIFICATIONS}?cursor=99:1",
+                nonce=failed_nonce,
+            )
+            self.assertEqual(status, 400)
+
+    def test_favpvpvpvpv_old_database_gains_empty_report_storage(self) -> None:
+        # 模拟升级前旧库：不存在本功能复核报告存储；重启后仅新增空存储，
+        # 不补造任何历史报告，新报告序号自 1 起。
+        self.setup_two_l4_chain_proofs("favpvpvpvpv-mig")
+        self.db_execute(f"DROP TABLE {self.L4_VERIFICATION_TABLE}")
+        self.db_execute(f"DROP TABLE {self.L4_VERIFICATION_IDEMPOTENCY_TABLE}")
+        self.restart()
+        status, body = self.get(self.L4_CHAIN_PROOF_VERIFICATIONS)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["verifications"], [])
+        status, response = self.post_l4_chain_proof_verification_report(
+            2, "favpvpvpvpv-mig-r"
+        )
+        self.assertEqual(status, 201, response)
+        self.assertEqual(json.loads(response)["verificationSeq"], 1)
+        self.assertEqual(json.loads(response)["proofSeqBound"], 2)
+
+
 class IntegerLimitTests(_EvidenceScenario, unittest.TestCase):
     # 进程级整数转换保护（PEP 682）不再全局关闭：仅 README 已声明的审计序号
     # 入口接受超长整数（超存储范围按不存在处理），其他入口的超长整数一律
